@@ -36294,17 +36294,26 @@ def pe_bar(theme: str, filled: int, total: int, plain: str) -> str:
     if not f or not e:
         return plain
     filled = max(0, min(total, filled))
-    return (f'<tg-emoji emoji-id="{f}">▰</tg-emoji>' * filled) + (f'<tg-emoji emoji-id="{e}">▱</tg-emoji>' * (total - filled))
-
-
-_PE_BAR_TILE_RE = re.compile(r'<tg-emoji emoji-id="\d+">([▰▱])</tg-emoji>')
+    # внутри <tg-emoji> обязан быть настоящий эмодзи — иначе Telegram отвечает ENTITY_TEXT_INVALID
+    fe, ee = (_pe_emoji_of(f"bk:{theme}:{x}") for x in "fe")
+    fe, ee = (v + "\ufe0f" if len(v) == 1 and ord(v) < 0x1F000 else v for v in (fe, ee))
+    return (f'<tg-emoji emoji-id="{f}">{fe}</tg-emoji>' * filled) + (f'<tg-emoji emoji-id="{e}">{ee}</tg-emoji>' * (total - filled))
 
 
 def pe_trim_bars(text: str, limit: int = 98) -> str:
     """У Telegram лимит 100 прем-эмодзи в сообщении. Если с полосками их больше — полоски становятся обычными ▰▱."""
     if text.count("<tg-emoji") <= limit:
         return text
-    return _PE_BAR_TILE_RE.sub(lambda m: m.group(1), text)
+    filled_ids = {v for k, v in _pe_ids.items() if k.startswith("bk:") and k.endswith(":f")}
+    empty_ids = {v for k, v in _pe_ids.items() if k.startswith("bk:") and k.endswith(":e")}
+
+    def _plain(m):
+        if m.group(1) in filled_ids:
+            return "▰"
+        if m.group(1) in empty_ids:
+            return "▱"
+        return m.group(0)
+    return re.sub(r'<tg-emoji emoji-id="(\d+)">[^<]{1,4}</tg-emoji>', _plain, text)
 
 
 def _pe_emoji_of(key: str) -> str:
