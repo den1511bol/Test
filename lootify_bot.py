@@ -2,15 +2,335 @@
 Lootify RPG - Telegram RNG/RPG Bot
 """
 
-from database import init_db, close_db, load_all_users, upsert_user, upsert_many, delete_user, load_banned_ids, add_banned_id, remove_banned_id, load_all_clans, upsert_clan, upsert_many_clans, delete_clan, load_kv, save_kv
-import asyncio, collections, copy, html, json, math, os, random, re, time
-from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+import asyncio, collections, copy, html, json, math, os, random, re, ssl, time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from urllib.parse import urlsplit, parse_qs, urlunsplit
+import asyncpg
 import aiofiles
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, LabeledPrice, PreCheckoutQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, LabeledPrice, PreCheckoutQuery, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.fsm.storage.memory import MemoryStorage
+
+# ============================================================
+# БАЗА ДАННЫХ (PostgreSQL) — встроено из database.py
+# ============================================================
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+_pool: Optional[asyncpg.Pool] = None
+_pool_lock = asyncio.Lock()
+
+CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS players (
+    user_id BIGINT PRIMARY KEY,
+    data JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+CREATE_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS players_updated_at_idx
+    ON players (updated_at DESC);
+"""
+
+CREATE_BANNED_SQL = """
+CREATE TABLE IF NOT EXISTS banned_users (
+    user_id BIGINT PRIMARY KEY,
+    banned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+CREATE_CLANS_SQL = """
+CREATE TABLE IF NOT EXISTS clans (
+    clan_id TEXT PRIMARY KEY,
+    data JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+CREATE_KV_SQL = """
+CREATE TABLE IF NOT EXISTS kv_state (
+    key TEXT PRIMARY KEY,
+    data JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+CONNECT_RETRIES = 5
+CONNECT_RETRY_DELAY = 3.0
+
+
+def _normalize_dsn(dsn: str) -> tuple:
+    if not dsn:
+        return dsn, False
+    parts = urlsplit(dsn)
+    query = parse_qs(parts.query)
+    sslmode = (query.pop("sslmode", [""])[0] or "").lower()
+    new_query = "&".join(f"{k}={v[0]}" for k, v in query.items())
+    clean_dsn = urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    use_ssl = sslmode in ("require", "verify-ca", "verify-full", "prefer")
+    if not sslmode and "railway" in parts.netloc.lower():
+        use_ssl = True
+    return clean_dsn, use_ssl
+
+
+async def init_db() -> None:
+    global _pool
+    async with _pool_lock:
+        if _pool is not None:
+            return
+        if not DATABASE_URL:
+            raise RuntimeError(
+                "DATABASE_URL не задан. Добавь PostgreSQL в Railway и пропиши "
+                "переменную DATABASE_URL в сервисе бота."
+            )
+
+        clean_dsn, use_ssl = _normalize_dsn(DATABASE_URL)
+        last_error: Optional[Exception] = None
+        for attempt in range(1, CONNECT_RETRIES + 1):
+            try:
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                _pool = await asyncpg.create_pool(
+                    dsn=clean_dsn,
+                    min_size=1,
+                    max_size=10,
+                    ssl=ssl_context if use_ssl else None,
+                    statement_cache_size=0,
+                    command_timeout=30,
+                )
+                break
+            except Exception as e:
+                last_error = e
+                print(f"[init_db] attempt {attempt}/{CONNECT_RETRIES} failed: {e}")
+                if attempt < CONNECT_RETRIES:
+                    await asyncio.sleep(CONNECT_RETRY_DELAY)
+
+        if _pool is None:
+            raise RuntimeError(f"Не удалось подключиться к БД: {last_error}")
+
+        async with _pool.acquire() as conn:
+            await conn.execute(CREATE_TABLE_SQL)
+            await conn.execute(CREATE_INDEX_SQL)
+            await conn.execute(CREATE_BANNED_SQL)
+            await conn.execute(CREATE_CLANS_SQL)
+            await conn.execute(CREATE_KV_SQL)
+
+
+async def close_db() -> None:
+    global _pool
+    async with _pool_lock:
+        if _pool is not None:
+            await _pool.close()
+            _pool = None
+
+
+def _get_pool() -> asyncpg.Pool:
+    if _pool is None:
+        raise RuntimeError("База данных ещё не инициализирована — вызови init_db().")
+    return _pool
+
+
+async def load_all_users() -> Dict[str, dict]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, data FROM players")
+    result: Dict[str, dict] = {}
+    for row in rows:
+        raw = row["data"]
+        result[str(row["user_id"])] = raw if isinstance(raw, dict) else json.loads(raw)
+    return result
+
+
+async def upsert_user(user_id: int, data: dict) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO players (user_id, data, updated_at)
+            VALUES ($1, $2::jsonb, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+                SET data = EXCLUDED.data,
+                    updated_at = NOW()
+            """,
+            int(user_id),
+            json.dumps(data, ensure_ascii=False, default=str),
+        )
+
+
+async def upsert_many(users: Dict[str, dict]) -> None:
+    if not users:
+        return
+    pool = _get_pool()
+    rows = [
+        (int(uid), json.dumps(data, ensure_ascii=False, default=str))
+        for uid, data in users.items()
+        if str(uid).isdigit()
+    ]
+    if not rows:
+        return
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO players (user_id, data, updated_at)
+            VALUES ($1, $2::jsonb, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+                SET data = EXCLUDED.data,
+                    updated_at = NOW()
+            """,
+            rows,
+        )
+
+
+async def delete_user(user_id: int) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM players WHERE user_id = $1", int(user_id))
+
+
+# ----- bans (persistent) -----
+
+async def load_banned_ids() -> Set[int]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM banned_users")
+    return {int(r["user_id"]) for r in rows}
+
+
+async def upsert_banned_ids(banned: Set[int]) -> None:
+    """Полная синхронизация списка банов с БД."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM banned_users")
+            if banned:
+                await conn.executemany(
+                    "INSERT INTO banned_users (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                    [(int(uid),) for uid in banned],
+                )
+
+
+async def add_banned_id(user_id: int) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO banned_users (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            int(user_id),
+        )
+
+
+async def remove_banned_id(user_id: int) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM banned_users WHERE user_id = $1", int(user_id))
+
+
+# ----- clans (persistent) -----
+
+async def load_all_clans() -> Dict[str, dict]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT clan_id, data FROM clans")
+    result: Dict[str, dict] = {}
+    for row in rows:
+        raw = row["data"]
+        result[str(row["clan_id"])] = raw if isinstance(raw, dict) else json.loads(raw)
+    return result
+
+
+async def upsert_clan(clan_id: str, data: dict) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO clans (clan_id, data, updated_at)
+            VALUES ($1, $2::jsonb, NOW())
+            ON CONFLICT (clan_id) DO UPDATE
+                SET data = EXCLUDED.data,
+                    updated_at = NOW()
+            """,
+            str(clan_id),
+            json.dumps(data, ensure_ascii=False, default=str),
+        )
+
+
+async def upsert_many_clans(clans: Dict[str, dict]) -> None:
+    if not clans:
+        return
+    pool = _get_pool()
+    rows = [
+        (str(cid), json.dumps(data, ensure_ascii=False, default=str))
+        for cid, data in clans.items()
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO clans (clan_id, data, updated_at)
+            VALUES ($1, $2::jsonb, NOW())
+            ON CONFLICT (clan_id) DO UPDATE
+                SET data = EXCLUDED.data,
+                    updated_at = NOW()
+            """,
+            rows,
+        )
+
+
+async def delete_clan(clan_id: str) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM clans WHERE clan_id = $1", str(clan_id))
+
+
+# ----- произвольное состояние (мировой босс, награды дня и т.п.) -----
+
+async def load_kv(key: str) -> Optional[dict]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT data FROM kv_state WHERE key = $1", str(key))
+    if row is None:
+        return None
+    raw = row["data"]
+    return raw if isinstance(raw, dict) else json.loads(raw)
+
+
+async def save_kv(key: str, data: dict) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO kv_state (key, data, updated_at)
+            VALUES ($1, $2::jsonb, NOW())
+            ON CONFLICT (key) DO UPDATE
+                SET data = EXCLUDED.data,
+                    updated_at = NOW()
+            """,
+            str(key),
+            json.dumps(data, ensure_ascii=False, default=str),
+        )
+
+# ============================================================
+# КОНЕЦ БЛОКА БАЗЫ ДАННЫХ
+# ============================================================
+
+# Реестр экранов с шаблонами (админ меняет их текст командой «экран»). Объявлен в начале,
+# чтобы экраны по всему файлу могли регистрировать свои шаблоны рядом с кодом.
+SCREEN_DEFAULTS: Dict[str, dict] = {}
+_screen_templates: Dict[str, str] = {}
+
+
+def register_screen(key: str, title: str, text: str, marks: Optional[dict] = None):
+    SCREEN_DEFAULTS[key] = {"title": title, "text": text, "marks": marks or {}}
+
+
+def render_screen(key: str, values: Optional[dict] = None) -> str:
+    template = _screen_templates.get(key) or SCREEN_DEFAULTS.get(key, {}).get("text", "")
+    for name, value in (values or {}).items():
+        template = template.replace("{" + name + "}", str(value))
+    return template
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -86,7 +406,8 @@ def get_auto_roll_bag_capacity(user: Optional[dict]) -> int:
 
 def get_auto_roll_duration(user: dict) -> int:
     level = user.get("level", 1) if user else 1
-    return AUTO_ROLL_DURATION_SECONDS + level * 3 * 60
+    base = AUTO_ROLL_DURATION_SECONDS + level * 3 * 60
+    return int(base * PRESTIGE_AUTOROLL_MULT) if prestige_has(user, 17) else base   # престиж 17+
 ADMIN_IDS = {993958415}
 STARTER_QUEST_ID = "starter_rolls"
 ROLLS_50_QUEST_ID = "rolls_50"
@@ -129,9 +450,9 @@ RARITIES = {
     "mythic":    {"name": "Мифическое",   "emoji": "🔴", "color": "#f44336", "mult": 12.0, "chance": 0.003},
     "nightmare": {"name": "Кошмарное",    "emoji": "🚀", "color": "#4a0072", "mult": 20.0, "chance": 0.0},
     # Крафтовые редкости: НЕ выпадают из роллов, покупаются только у Хранителя реликвий за ресурсы боссов
-    "ancient":    {"name": "Древнее",      "emoji": "🏺", "color": "#c9a227", "mult": 35.0,  "chance": 0.0},
-    "divine":     {"name": "Божественное", "emoji": "🌞", "color": "#ffe066", "mult": 60.0,  "chance": 0.0},
-    "primordial": {"name": "Первородное",  "emoji": "🌌", "color": "#00e5ff", "mult": 100.0, "chance": 0.0},
+    "ancient":    {"name": "Древнее",      "emoji": "🏺", "color": "#c9a227", "mult": 55.0,  "chance": 0.0},
+    "divine":     {"name": "Божественное", "emoji": "🌞", "color": "#ffe066", "mult": 90.0,  "chance": 0.0},
+    "primordial": {"name": "Первородное",  "emoji": "🌌", "color": "#00e5ff", "mult": 150.0, "chance": 0.0},
 }
 # Редкости, которые участвуют в роллах (крафтовые сюда не входят)
 ROLL_RARITIES = ("common", "uncommon", "rare", "epic", "legendary", "mythic", "nightmare")
@@ -221,7 +542,15 @@ ARMOR_SLOT_EMOJI = {
     "boots": "👢",
 }
 
-SKILL_MAX_LEVEL = 15
+SKILL_MAX_LEVEL = 30   # общий максимум; у части скиллов свой потолок — см. SKILL_MAX_LEVEL_OVERRIDES
+# скиллы, у которых больший уровень уже ничего не даёт (упирается в потолок эффекта)
+# вампиризм, удача и скорость ролла остаются на старом потолке 15: это самые «ломающие» скиллы,
+# а их эффект уже усилен путём, питомцами и зельями
+SKILL_MAX_LEVEL_OVERRIDES = {"greed": 35, "vampirism": 15, "luck": 15, "roll_speed": 15, "miss": 20, "fishing": 15, "farming": 15}
+
+
+def skill_max_level(skill_id: str) -> int:
+    return SKILL_MAX_LEVEL_OVERRIDES.get(skill_id, SKILL_MAX_LEVEL)
 SKILL_DEFS = {
     "armor": {
         "name": "Броня",
@@ -295,6 +624,24 @@ SKILL_DEFS = {
         "description": "Сильно увеличивает монеты, которые приносит продажа улова: до ×4 на максимальном уровне.",
         "per_level": "+20% монет за рыбу",
     },
+    "crit_damage": {
+        "name": "Сокрушение",
+        "emoji": "🔥",
+        "description": "Увеличивает урон критических ударов на 3% за уровень. Работает вместе со скиллом «Шанс крит урона».",
+        "per_level": "+3% крит. урона",
+    },
+    "evasion": {
+        "name": "Уклонение",
+        "emoji": "🌀",
+        "description": "Шанс увернуться от удара босса: +1% за уровень (общий потолок уклонения — 35%, вместе с путём и питомцами).",
+        "per_level": "+1% уклонения",
+    },
+    "greed": {
+        "name": "Алчность",
+        "emoji": "🪙",
+        "description": "Увеличивает все получаемые монеты на 1% за уровень (максимум 35 уровней = +35%): с боссов, роллов, рыбалки, огорода.",
+        "per_level": "+1% монет",
+    },
     "farming": {
         "name": "Золотой урожай",
         "emoji": "🌿",
@@ -318,6 +665,9 @@ SKILL_BUTTON_EMOJI_IDS = {
     "stamina": "5819022417917383759",
     "fishing": "5343609421316521960",
     "farming": "5197555094161234652",
+    "crit_damage": "5332336747072208845",
+    "evasion": "5217572051237228647",
+    "greed": "5463046637842608206",
 }
 
 def skill_premium_emoji(skill_id: str, fallback: str = "") -> str:
@@ -326,7 +676,7 @@ def skill_premium_emoji(skill_id: str, fallback: str = "") -> str:
         return fallback
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback or "▫️"}</tg-emoji>'
 
-PATH_MAX_LEVEL = 200
+PATH_MAX_LEVEL = 500
 PATH_RESET_COST = 10000
 MANNEQUIN_MAX_TRAINING_SECONDS = 48 * 60 * 60
 MANNEQUIN_HIT_COOLDOWN_SECONDS = 10
@@ -556,7 +906,7 @@ PATH_LEVELS = {
         ("Критмастер", "+5% к шансу крита", {"crit": 5}),
         ("Запас сил", "+10 к макс. выносливости", {"stamina_flat": 10}),
         ("Убойный", "+20% к крит. урону", {"crit_damage": 20}),
-        ("Снайперский выстрел", "скилл: 200% урона и ранение", {"skill": "sniper_shot"}),
+        ("Снайперский выстрел", "скилл: 200% урона + ранение (25% от удара/ход, 2 хода)", {"skill": "sniper_shot"}),
         ("Точность II", "+10% к урону атаки", {"damage": 10}),
         ("Опытный II", "+5% опыта отовсюду", {"xp": 5}),
         ("Восстановление", "+2% выносливости за ход", {"stamina_regen": 2}),
@@ -581,7 +931,7 @@ PATH_LEVELS = {
         ("Экономия", "−2% траты выносливости", {"resource_discount": 2}),
         ("Снайпер+", "+4% к урону атаки", {"damage": 4}),
         ("Крит+", "+3% к шансу крита", {"crit": 3}),
-        ("Залп", "скилл: 3 выстрела по цели (70% каждый)", {"skill": "multi_shot"}),
+        ("Залп", "скилл: 3 выстрела по цели (75% каждый)", {"skill": "multi_shot"}),
         ("Опыт пути", "+3% опыта отовсюду", {"xp": 3}),
         ("Добытчик", "+3% монет отовсюду", {"coins": 3}),
         ("Поток сил", "+1 выносливости за ход", {"stamina_regen": 1}),
@@ -681,7 +1031,7 @@ PATH_LEVELS = {
         ("Экономия", "−4% траты выносливости", {"resource_discount": 4}),
         ("Снайпер+", "+9% к урону атаки", {"damage": 9}),
         ("Крит+", "+8% к шансу крита", {"crit": 8}),
-        ("Пробитие", "скилл: 250% урона, игнор 20% брони врага", {"skill": "pierce_shot"}),
+        ("Пробитие", "скилл: 280% урона по цели", {"skill": "pierce_shot"}),
         ("Опыт пути", "+8% опыта отовсюду", {"xp": 8}),
         ("Добытчик", "+8% монет отовсюду", {"coins": 8}),
         ("Поток сил", "+2 выносливости за ход", {"stamina_regen": 2}),
@@ -947,6 +1297,55 @@ PATH_LEVELS = {
     ],
 }
 
+# === Уровни пути 201–500: «Вершина мастерства» ===
+# Маленькие прибавки (бонусы пути и так под софт-капом): за все 300 уровней ≈ +19% к итоговому урону
+# и столько же к основному стату пути. Каждый 10-й — «Мастерство», каждый 50-й — «Веха» (вдвое больше).
+_PATH_LATE_CYCLE = {
+    "melee": [("Закалка", {"damage": 1}), ("Стальные мышцы", {"hp": 1}), ("Точный удар", {"damage": 1}),
+              ("Выносливость", {"hp": 1}), ("Опыт ветерана", {"xp": 1}), ("Трофеи", {"coins": 1}),
+              ("Сокрушение", {"damage": 1}), ("Несгибаемость", {"hp": 1}), ("Латы", {"armor": 0.5})],
+    "bow": [("Твёрдая рука", {"damage": 1}), ("Слабое место", {"crit_damage": 1.5}), ("Меткость", {"damage": 1}),
+            ("Второе дыхание", {"stamina_flat": 2}), ("Опыт охотника", {"xp": 1}), ("Трофеи", {"coins": 1}),
+            ("Пробивной выстрел", {"damage": 1}), ("Зоркий глаз", {"crit": 0.5}), ("Охота на крупного", {"crit_damage": 1.5})],
+    "magic": [("Сосредоточение", {"damage": 1}), ("Глубокий резерв", {"mana": 2}), ("Чистая сила", {"damage": 1}),
+              ("Поток", {"mana_regen": 0.3}), ("Опыт мага", {"xp": 1}), ("Трофеи", {"coins": 1}),
+              ("Резонанс", {"damage": 1}), ("Магический щит", {"armor": 0.5}), ("Озарение", {"mana": 2})],
+}
+_PATH_LATE_MASTERY = {
+    "melee": {"damage": 1.5, "hp": 1.5},
+    "bow": {"damage": 1.5, "crit_damage": 1.5},
+    "magic": {"damage": 1.5, "mana": 2},
+}
+_PATH_BONUS_TEXT = {
+    "damage": "к урону", "hp": "к макс. здоровью", "armor": "брони", "xp": "опыта", "coins": "монет",
+    "crit": "шанса крита", "crit_damage": "к крит. урону", "stamina_flat": "выносливости", "mana": "маны",
+    "mana_regen": "к восстановлению маны", "evasion": "уклонения", "reduction": "снижения урона",
+    "vampirism": "вампиризма", "resource_discount": "экономии ресурса",
+}
+
+
+def _path_effect_desc(effects: dict) -> str:
+    return ", ".join(f"+{v:g}% {_PATH_BONUS_TEXT.get(k, k)}" for k, v in effects.items())
+
+
+def _extend_path_levels():
+    for path, levels in PATH_LEVELS.items():
+        cycle = _PATH_LATE_CYCLE[path]
+        for lvl in range(len(levels) + 1, PATH_MAX_LEVEL + 1):
+            if lvl % 50 == 0:
+                eff = {k: v * 2 for k, v in _PATH_LATE_MASTERY[path].items()}
+                name = f"Веха {lvl}"
+            elif lvl % 10 == 0:
+                eff = dict(_PATH_LATE_MASTERY[path])
+                name = f"Мастерство {lvl}"
+            else:
+                name, eff = cycle[(lvl % 10) - 1]
+                eff = dict(eff)
+            levels.append((name, _path_effect_desc(eff), eff))
+
+
+_extend_path_levels()
+
 ARMOR = {
     "common": {
         "helmet": [
@@ -1171,7 +1570,7 @@ def create_default_user(name: str = "") -> dict:
         "witch_potions": [],
         "active_brew": None,
         "pets": [],
-        "equipped_pets": [None, None],
+        "equipped_pets": [None, None, None, None, None],
         "pet_eggs": {},
         "pet_incubator": [{"egg_id": None, "started_at": 0, "ready_at": 0}],
         "marshmallows": 0,
@@ -1304,7 +1703,7 @@ def get_skill_level(user: Optional[dict], skill_id: str) -> int:
     if not user:
         return 0
     try:
-        return max(0, min(SKILL_MAX_LEVEL, int(user.get("skills", {}).get(skill_id, 0))))
+        return max(0, min(skill_max_level(skill_id), int(user.get("skills", {}).get(skill_id, 0))))
     except (TypeError, ValueError):
         return 0
 
@@ -1340,7 +1739,11 @@ def get_path_xp_required(level: int) -> int:
     """Опыт мастерства до следующего уровня. Раньше рос экспоненциально — до 200 уровня
     нужно было ~782 трлн опыта (недостижимо). Теперь квадратичная кривая: всего ~8,7 млн."""
     level = max(1, int(level))
-    return math.ceil(150 + 40 * level + 3 * level * level)
+    if level < 200:
+        return math.ceil(150 + 40 * level + 3 * level * level)
+    # «Вершина мастерства» (200→500): отдельная пологая кривая, чтобы её реально было пройти:
+    # 40к на 200 уровне, +200 за каждый следующий (≈21 млн на все 300 уровней).
+    return 40_000 + 200 * (level - 200)
 
 # Софт-кап стаков пути: ранние % почти полные, дальше сильно слабее
 
@@ -1975,7 +2378,7 @@ def get_crit_chance(user: Optional[dict]) -> float:
     effects = (user.get("battle_effects") or {}) if user else {}
     bonus = 0.0
     if effects.get("aim_turns", 0) > 0:
-        bonus += 50
+        bonus += 35
     if effects.get("eagle_eye_turns", 0) > 0:
         bonus += 25
     bonus += get_enchant_crit_bonus(user)
@@ -1991,11 +2394,11 @@ def get_crit_chance(user: Optional[dict]) -> float:
     return min(MAX_CRIT_CHANCE, get_skill_level(user, "crit") * 2.0 + get_path_bonus(user, "crit") + get_pet_bonus(user, "crit") + bonus)
 
 def get_crit_damage_percent(user: Optional[dict]) -> float:
-    bonus = 100 if user and (user.get("battle_effects") or {}).get("aim_turns", 0) > 0 else 0
-    return 100 + get_path_bonus(user, "crit_damage") + bonus
+    bonus = 60 if user and (user.get("battle_effects") or {}).get("aim_turns", 0) > 0 else 0
+    return 100 + get_path_bonus(user, "crit_damage") + bonus + get_skill_level(user, "crit_damage") * 3
 
 def get_evasion_chance(user: Optional[dict]) -> float:
-    return min(MAX_EVASION_CHANCE, get_path_bonus(user, "evasion") + get_pet_bonus(user, "evasion"))
+    return min(MAX_EVASION_CHANCE, get_path_bonus(user, "evasion") + get_pet_bonus(user, "evasion") + get_skill_level(user, "evasion"))
 
 def get_miss_chance(user: Optional[dict]) -> float:
     return max(0.0, 30.0 - get_skill_level(user, "miss") * 1.5 - get_pet_bonus(user, "miss"))
@@ -2063,11 +2466,42 @@ AUTO_ROLL_MIN_INTERVAL = 3
 AUTO_ROLL_PET_MIN_RARITY = ("epic", "legendary", "mythic")
 
 
-def get_auto_roll_interval(user: Optional[dict]) -> int:
-    interval = AUTO_ROLL_BASE_INTERVAL_SECONDS - get_skill_level(user, "roll_speed") - get_pet_roll_speed_bonus(user)
+AUTO_ROLL_PET_MIN_INTERVAL = 1   # ниже AUTO_ROLL_MIN_INTERVAL интервал опускают ТОЛЬКО питомцы
+
+
+SPEED_POTION_INTERVAL_MULT = 0.7      # зелье скорости: интервал ×0.7 (−30%) уже ПОСЛЕ всех лимитов
+SPEED_POTION_MIN_INTERVAL = 0.5       # с зельем авторолл может быть быстрее 1 сек., но не чаще раза в 0.5 сек.
+
+
+def get_auto_roll_interval(user: Optional[dict]) -> float:
+    """Навык ускоряет авторолл до AUTO_ROLL_MIN_INTERVAL (3 сек.), питомцы эпик+ — сверх этого до 1 сек.
+    Зелье скорости действует поверх всех лимитов: −30% к итоговому интервалу, вплоть до 0.5 сек."""
+    interval = AUTO_ROLL_BASE_INTERVAL_SECONDS - get_skill_level(user, "roll_speed")
+    interval = max(AUTO_ROLL_MIN_INTERVAL, int(interval))
+    interval = max(AUTO_ROLL_PET_MIN_INTERVAL, interval - get_pet_roll_speed_bonus(user))
     if user and has_buff(user, "speed"):
-        interval -= 1
-    return max(AUTO_ROLL_MIN_INTERVAL, int(interval))
+        interval = max(SPEED_POTION_MIN_INTERVAL, round(interval * SPEED_POTION_INTERVAL_MULT, 1))
+    return interval
+
+
+AUTO_ROLL_SURPLUS_CHANCE = 20   # % шанса двойного ролла за каждую секунду скорости сверх лимита 1 сек.
+
+
+def get_auto_roll_surplus(user: Optional[dict]) -> int:
+    """Сколько секунд скорости от питомцев не влезло в лимит интервала (пол — AUTO_ROLL_PET_MIN_INTERVAL)."""
+    if not user:
+        return 0
+    interval = AUTO_ROLL_BASE_INTERVAL_SECONDS - get_skill_level(user, "roll_speed")
+    interval = max(AUTO_ROLL_MIN_INTERVAL, int(interval))
+    return max(0, AUTO_ROLL_PET_MIN_INTERVAL - (interval - get_pet_roll_speed_bonus(user)))
+
+
+def get_auto_roll_double_chance(user: Optional[dict]) -> int:
+    return get_auto_roll_surplus(user) * AUTO_ROLL_SURPLUS_CHANCE
+
+
+def format_roll_interval(user: Optional[dict]) -> str:
+    return f"{get_auto_roll_interval(user):g}"
 
 def recalculate_user_combat_stats(user: dict, battle: Optional[dict] = None):
     equipped_armor = user.get("equipped_armor", {slot: None for slot in ARMOR_SLOTS})
@@ -2114,12 +2548,15 @@ def get_vampirism_heal_cap_percent(user: Optional[dict]) -> float:
     return get_vampirism_percent(user) * VAMPIRISM_HEAL_CAP_RATIO
 
 
-def calc_vampirism_heal(user: dict, damage: int, max_hp: int) -> int:
+SHARED_BOSS_VAMP_CAP_MULT = 2.0   # против общих боссов (Кратос, мировой, Лутиафан) лечение за удар до ×2 выше
+
+
+def calc_vampirism_heal(user: dict, damage: int, max_hp: int, cap_mult: float = 1.0) -> int:
     percent = get_vampirism_percent(user)
     if damage <= 0 or percent <= 0:
         return 0
     heal = math.floor(damage * percent / 100)
-    cap = math.floor(max(1, max_hp) * get_vampirism_heal_cap_percent(user) / 100)
+    cap = math.floor(max(1, max_hp) * get_vampirism_heal_cap_percent(user) * cap_mult / 100)
     return max(1, min(heal, max(1, cap)))
 
 
@@ -2640,11 +3077,11 @@ class Database:
         equipped_pets = self.data[uid].get("equipped_pets")
         if not isinstance(equipped_pets, list):
             equipped_pets = []
-        while len(equipped_pets) < 2:
+        while len(equipped_pets) < PET_MAX_SLOTS:
             equipped_pets.append(None)
             migrated = True
-        if len(equipped_pets) > 2:
-            equipped_pets = equipped_pets[:2]
+        if len(equipped_pets) > PET_MAX_SLOTS:
+            equipped_pets = equipped_pets[:PET_MAX_SLOTS]
             migrated = True
         if equipped_pets != self.data[uid].get("equipped_pets"):
             self.data[uid]["equipped_pets"] = equipped_pets
@@ -2705,7 +3142,9 @@ class Database:
                 level = int(skills.get(skill_id, 0))
             except (TypeError, ValueError):
                 level = 0
-            normalized_skills[skill_id] = max(0, min(SKILL_MAX_LEVEL, level))
+            normalized_skills[skill_id] = max(0, min(skill_max_level(skill_id), level))
+            if level > skill_max_level(skill_id):   # потолок снизили — лишние очки возвращаем
+                self.data[uid]["skill_points"] = int(self.data[uid].get("skill_points", 0) or 0) + (level - skill_max_level(skill_id))
         if normalized_skills != skills:
             self.data[uid]["skills"] = normalized_skills
             skills = normalized_skills
@@ -2858,7 +3297,7 @@ def nav_pet(pet: dict) -> tuple:
     return ("К питомцу", f"pet_view|{pet.get('iid')}||", get_pet_icon_custom_emoji_id(pet.get("pet_id")) or "5233312311808108588")
 
 
-NOTIFY_MAX_PER_SECOND = 20          # Telegram режет бота целиком при ~30 сообщениях/сек
+NOTIFY_MAX_PER_SECOND = 10          # Telegram режет бота целиком при ~30 сообщениях/сек (часть — боям и ответам)
 _notify_lock = asyncio.Lock()
 _notify_last_sent = 0.0
 
@@ -2870,7 +3309,7 @@ async def send_user_notification(user_id: int, text: str, reply_markup=None) -> 
     global _notify_last_sent
     if not NOTIFY_BOT:
         return False
-    for attempt in range(2):
+    for attempt in range(4):
         async with _notify_lock:
             wait = _notify_last_sent + 1.0 / NOTIFY_MAX_PER_SECOND - time.time()
             if wait > 0:
@@ -2887,10 +3326,15 @@ async def send_user_notification(user_id: int, text: str, reply_markup=None) -> 
             return True
         except Exception as e:
             retry = getattr(e, "retry_after", None)
-            if retry and attempt == 0:
-                print(f"[send_user_notification] flood, ждём {retry} c")
+            if isinstance(e, FloodPaused) or (retry and float(retry) >= FLOOD_BAN_MIN):
+                return False   # долгий бан Telegram — не ждём часами и не продлеваем его попытками
+            if retry and attempt < 3:
+                print(f"[send_user_notification] flood, ждём {retry} c (попытка {attempt + 1})")
                 async with _notify_lock:
-                    await asyncio.sleep(float(retry) + 0.5)  # притормаживаем все уведомления разом
+                    await asyncio.sleep(min(float(retry), 60) + 0.5)  # притормаживаем все уведомления разом
+                continue
+            if attempt < 2 and any(w in str(e).lower() for w in ("timeout", "server error", "bad gateway", "network", "connection")):
+                await asyncio.sleep(2 + 3 * attempt)   # сбой сети/Telegram — пробуем ещё раз, а не теряем уведомление
                 continue
             print(f"[send_user_notification] failed uid={user_id}: {e}")
             return False
@@ -3405,7 +3849,7 @@ async def log_boss_victory(uid: int, user: dict, boss: dict, hard_mode: bool, co
     loot = ", ".join(re.sub(r"<[^>]+>", "", str(d)) for d in (drops or [])) or "нет"
     await write_activity_log(
         f"BOSS {_log_user_name(uid, user)} | {boss.get('name', '?')}{' (хард)' if hard_mode else ''} | "
-        f"ПОБЕДА: +{coins} монет, +{xp} опыта, лут: {loot}"
+        f"ПОБЕДА: +{format_num(coins)} монет, +{xp} опыта, лут: {loot}"
     )
 
 
@@ -3456,7 +3900,6 @@ async def save_banned_users():
     async with _banned_lock:
         try:
             # Полная синхронизация через upsert_banned если есть, иначе по одному
-            from database import upsert_banned_ids
             await upsert_banned_ids(set(_banned_ids))
         except Exception as e:
             print(f"[save_banned_users] failed: {e}")
@@ -3823,6 +4266,138 @@ class ActivityMiddleware(BaseMiddleware):
             if user:
                 await touch_user_activity(user.id)
 
+# ============================================================
+# === Нижняя клавиатура (как у ботов-игр): главное + разделы ===
+# Кнопка шлёт свой текст; средняя прослойка (outer middleware) превращает его в обычную команду,
+# поэтому все обработчики работают как при ручном вводе. Только в личке.
+# «меню» / «клавиатура» — показать, «скрыть клавиатуру» — убрать.
+# ============================================================
+KB_VERSION = 2   # 2: клавиатура сворачивается значком в поле ввода (is_persistent=False)
+KB_HOME = "⬅️ Главное"
+KB_MAIN_ROWS = [
+    [("🎲 Ролл", "ролл"), ("👑 Боссы", "бс"), ("⚡ Быстрые боссы", "бсс")],
+    [("👤 Профиль", "проф"), ("🎒 Инвентарь", "инв"), ("🗡 Экипировка", "экип")],
+    [("📂 Бои", None), ("📂 Развитие", None), ("📂 Экономика", None)],
+    [("📂 Питомцы и лут", None), ("📂 Отдых", None), ("📂 Ещё", None)],
+]
+KB_SECTIONS = {
+    "📂 Бои": [
+        [("⏳ КД боссов", "бскд"), ("🎉 Ивент", "ивент"), ("🔄 Воскрешение", "рв")],
+        [("🎲 Кратос", "кратос"), ("🌟 Мировой босс", "мб"), ("🐉 Лутиафан", "лутиафан")],
+        [("🗿 Стражи", "стражи"), ("🛡 Подземелье", "башня"), ("🔁 Автоатака", "автоатака")],
+    ],
+    "📂 Развитие": [
+        [("📚 Скиллы", "скиллы"), ("📊 Характеристики", "хары"), ("🧭 Путь", "путь")],
+        [("🎯 Манекены", "маник"), ("🤩 Престиж", "престиж"), ("🆙 Уровень", "ур")],
+        [("🛠 Кузнец", "куз"), ("💠 Обмен осколков", "обмен"), ("📜 Реликварий", "реликварий")],
+        [("🎽 Пояс", "пояс"), ("🧩 Сеты", "сеты"), ("📈 Статистика", "ст")],
+    ],
+    "📂 Экономика": [
+        [("📆 Ежедневка", "ежедневка"), ("✍️ Задания", "задания"), ("🌟 Боевой пропуск", "бп")],
+        [("🛒 Магазин", "магазин"), ("⭐ Донат", "донат"), ("🔄 Автоперезапуск", "арп")],
+        [("💸 Передать", "передать"), ("🏆 Кузница Кратоса", "кратос магазин"), ("🎰 Казино", "казино")],
+    ],
+    "📂 Питомцы и лут": [
+        [("🐾 Домик питомцев", "пет"), ("🐶 Петсы", "петсы"), ("📖 Все питомцы", "питомцы")],
+        [("🧹 Ведьма", "ведьма"), ("⚗️ Алхимик", "алхимик"), ("✨ Баффы", "баффы")],
+        [("🔮 Чародей", "чародей"), ("🎲 Шансы роллов", "шр")],
+    ],
+    "📂 Отдых": [
+        [("🎣 Рыбалка", "рыбалка"), ("🌿 Огород", "огород"), ("🍵 Чайная", "чайная")],
+        [("💎 Кристалл", "кристалл"), ("📖 Бестиарий", "бестиарий"), ("🏅 Достижения", "достижения")],
+        [("🎖 Титулы", "титулы"), ("🎨 Плашки", "плашки")],
+    ],
+    "📂 Ещё": [
+        [("🏆 Топ", "топ"), ("🏛 Клан", "клан"), ("❤️ Грааль", "грааль")],
+        [("🔔 Уведомления", "уведомления"), ("✨ Бонус био", "био")],
+        [("🗒 Хелп", "хелп"), ("📘 Гайд", "гайд"), ("📕 Правила", "правила")],
+        [("🙈 Скрыть клавиатуру", "скрыть клавиатуру")],
+    ],
+}
+KB_BUTTON_CMD: Dict[str, str] = {}
+for _rows in [KB_MAIN_ROWS] + list(KB_SECTIONS.values()):
+    for _row in _rows:
+        for _label, _cmd in _row:
+            if _cmd:
+                KB_BUTTON_CMD[_label] = _cmd
+
+
+def _kb(rows: list, home: bool = False) -> ReplyKeyboardMarkup:
+    keyboard = [[KeyboardButton(text=label) for label, _cmd in row] for row in rows]
+    if home:
+        keyboard.append([KeyboardButton(text=KB_HOME)])
+    # is_persistent=False — в поле ввода появляется значок клавиатуры: им её можно свернуть и развернуть
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, is_persistent=False,
+                               input_field_placeholder="Команда или кнопка ⌨️")
+
+
+def main_reply_keyboard() -> ReplyKeyboardMarkup:
+    return _kb(KB_MAIN_ROWS)
+
+
+async def send_main_keyboard(message: Message, text: str = ""):
+    await message.answer(
+        text or (f"{PE_SPARK} <b>Клавиатура внизу</b>\n\n<blockquote>Главные команды — сразу, остальное — в разделах 📂.\n"
+                 "Свернуть/развернуть — значок ⌨️ справа в поле ввода.\n"
+                 "Убрать совсем: <code>скрыть клавиатуру</code> · вернуть: <code>меню</code></blockquote>"),
+        reply_markup=main_reply_keyboard(), parse_mode="HTML")
+
+
+class ReplyKeyboardMiddleware(BaseMiddleware):
+    """Кнопки нижней клавиатуры → обычные команды; разделы открывают свою клавиатуру."""
+    async def __call__(self, handler, event, data):
+        try:
+            text = getattr(event, "text", None)
+            chat = getattr(event, "chat", None)
+            if text and chat is not None and getattr(chat, "type", "") == "private":
+                if text == KB_HOME:
+                    await event.answer(f"{PE_SPARK} Главное меню", reply_markup=main_reply_keyboard(), parse_mode="HTML")
+                    return None
+                if text in KB_SECTIONS:
+                    await event.answer(f"{PE_SPARK} <b>{html.escape(text[2:].strip())}</b> — выбери кнопку внизу",
+                                       reply_markup=_kb(KB_SECTIONS[text], home=True), parse_mode="HTML")
+                    return None
+                cmd = KB_BUTTON_CMD.get(text)
+                if cmd:
+                    event = event.model_copy(update={"text": cmd})
+                elif getattr(event, "from_user", None):
+                    # один раз показываем клавиатуру тем, кто ещё её не видел
+                    user = db.data.get(str(event.from_user.id)) if db._loaded else None
+                    if isinstance(user, dict) and not user.get("kb_off") and int(user.get("kb_ver", 0) or 0) < KB_VERSION:
+                        user["kb_ver"] = KB_VERSION
+                        try:
+                            await send_main_keyboard(event)
+                        except Exception as e:
+                            print(f"[reply kb] {e}")
+        except Exception as e:
+            print(f"[reply kb middleware] {e}")
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(ReplyKeyboardMiddleware())
+
+
+def set_reply_keyboard_off(uid: int, off: bool) -> None:
+    user = db.data.get(str(uid))
+    if isinstance(user, dict):
+        user["kb_off"] = bool(off)
+        user["kb_ver"] = KB_VERSION
+
+
+@dp.message(lambda msg: msg.text and msg.chat.type == "private" and msg.text.strip().casefold() in ("меню", "клавиатура", "/menu", "показать клавиатуру"))
+async def text_reply_menu(message: Message):
+    set_reply_keyboard_off(message.from_user.id, False)
+    await send_main_keyboard(message)
+
+
+@dp.message(lambda msg: msg.text and msg.text.strip().casefold() in ("скрыть клавиатуру", "убрать клавиатуру"))
+async def text_reply_menu_hide(message: Message):
+    set_reply_keyboard_off(message.from_user.id, True)
+    await message.answer(f"{PE_OK} Клавиатура скрыта и больше не появится сама.\n\n"
+                         "<blockquote>Вернуть — <code>меню</code> или в «уведомления» → «Клавиатура».</blockquote>",
+                         reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
+
+
 dp.message.middleware(RegistrationMiddleware())
 dp.callback_query.middleware(RegistrationMiddleware())
 dp.message.middleware(ActivityMiddleware())
@@ -3849,7 +4424,6 @@ COMMAND_STICKERS: Dict[str, tuple] = {
     "яйца":        ("Инкубатор и яйца", ["инкубатор", "яйца"], False, False),
     "реликварий":  ("Хранитель реликвий", ["реликварий", "хранитель", "реликвии"], False, False),
     "грааль":      ("Лунный грааль", ["грааль", "пыль"], False, False),
-    "луна":        ("Ивент «Кровавая луна»", ["луна", "кровавая"], False, False),
     "стражи":      ("Стражи реликвий", ["стражи", "святилище", "страж"], False, False),
     # --- профиль ---
     "профиль":     ("Профиль", ["проф", "профиль", "profile"], False, False),
@@ -3974,7 +4548,7 @@ async def _show_sticker_list(message: Message):
     stickers = await load_command_stickers()
     groups = [
         ("NPC", ["кузнец", "алхимик", "ведьма", "чародей", "чай", "яйца", "реликварий"]),
-        ("Ивент и грааль", ["луна", "грааль", "стражи"]),
+        ("Грааль и стражи", ["грааль", "стражи"]),
         ("Профиль", ["профиль", "уровень", "статы", "хары", "престиж", "лф", "био", "шансы"]),
         ("Игра", ["ролл", "задания", "топ", "экип", "пояс", "боссы", "бсс", "бскд", "ивент", "воскрешение", "мб", "башня", "клан",
                   "скиллы", "наборы", "пути", "маник", "инвентарь", "баффы", "питомцы", "бп", "сеты", "плашки"]),
@@ -4242,7 +4816,7 @@ NIGHT_EVENT_MSK_END_HOUR = 6
 # ====== ЛОКАЦИИ И БОССЫ ======
 
 def get_msk_now() -> datetime:
-    return datetime.utcnow() + timedelta(hours=3)
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
 
 def is_night_event_active(now: Optional[datetime] = None) -> bool:
     now = now or get_msk_now()
@@ -5112,8 +5686,8 @@ POTION_DEFS = {
         "name": "Зелье скорости",
         "emoji": "⏱️🧪",
         "buff_key": "speed",
-        "description": "Ускоряет авторолл на 20%",
-        "buff_text": "⏱️ +20% скорости авторолла",
+        "description": "Авторолл на 30% быстрее — сверх всех лимитов, даже быстрее 1 сек. (до 0.5 сек.)",
+        "buff_text": "⏱️ авторолл на 30% быстрее (сверх лимита)",
     },
     "coins_potion": {
         "id": "coins_potion",
@@ -5332,6 +5906,9 @@ def apply_xp_buff(user: dict, xp: int) -> int:
 
 def apply_coin_buff(user: dict, coins: int) -> int:
     coins = math.ceil(coins * (1 + get_path_bonus(user, "coins") / 100))
+    greed = get_skill_level(user, "greed")
+    if greed:
+        coins = math.ceil(coins * (1 + greed * 0.01))  # скилл «Алчность»: +1% за уровень, 35 ур. = +35%
     if has_star_pass(user):
         coins = math.ceil(coins * (1 + STAR_PASS_COIN_BONUS))
     if has_buff(user, "coins"):
@@ -5763,7 +6340,7 @@ async def witch_use_potion(user_id: int, potion_id: str, answer_func):
     await db.save_user(user_id, user)
     pdef = POTION_DEFS[potion_id]
     await answer_func(
-        f"🧃 Выпил {pdef['emoji']} <b>{pdef['name']}</b>!\n\n<blockquote>{pdef['buff_text']} — 30 минут.</blockquote>",
+        f"<tg-emoji emoji-id=\"5411512278740640309\">🧪</tg-emoji> Выпил {pdef['emoji']} <b>{pdef['name']}</b>!\n\n<blockquote>{potion_buff_html(pdef)} — 30 минут.</blockquote>",
         None,
     )
 
@@ -5799,6 +6376,21 @@ BOT_RULES_TEXT = (
 async def show_rules(user_id: int, answer_func):
     await answer_func(BOT_RULES_TEXT, None)
 
+def potion_icon(potion_id: str, fallback: str = "🧪") -> str:
+    """Прем-эмодзи зелья из пака (если пак загружен), иначе обычный эмодзи."""
+    tag = pe_tag("p:" + potion_id) if "pe_tag" in globals() else None
+    return tag or fallback
+
+
+def potion_buff_html(pdef: dict) -> str:
+    """Текст бонуса зелья с прем-эмодзи вместо обычного значка в начале."""
+    text = str(pdef.get("buff_text", ""))
+    first, _, rest = text.partition(" ")
+    if not rest:
+        return text
+    return f"{potion_icon(pdef.get('id', ''), first)} {rest}"
+
+
 async def show_buffs(user_id: int, answer_func):
     user = await db.get_user(user_id)
     active = get_active_buffs(user)
@@ -5813,12 +6405,12 @@ async def show_buffs(user_id: int, answer_func):
         "xp": f'<tg-emoji emoji-id="5431631782455819233">{flask}</tg-emoji> +10% ' + "\u043e\u043f\u044b\u0442\u0430",
         "luck": f'<tg-emoji emoji-id="5395325195542078574">{clover}</tg-emoji> +15% ' + "\u0443\u0434\u0430\u0447\u0438",
         "damage": f'<tg-emoji emoji-id="5373173798633752502">{shield}</tg-emoji> +20% ' + "\u0443\u0440\u043e\u043d\u0430",
-        "damage_strong": "🌋 +35% урона",
-        "crit": "💥 +20% крита",
-        "crit_strong": "🧊 +30% крита",
-        "armor_buff": "🛡 −15% входящего урона",
-        "nightmare": "🏰 +25% урона · +10% крита",
-        "speed": f'<tg-emoji emoji-id="5287473790735890430">{hourglass}</tg-emoji> +20% ' + "\u0441\u043a\u043e\u0440\u043e\u0441\u0442\u0438 \u0430\u0432\u0442\u043e\u0440\u043e\u043b\u043b\u0430",
+        "damage_strong": f"{potion_icon('inferno_potion', '🌋')} +35% урона",
+        "crit": f"{potion_icon('crit_potion', '💥')} +20% крита",
+        "crit_strong": f"{potion_icon('frost_potion', '🧊')} +30% крита",
+        "armor_buff": f"{potion_icon('armor_potion', '🛡')} −15% входящего урона",
+        "nightmare": f"{potion_icon('nightmare_potion', '🏰')} +25% урона · +10% крита",
+        "speed": f'<tg-emoji emoji-id="5287473790735890430">{hourglass}</tg-emoji> авторолл на 30% быстрее (сверх лимита)',
         "coins": '<tg-emoji emoji-id="5433594926107481306">\u26aa\ufe0f</tg-emoji> +30% ' + "\u043f\u043e\u043b\u0443\u0447\u0430\u0435\u043c\u044b\u0445 \u043c\u043e\u043d\u0435\u0442 \u043e\u0442\u043e\u0432\u0441\u044e\u0434\u0443",
         **{TEA_DEFS[tid]["buff"]: f"{TEA_EMOJI} {TEA_DEFS[tid]['text']} ({TEA_DEFS[tid]['name'].lower()})" for tid in TEA_DEFS},
         "star_xp": f"{PE_STAR} +{int(STAR_BUFF_XP * 100)}% опыта (свиток опыта)",
@@ -5925,8 +6517,8 @@ async def use_potion_from_inventory(user_id: int, potion_id: str, answer_func, c
     total_min = used * WITCH_POTION_BUFF_SECONDS // 60
     left = max(0, have - used)
     await answer_func(
-        f"🧃 Выпил {pdef['emoji']} <b>{pdef['name']}</b>" + (f" ×{used}" if used > 1 else "") + "!\n\n"
-        f"<blockquote>{pdef['buff_text']} — +{total_min} мин."
+        f"<tg-emoji emoji-id=\"5411512278740640309\">🧪</tg-emoji> Выпил {pdef['emoji']} <b>{pdef['name']}</b>" + (f" ×{used}" if used > 1 else "") + "!\n\n"
+        f"<blockquote>{potion_buff_html(pdef)} — +{total_min} мин."
         + (f"\nОсталось зелий: <b>{left}</b>" if left else "")
         + "\n\nПосмотреть баффы — команда <b>баффы</b>.</blockquote>",
         back,
@@ -5948,13 +6540,14 @@ async def show_boss_cooldowns(user_id: int, answer_func):
             cd = get_boss_cd_remaining(user, boss["id"])
             # без премиум-эмодзи статуса: в Telegram не больше 100 прем-эмодзи на сообщение, а боссов уже 52
             if cd > 0:
-                status = f"<b>{format_cd_time(cd)}</b>"
+                status = render_screen("кд боссов откат", {"время": format_cd_time(cd)})
             else:
-                status = "<b>жив</b>"
-            loc_lines.append(f"  {boss.get('premium_emoji', boss['emoji'])} {html.escape(boss['name'])}: {status}")
+                status = render_screen("кд боссов жив")
+            loc_lines.append(render_screen("кд боссов босс", {"эмодзи": boss.get('premium_emoji', boss['emoji']),
+                                                              "босс": html.escape(boss['name']), "статус": status}))
         if loc_lines:
-            block = f"{loc.get('premium_emoji', loc['emoji'])} <b>{loc['name']}</b>\n" + "\n".join(loc_lines)
-            lines.append(f"<blockquote>{block}</blockquote>")
+            lines.append(render_screen("кд боссов локация", {"эмодзи": loc.get('premium_emoji', loc['emoji']),
+                                                             "локация": loc['name'], "боссы": "\n".join(loc_lines)}))
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Обновить", callback_data="bosscd_refresh", icon_custom_emoji_id="5346321684574003384")],
         [InlineKeyboardButton(
@@ -5968,7 +6561,19 @@ async def show_boss_cooldowns(user_id: int, answer_func):
     if not lines:
         await answer_func(f"{title_emoji} <b>Кулдауны боссов</b>\n\n<blockquote>Все боссы готовы к бою.{footer}</blockquote>", kb)
         return
-    await answer_func(f"{title_emoji} <b>Кулдауны боссов</b>\n\n" + "\n".join(lines) + footer, kb)
+    await answer_func(render_screen("кд боссов", {"локации": "\n".join(lines), "время": updated}), kb)
+
+
+register_screen("кд боссов", "Кулдауны боссов (бскд)",
+                '<tg-emoji emoji-id="5217822164362739968">👑</tg-emoji> <b>Кулдауны боссов</b>\n\n{локации}\n\n<i>Обновлено в {время} МСК</i>',
+                {"локации": "блоки локаций (шаблон «кд боссов локация»)", "время": "время обновления"})
+register_screen("кд боссов локация", "Кулдауны боссов — блок локации",
+                "<blockquote>{эмодзи} <b>{локация}</b>\n{боссы}</blockquote>",
+                {"эмодзи": "эмодзи локации", "локация": "название", "боссы": "строки боссов"})
+register_screen("кд боссов босс", "Кулдауны боссов — строка босса", "  {эмодзи} {босс}: {статус}",
+                {"эмодзи": "эмодзи босса", "босс": "имя", "статус": "«жив» или время"})
+register_screen("кд боссов жив", "Кулдауны боссов — статус «жив»", "<b>жив</b>")
+register_screen("кд боссов откат", "Кулдауны боссов — статус «откат»", "<b>{время}</b>", {"время": "сколько осталось"})
 
 
 @dp.callback_query(F.data == "bosscd_refresh")
@@ -6677,6 +7282,51 @@ def get_prestige_xp_multiplier(rebirths: int) -> float:
     multiplier = (2 ** base_tier) * (1 + 0.2 * extra_tier + 0.02 * extra_tier ** 2)
     return multiplier
 
+# ===== Новый функционал за престижи: каждые 3 престижа после 8-го =====
+# престиж → (название, описание). Максимум престижа — 20, поэтому 8 / 11 / 14 / 17 / 20.
+PRESTIGE_UNLOCKS = {
+    8:  ("5-й слот питомца", "ещё один питомец в слоте"),
+    11: ("Дар престижа", "команда «дар престижа» — бесплатный набор раз в сутки"),
+    14: ("Благословение престижа", "команда «благословение престижа» — раз в сутки на 1 час удача, опыт и монеты"),
+    17: ("Двойные воскрешения", "лимит воскрешений боссов 10 → 20 в сутки и автороллы на 50% дольше"),
+    20: ("Предел мира", "зелий удачи в Даре престижа ×2 и особое звание в «престиж»"),
+}
+PRESTIGE_BLESS_SECONDS = 60 * 60   # длительность «Благословения престижа»
+PRESTIGE_EXTRA_REVIVES = 10
+PRESTIGE_AUTOROLL_MULT = 1.5
+
+
+def prestige_has(user: Optional[dict], need: int) -> bool:
+    return get_rebirth_count(user) >= need
+
+
+def get_prestige_gift(user: dict) -> dict:
+    """Набор «Дара престижа». Свитки и ресурс босса продаются в звёздной лавке, поэтому растут медленно:
+    зелья удачи — 1/2/3/4 (×2 на 20-м), свитки — 1/2/3/4, ресурс босса — 1/1/2/2."""
+    mult = 2 if prestige_has(user, 20) else 1
+    step = max(0, get_rebirth_count(user) - 11) // 3   # +1 на 14, 17, 20
+    return {"luck": (1 + step) * mult, "scrolls": 1 + step, "res": 1 + step // 2, "mult": mult}
+
+
+T_LOCK = '<tg-emoji emoji-id="5296369303661067030">🔒</tg-emoji>'
+T_ARROW = '<tg-emoji emoji-id="5213214459023076318">➡️</tg-emoji>'
+T_CLOVER = '<tg-emoji emoji-id="5395325195542078574">🍀</tg-emoji>'
+T_COIN = '<tg-emoji emoji-id="5463046637842608206">🪙</tg-emoji>'
+
+
+def prestige_unlocks_text(rebirths: int) -> str:
+    lines = []
+    nxt_done = False
+    for need, (name, desc) in PRESTIGE_UNLOCKS.items():
+        if rebirths >= need:
+            lines.append(f"{PE_OK} <b>{need} престиж</b> — {name}: {desc}")
+        else:
+            mark = T_LOCK if nxt_done else T_ARROW
+            lines.append(f"{mark} <b>{need} престиж</b> — {name}: {desc}")
+            nxt_done = True
+    return "\n".join(lines)
+
+
 def get_chest_xp_reward(user: Optional[dict]) -> int:
     return round(10 * get_prestige_xp_multiplier(get_rebirth_count(user)))
 
@@ -6923,10 +7573,34 @@ WEAPON_TYPE_LABELS = {
     "magic": ("🔮", "Магия"),
 }
 
+# прем-эмодзи типов оружия (те же, что у путей) и гравировки
+WEAPON_TYPE_PE = {
+    "melee": '<tg-emoji emoji-id="5467552960479255933">🗡</tg-emoji>',
+    "bow": '<tg-emoji emoji-id="5314779711040134513">🏹</tg-emoji>',
+    "magic": '<tg-emoji emoji-id="5287734091523829559">🔮</tg-emoji>',
+}
+PE_ENGRAVE = '<tg-emoji emoji-id="6267107250578395601">🪓</tg-emoji>'
+PE_WARN = '<tg-emoji emoji-id="5440660757194744323">‼️</tg-emoji>'
+# иконка слота брони — берём рисунок железной вещи этого слота из пака эмодзи
+_ARMOR_SLOT_PE_KEYS = {"helmet": "a:iron_helmet", "chestplate": "a:iron_chest", "bracers": "a:iron_bracers",
+                       "bracers_left": "a:iron_bracers", "bracers_right": "a:iron_bracers",
+                       "leggings": "a:iron_greaves", "boots": "a:iron_boots"}
+
+
+def weapon_type_emoji(weapon_type: str) -> str:
+    return WEAPON_TYPE_PE.get(weapon_type, WEAPON_TYPE_PE["melee"])
+
+
+def armor_slot_icon(slot) -> str:
+    key = _ARMOR_SLOT_PE_KEYS.get(str(slot or ""))
+    tag = pe_tag(key) if key and "pe_tag" in globals() else None
+    return tag or "📋"
+
+
 def get_weapon_type_text(item: dict) -> str:
     weapon_type = infer_weapon_type(item)
-    emoji, name = WEAPON_TYPE_LABELS.get(weapon_type, ("🗡", "Ближний бой"))
-    return f"{emoji} Тип: <b>{name}</b>"
+    _emoji, name = WEAPON_TYPE_LABELS.get(weapon_type, ("🗡", "Ближний бой"))
+    return f"{weapon_type_emoji(weapon_type)} Тип: <b>{name}</b>"
 
 def get_armor_resource_lines(item: dict) -> List[str]:
     lines = []
@@ -6945,11 +7619,11 @@ def get_item_card_text(item: dict) -> str:
         return (
             f"{item['emoji']} <b>{item['name']}</b>\n\n<blockquote>"
             f"{rarity_html(item.get('rarity'), item.get('rarity_emoji', ''))} <i>{item['rarity_name']}</i>\n"
-            f"📋 {slot_name}\n"
+            f"{armor_slot_icon(item.get('slot'))} {slot_name}\n"
             f"<tg-emoji emoji-id=\"6269538837723090339\">⭐️</tg-emoji> {item.get('level', 1)} Уровень\n"
-            f"🪓 Гравировка: <b>{item.get('engraving_level', 0)}/{MAX_ENGRAVING_LEVEL}</b>\n"
+            f"{PE_ENGRAVE} Гравировка: <b>{item.get('engraving_level', 0)}/{MAX_ENGRAVING_LEVEL}</b>\n"
             f"{fusion_line}"
-            f"<tg-emoji emoji-id=\"5404843113652970870\">❤️</tg-emoji> +{item['hp']} HP"
+            f"<tg-emoji emoji-id=\"5404843113652970870\">❤️</tg-emoji> +{format_num(item['hp'])} HP"
             + (("\n" + "\n".join(resource_lines)) if resource_lines else "")
             + "</blockquote>"
         )
@@ -6959,10 +7633,10 @@ def get_item_card_text(item: dict) -> str:
         f"{rarity_html(item.get('rarity'), item.get('rarity_emoji', ''))} <i>{item['rarity_name']}</i>\n"
         f"{get_weapon_type_text(item)}\n"
         f"<tg-emoji emoji-id=\"6269538837723090339\">⭐️</tg-emoji> {item.get('weapon_level', 1)} Уровень\n"
-        f"🪓 Гравировка: <b>{item.get('engraving_level', 0)}/{MAX_ENGRAVING_LEVEL}</b>\n"
+        f"{PE_ENGRAVE} Гравировка: <b>{item.get('engraving_level', 0)}/{MAX_ENGRAVING_LEVEL}</b>\n"
         f"{fusion_line}"
-        f"<tg-emoji emoji-id=\"5373173798633752502\">⚔️</tg-emoji> Урон: {item['dmg'][0]}–{item['dmg'][1]}\n"
-        f"<tg-emoji emoji-id=\"5332336747072208845\">🔥</tg-emoji> Сила: {calculate_weapon_power(item)}</blockquote>"
+        f"<tg-emoji emoji-id=\"5373173798633752502\">⚔️</tg-emoji> Урон: {format_num(item['dmg'][0])}–{format_num(item['dmg'][1])}\n"
+        f"<tg-emoji emoji-id=\"5332336747072208845\">🔥</tg-emoji> Сила: {format_num(calculate_weapon_power(item))}</blockquote>"
     )
 
 def get_smith_item_blockquote(item: dict) -> str:
@@ -6982,16 +7656,17 @@ def get_smith_item_blockquote(item: dict) -> str:
         lines = [
             f"{item.get('emoji', '')} <b>{item_name}</b>",
             f"{rarity_emoji} <i>{rarity_name}</i>",
-            f"📋 {slot_name}",
+            f"{armor_slot_icon(item.get('slot'))} {slot_name}",
             f"{level_emoji} {item.get('level', 1)} Уровень",
             f"{engrave_emoji} Гравировка: <b>{engr}/{MAX_ENGRAVING_LEVEL}</b>",
             f"<tg-emoji emoji-id=\"6269538837723090339\">⭐</tg-emoji> Скрещивание: <b>{fusion_level}/{MAX_FUSION_LEVEL}</b>",
-            f"{hp_emoji} HP: +{item.get('hp', 0)}",
+            f"{hp_emoji} HP: +{format_num(item.get('hp', 0))}",
         ]
         lines.extend(get_armor_resource_lines(item))
     else:
         dmg = item.get("dmg", (0, 0))
         _, type_name = WEAPON_TYPE_LABELS.get(infer_weapon_type(item), ("🗡", "Ближний бой"))
+        type_emoji = weapon_type_emoji(infer_weapon_type(item))
         lines = [
             f"{item.get('emoji', '')} <b>{item_name}</b>",
             f"{rarity_emoji} <i>{rarity_name}</i>",
@@ -6999,8 +7674,8 @@ def get_smith_item_blockquote(item: dict) -> str:
             f"{level_emoji} {item.get('weapon_level', 1)} Уровень",
             f"{engrave_emoji} Гравировка: <b>{engr}/{MAX_ENGRAVING_LEVEL}</b>",
             f"<tg-emoji emoji-id=\"6269538837723090339\">⭐</tg-emoji> Скрещивание: <b>{fusion_level}/{MAX_FUSION_LEVEL}</b>",
-            f"{damage_emoji} Урон: {dmg[0]}–{dmg[1]}",
-            f"{power_emoji} Сила: {calculate_weapon_power(item)}",
+            f"{damage_emoji} Урон: {format_num(dmg[0])}–{format_num(dmg[1])}",
+            f"{power_emoji} Сила: {format_num(calculate_weapon_power(item))}",
         ]
     return "<blockquote>" + "\n".join(lines) + "</blockquote>"
 
@@ -7018,7 +7693,7 @@ def format_belt_armor_line(piece: Optional[dict]) -> str:
         return "—"
     return (
         f"{piece['emoji']} {html.escape(piece['name'])} | "
-        f"<tg-emoji emoji-id=\"5404843113652970870\">❤️</tg-emoji> +{piece.get('hp', 0)} HP"
+        f"<tg-emoji emoji-id=\"5404843113652970870\">❤️</tg-emoji> +{format_num(piece.get('hp', 0))} HP"
     )
 
 # Премиум-иконки для предметов на кнопках пояса (id предмета → id премиум-эмодзи)
@@ -7030,9 +7705,13 @@ ITEM_PREMIUM_ICON_IDS = {
 def build_belt_keyboard(user: Optional[dict] = None) -> InlineKeyboardMarkup:
     equipped_weapon = user.get("equipped") if user else None
     equipped_armor = user.get("equipped_armor", {}) if user else {}
-    weapon_text = ("💢" + equipped_weapon.get("emoji", "⚔️")) if equipped_weapon else "⚔️"
+    weapon_icon = ITEM_PREMIUM_ICON_IDS.get((equipped_weapon or {}).get("id")) if equipped_weapon else None
+    if equipped_weapon and weapon_icon:
+        weapon_text = "💢"
+    else:
+        weapon_text = ("💢" + equipped_weapon.get("emoji", "⚔️")) if equipped_weapon else "⚔️"
     buttons = [
-        [InlineKeyboardButton(text=weapon_text, callback_data="belt_slot|weapon")],
+        [InlineKeyboardButton(text=weapon_text, callback_data="belt_slot|weapon", icon_custom_emoji_id=weapon_icon)],
     ]
     for slot_group in (("helmet",), ("chestplate",), ("bracers_left", "bracers_right"), ("leggings",), ("boots",)):
         row = []
@@ -7065,7 +7744,7 @@ def get_belt_text(user: dict) -> str:
     return (
         "<tg-emoji emoji-id=\"5215614521107820706\">🩶</tg-emoji> Пояс\n\n<blockquote>"
         f"<tg-emoji emoji-id=\"5373173798633752502\">⚔️</tg-emoji> Бонус урона: <b>{damage_text}</b>\n"
-        f"<tg-emoji emoji-id=\"5404843113652970870\">❤️</tg-emoji> Бонус HP: <b>+{armor_hp}</b>\n"
+        f"<tg-emoji emoji-id=\"5404843113652970870\">❤️</tg-emoji> Бонус HP: <b>+{format_num(armor_hp)}</b>\n"
         f"{format_armor_set_line(user)}".rstrip("\n") + "</blockquote>"
     )
 
@@ -7178,7 +7857,9 @@ TOP_ALL_TIME_ONLY = {"power", "prestige", "donate", "tower"}
 
 
 def get_user_donated_stars(user: dict) -> int:
-    return sum(int(p.get("stars", 0) or 0) for p in (user.get("star_purchases") or []) if not p.get("refunded"))
+    """Звёзды в топ доната: покупки, которые бот засчитал сам, + добавленные админом вручную («донат+»)."""
+    auto = sum(int(p.get("stars", 0) or 0) for p in (user.get("star_purchases") or []) if not p.get("refunded"))
+    return max(0, auto + int(user.get("manual_donated_stars", 0) or 0))
 
 
 # Привилегии топа доната: действуют, пока игрок держит место в общем топе (по звёздам за всё время).
@@ -7711,13 +8392,13 @@ async def show_loot_inventory(user_id, answer_func):
     if not present_items:
         if potions_count:
             await answer_func(
-                "🎒 <b>Склад пуст</b>\n\n<blockquote>Лут и фрагменты падают с боссов.</blockquote>",
+                render_screen("склад пуст"),
                 InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
                     text=f"🧪 Зелья ({potions_count})", callback_data="inv_potions"
                 )]]),
             )
         else:
-            await answer_func("🎒 <b>Склад пуст</b>\n\n<blockquote>Лут и фрагменты падают с боссов.</blockquote>", None)
+            await answer_func(render_screen("склад пуст"), None)
         return
 
     def sort_key(entry):
@@ -7744,17 +8425,12 @@ async def show_loot_inventory(user_id, answer_func):
         else:
             loot_lines.append(line)
 
-    text_parts = ["🎒 <b>Склад</b>"]
-    if relic_lines:
-        text_parts.append("<b>Реликвии</b> (для Хранителя реликвий):\n" + "\n".join(relic_lines))
-    if loot_lines:
-        text_parts.append("<b>Лут:</b>\n" + "\n".join(loot_lines))
-    if fragment_lines:
-        text_parts.append("<b>Фрагменты:</b>\n" + "\n".join(fragment_lines))
-    if shard_lines:
-        text_parts.append("<b>Осколки:</b>\n" + "\n".join(shard_lines))
-    if essence_lines:
-        text_parts.append("<b>Эссенции:</b>\n" + "\n".join(essence_lines))
+    sections = []
+    for title, lines_ in (("Реликвии (для Хранителя реликвий)", relic_lines), ("Лут", loot_lines),
+                          ("Фрагменты", fragment_lines), ("Осколки", shard_lines), ("Эссенции", essence_lines)):
+        if lines_:
+            sections.append(render_screen("склад раздел", {"название": title, "список": "\n".join(lines_)}))
+    text_parts = [render_screen("склад", {"разделы": "\n\n".join(sections)})]
 
     keyboard = None
     if potions_count:
@@ -7763,6 +8439,13 @@ async def show_loot_inventory(user_id, answer_func):
         )]])
 
     await answer_func("\n\n".join(text_parts), keyboard)
+
+
+register_screen("склад", "Склад лута", "<tg-emoji emoji-id=\"5854908544712707500\">📦</tg-emoji> <b>Склад</b>\n\n{разделы}",
+                {"разделы": "разделы склада (каждый оформляется шаблоном «склад раздел»)"})
+register_screen("склад раздел", "Склад — один раздел (Лут, Фрагменты…)", "<b>{название}:</b>\n{список}",
+                {"название": "название раздела", "список": "предметы раздела"})
+register_screen("склад пуст", "Склад — пустой", "<tg-emoji emoji-id=\"5854908544712707500\">📦</tg-emoji> <b>Склад пуст</b>\n\n<blockquote>Лут и фрагменты падают с боссов.</blockquote>")
 
 
 ENGRAVING_COSTS = {
@@ -7816,7 +8499,10 @@ def set_item_level(item: dict, level: int):
         item["weapon_level"] = level
 
 def get_smith_upgrade_cost(item: dict) -> int:
-    lvl = get_item_level(item)
+    return smith_upgrade_cost_at(get_item_level(item))
+
+
+def smith_upgrade_cost_at(lvl: int) -> int:
     if lvl <= 100:
         return math.ceil(200 * (1.1 ** max(0, lvl - 1)))
     # выше 100 уровня рост мягче (×1.06), иначе улучшение стоит больше 1000 часов дохода
@@ -7922,9 +8608,9 @@ def get_fusion_chance(item: dict, boost: Optional[dict] = None, user: Optional[d
 
 def get_fusion_stat_text(item: dict) -> str:
     if item.get("item_type") == "armor":
-        return f"HP: <b>+{item.get('hp', 0)}</b>"
+        return f"HP: <b>+{format_num(item.get('hp', 0))}</b>"
     dmg = item.get("dmg", (0, 0))
-    return f"Урон: <b>{dmg[0]}–{dmg[1]}</b> · Сила: <b>{calculate_weapon_power(item)}</b>"
+    return f"Урон: <b>{format_num(dmg[0])}–{format_num(dmg[1])}</b> · Сила: <b>{format_num(calculate_weapon_power(item))}</b>"
 
 def apply_smith_level_upgrade(item: dict):
     ensure_item_base_stats(item)
@@ -7967,14 +8653,145 @@ async def show_blacksmith(user_id: int, answer_func):
         'повышает уровень предмета до твоего уровня +5.</blockquote>\n\n'
         '<blockquote><tg-emoji emoji-id="6267107250578395601">😃</tg-emoji><b>Гравировка</b> - '
         'усиливает урон/HP: уровни 1–10 по +10%, 11–20 по +4%, 21–50 по +2% (с 11-го нужны осколки IV уровня).</blockquote>\n\n'
-        '<blockquote><tg-emoji emoji-id="6269538837723090339">⭐</tg-emoji><b>Скрещивание</b> - объединяет одинаковую экипировку и даёт звёзды до 5.</blockquote>'
+        '<blockquote><tg-emoji emoji-id="6269538837723090339">⭐</tg-emoji><b>Скрещивание</b> - объединяет одинаковую экипировку и даёт звёзды до 5.</blockquote>\n\n'
+        f'<blockquote>{BOSS_RESOURCE_DEFS["engraving_shard_2"]["emoji"]}<b>Обмен осколков</b> - '
+        f'{SHARD_UP_RATE} осколка → 1 уровнем выше, 1 осколок → {SHARD_DOWN_RATE} уровнем ниже.</blockquote>\n\n'
+        '<blockquote><tg-emoji emoji-id="5213214428958306222">🛠</tg-emoji><b>Перековка</b> - '
+        'дорогая попытка поднять редкость предмета на ступень. Шанс крошечный, монеты не возвращаются.</blockquote>\n\n'
+        '<blockquote><tg-emoji emoji-id="5346321684574003384">🔄</tg-emoji><b>Перенос улучшений</b> - '
+        'гравировка и звёзды переходят на новую вещь той же или выше редкости. Дорого: монеты, осколки IV, эссенции и трофеи Кратоса.</blockquote>'
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Улучшить", callback_data="smith_mode|upgrade", icon_custom_emoji_id="6084922627736996647")],
         [InlineKeyboardButton(text="Гравировка", callback_data="smith_mode|engrave", icon_custom_emoji_id="6267107250578395601")],
         [InlineKeyboardButton(text="Скрещивание", callback_data="smith_mode|fusion", icon_custom_emoji_id="6269538837723090339")],
+        [InlineKeyboardButton(text="Перековка", callback_data="smith_mode|reforge", icon_custom_emoji_id="5213214428958306222")],
+        [InlineKeyboardButton(text="Перенос улучшений", callback_data="tr|menu", icon_custom_emoji_id="5346321684574003384")],
+        [InlineKeyboardButton(text="Обмен осколков", callback_data="shx|menu", icon_custom_emoji_id="5458384287634042890")],
     ])
     await answer_func(text, kb)
+
+
+# ============================================================
+# === Обмен осколков гравировки (у Кузнеца) ===
+# SHARD_UP_RATE осколков уровня N → 1 осколок уровня N+1;  1 осколок уровня N → SHARD_DOWN_RATE уровня N−1.
+# ============================================================
+SHARD_UP_RATE = 4
+SHARD_DOWN_RATE = 2
+SHARD_IDS = ["engraving_shard_1", "engraving_shard_2", "engraving_shard_3", "engraving_shard_4"]
+SHARD_ROMAN = ["I", "II", "III", "IV"]
+
+
+def shard_exchange(user: dict, direction: str, tier: int, batches) -> tuple:
+    """tier — индекс осколка, КОТОРЫЙ отдаём (0..3). batches — число обменов или 'max'. → (отдано, получено)."""
+    res = user.setdefault("boss_loot", {})
+    if direction == "up":
+        if not 0 <= tier < len(SHARD_IDS) - 1:
+            return 0, 0
+        src, dst, cost, gain = SHARD_IDS[tier], SHARD_IDS[tier + 1], SHARD_UP_RATE, 1
+    else:
+        if not 1 <= tier < len(SHARD_IDS):
+            return 0, 0
+        src, dst, cost, gain = SHARD_IDS[tier], SHARD_IDS[tier - 1], 1, SHARD_DOWN_RATE
+    have = int(res.get(src, 0) or 0)
+    possible = have // cost
+    n = possible if batches == "max" else min(possible, max(0, int(batches)))
+    if n <= 0:
+        return 0, 0
+    res[src] = have - n * cost
+    res[dst] = int(res.get(dst, 0) or 0) + n * gain
+    return n * cost, n * gain
+
+
+async def show_shard_exchange(user_id: int, answer_func, note: str = ""):
+    user = await db.get_user(user_id)
+    res = user.get("boss_loot") or {}
+    em = [BOSS_RESOURCE_DEFS[sid]["emoji"] for sid in SHARD_IDS]
+    have = [int(res.get(sid, 0) or 0) for sid in SHARD_IDS]
+    stock = "\n".join(
+        f"{em[i]} <b>Осколок {SHARD_ROMAN[i]}</b> — {format_num(have[i])}"
+        + (f"  <i>→ {have[i] // SHARD_UP_RATE} × {SHARD_ROMAN[i + 1]}</i>" if i < len(SHARD_IDS) - 1 and have[i] >= SHARD_UP_RATE else "")
+        for i in range(len(SHARD_IDS)))
+    smith = '<tg-emoji emoji-id="5080591035768242999">📱</tg-emoji>'
+    text = (
+        f"{em[3]} <b>О Б М Е Н   О С К О Л К О В</b> {em[3]}\n"
+        "<i>Кузнец Терентий переплавляет осколки гравировки</i>\n\n"
+        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
+        + f"<blockquote>{smith} <b>Терентий</b>\n«Мелкие сплавлю в крупный, крупный расколю на мелкие. "
+        "Только не жди, что я раздаю осколки даром.»</blockquote>\n\n"
+        f"{PE_BAG} <b>Твои осколки</b>\n<blockquote>{stock}</blockquote>\n\n"
+        f"{PE_TOOL} <b>Курс</b>\n"
+        f"<blockquote>{PE_LEVELUP} Сплавить: <b>{SHARD_UP_RATE}</b> {em[0]} → <b>1</b> {em[1]} (уровнем выше)\n"
+        f"{PE_RESTART} Расколоть: <b>1</b> {em[1]} → <b>{SHARD_DOWN_RATE}</b> {em[0]} (уровнем ниже)</blockquote>\n\n"
+        f"<i>{PE_SPARK} Осколки IV нужны для гравировки с 11-го уровня.</i>"
+    )
+    rows = []
+    for i in range(len(SHARD_IDS) - 1):
+        up_n = have[i] // SHARD_UP_RATE
+        row = [InlineKeyboardButton(text=f"Сплавить {SHARD_ROMAN[i]} → {SHARD_ROMAN[i + 1]}", callback_data=f"shx|up|{i}|1",
+                                    icon_custom_emoji_id=premium_emoji_id(em[i + 1]))]
+        if up_n > 1:
+            row.append(InlineKeyboardButton(text=f"Все · +{up_n}", callback_data=f"shx|up|{i}|max",
+                                            icon_custom_emoji_id="6084922627736996647"))
+        rows.append(row)
+    for i in range(1, len(SHARD_IDS)):
+        row = [InlineKeyboardButton(text=f"Расколоть {SHARD_ROMAN[i]} → {SHARD_ROMAN[i - 1]}", callback_data=f"shx|down|{i}|1",
+                                    icon_custom_emoji_id=premium_emoji_id(em[i - 1]))]
+        if have[i] >= 10:
+            row.append(InlineKeyboardButton(text=f"×10 · +{10 * SHARD_DOWN_RATE}", callback_data=f"shx|down|{i}|10",
+                                            icon_custom_emoji_id="5346321684574003384"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="Обновить", callback_data="shx|menu", icon_custom_emoji_id="5346321684574003384"),
+                 InlineKeyboardButton(text="К кузнецу", callback_data="shx|back", icon_custom_emoji_id="5215361191051798408")])
+    await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+_shard_locks: Dict[int, asyncio.Lock] = {}
+
+
+@dp.callback_query(F.data.startswith("shx|"))
+async def cb_shard_exchange(call: CallbackQuery):
+    uid = call.from_user.id
+    if not await db.has_user(uid):
+        await call.answer()
+        return
+    parts = call.data.split("|")
+    edit = lambda t, kb: edit_for_user(call, t, kb)
+    if parts[1] == "back":
+        await call.answer()
+        await show_blacksmith(uid, edit)
+        return
+    if parts[1] in ("up", "down") and len(parts) == 4:
+        async with _shard_locks.setdefault(uid, asyncio.Lock()):
+            user = await db.get_user(uid)
+            try:
+                tier = int(parts[2])
+            except ValueError:
+                await call.answer()
+                return
+            batches = "max" if parts[3] == "max" else parts[3]
+            gave, got = shard_exchange(user, parts[1], tier, batches)
+            if not got:
+                need = SHARD_UP_RATE if parts[1] == "up" else 1
+                await call.answer(f"Не хватает осколков: нужно {need}.", show_alert=True)
+                return
+            await save_runtime_state(uid, user)
+        dst = tier + 1 if parts[1] == "up" else tier - 1
+        e_src, e_dst = BOSS_RESOURCE_DEFS[SHARD_IDS[tier]]["emoji"], BOSS_RESOURCE_DEFS[SHARD_IDS[dst]]["emoji"]
+        note = (f"{PE_OK} <b>Готово!</b> {e_src} −{gave} {SHARD_ROMAN[tier]}  →  {e_dst} <b>+{got}</b> {SHARD_ROMAN[dst]}")
+        await write_activity_log(f"SHARDS {_log_user_name(uid, user)} | {gave}×{SHARD_ROMAN[tier]} → {got}×{SHARD_ROMAN[dst]}")
+        await call.answer("Обменяно!")
+        await show_shard_exchange(uid, edit, note)
+        return
+    await call.answer()
+    await show_shard_exchange(uid, edit)
+
+
+@dp.message(lambda msg: msg.text and (message_command(msg) == "обмен" or (msg.text or "").strip().casefold() in ("обмен осколков", "осколки")))
+async def text_shard_exchange(message: Message):
+    if not await db.has_user(message.from_user.id):
+        return
+    await show_shard_exchange(message.from_user.id, lambda t, kb: reply_to_user(message, t, kb))
 
 async def show_smith_type(user_id: int, mode: str, answer_func):
     if mode == "upgrade":
@@ -7991,6 +8808,12 @@ async def show_smith_type(user_id: int, mode: str, answer_func):
             '<blockquote>Выбери тип предмета, на котором хотел бы сделать гравировку'
             '<tg-emoji emoji-id="6267107250578395601">😃</tg-emoji>.</blockquote>'
         )
+    elif mode == "reforge":
+        text = (
+            '<tg-emoji emoji-id="5213214428958306222">🛠</tg-emoji> <b>Перековка</b>\n\n'
+            '<blockquote>Терентий раскалит горн до бела и попробует перековать вещь в редкость выше. '
+            'Получается не всегда, а чем выше редкость — тем реже. Выбери тип предмета.</blockquote>'
+        )
     else:
         text = (
             '<tg-emoji emoji-id="6269538837723090339">⭐</tg-emoji> <b>Скрещивание экипировки</b>\n\n'
@@ -8004,12 +8827,14 @@ async def show_smith_type(user_id: int, mode: str, answer_func):
     await answer_func(text, kb)
 
 async def show_smith_rarities(user_id: int, mode: str, item_type: str, answer_func):
-    if mode not in {"upgrade", "engrave", "fusion"} or item_type not in {"weapon", "armor"}:
+    if mode not in {"upgrade", "engrave", "fusion", "reforge"} or item_type not in {"weapon", "armor"}:
         await show_blacksmith(user_id, answer_func)
         return
     user = await db.get_user(user_id) or {}
     rows = []
     for rarity in RARITY_ORDER:
+        if mode == "reforge" and rarity not in REFORGE_CHANCES:
+            continue
         try:
             source_items = get_fusion_smith_items(user, item_type, rarity) if mode == "fusion" else get_smith_items(user, item_type, rarity)
             count = len(source_items)
@@ -8050,7 +8875,7 @@ async def show_smith_items(user_id: int, mode: str, item_type: str, rarity: str,
         iid = item.get("iid")
         engr = item.get("engraving_level", 0)
         stars = get_fusion_stars(item)
-        stat = f"+{item.get('hp', 0)} HP" if item.get("item_type") == "armor" else f"{item.get('dmg', (0,0))[0]}-{item.get('dmg', (0,0))[1]}"
+        stat = f"+{format_num(item.get('hp', 0))} HP" if item.get("item_type") == "armor" else f"{item.get('dmg', (0,0))[0]}-{item.get('dmg', (0,0))[1]}"
         item_lines.append(f"{item['emoji']} {html.escape(item['name'])}{(' ' + stars) if stars else ''} - \u0443\u0440. {get_item_level(item)} - \u0433\u0440. {engr}/{MAX_ENGRAVING_LEVEL} - {stat}")
         rows.append([InlineKeyboardButton(text=f"{item['emoji']} {item['name']}{(' ' + stars) if stars else ''} - \u0443\u0440. {get_item_level(item)}", callback_data=f"smith_item|{mode}|{iid}")])
     if not items:
@@ -8073,7 +8898,29 @@ async def show_smith_item(user_id: int, mode: str, iid: str, answer_func):
     if not item:
         await answer_func("<blockquote>\u274c \u041f\u0440\u0435\u0434\u043c\u0435\u0442 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d.</blockquote>", None)
         return
-    if mode == "upgrade":
+    if mode == "reforge":
+        rarity = item.get("rarity")
+        chance = REFORGE_CHANCES.get(rarity)
+        ready = chance is not None
+        if ready:
+            nxt = REFORGE_ORDER[REFORGE_ORDER.index(rarity) + 1]
+            cost = get_reforge_cost(user, item)
+            ratio = RARITIES[nxt]["mult"] / RARITIES[rarity]["mult"]
+            tries = int((user.get("reforge_stats") or {}).get("tries", 0))
+            text = (
+                '<tg-emoji emoji-id="5213214428958306222">🛠</tg-emoji> <b>Перековка</b>\n\n'
+                f"{get_smith_item_blockquote(item)}\n"
+                f"<blockquote>{rarity_premium_emoji(rarity)} {RARITIES[rarity]['name']} → {rarity_premium_emoji(nxt)} <b>{RARITIES[nxt]['name']}</b>\n"
+                f"Шанс: <b>{chance:g}%</b> · статы при успехе ×{ratio:.2f}\n"
+                "Уровень, гравировка и звёзды сохраняются.</blockquote>\n"
+                f"<blockquote>{PE_COIN} Цена попытки: <b>{format_num(cost)}</b>\n"
+                f"Твои монеты: <b>{format_num(int(user.get('coins', 0)))}</b>\n"
+                f"<i>При неудаче монеты сгорают, предмет остаётся как был. Твоих попыток всего: {tries}.</i></blockquote>"
+            )
+        else:
+            text = ('<tg-emoji emoji-id="5213214428958306222">🛠</tg-emoji> <b>Перековка</b>\n\n'
+                    f"{get_smith_item_blockquote(item)}\n<blockquote>Эту редкость перековать нельзя.</blockquote>")
+    elif mode == "upgrade":
         max_level = user.get("level", 1) + 5
         cost = get_smith_upgrade_cost(item)
         ready = get_item_level(item) < max_level
@@ -8081,7 +8928,7 @@ async def show_smith_item(user_id: int, mode: str, iid: str, answer_func):
             f"\U0001f6e0 <b>\u0423\u043b\u0443\u0447\u0448\u0435\u043d\u0438\u0435</b>\n\n{get_item_card_text(item)}\n\n"
             f"<blockquote>\u041c\u0430\u043a\u0441\u0438\u043c\u0443\u043c \u0441\u0435\u0439\u0447\u0430\u0441: <b>{max_level}</b> \u0443\u0440.\n"
             f"\u0421\u0442\u043e\u0438\u043c\u043e\u0441\u0442\u044c: <b>{cost}</b> \u043c\u043e\u043d\u0435\u0442\n"
-            f"\u0422\u0432\u043e\u0438 \u043c\u043e\u043d\u0435\u0442\u044b: <b>{user.get('coins', 0)}</b></blockquote>"
+            f"\u0422\u0432\u043e\u0438 \u043c\u043e\u043d\u0435\u0442\u044b: <b>{format_num(user.get('coins', 0))}</b></blockquote>"
         )
     elif mode == "engrave":
         next_level = item.get("engraving_level", 0) + 1
@@ -8094,7 +8941,7 @@ async def show_smith_item(user_id: int, mode: str, iid: str, answer_func):
             for shard_id, amount in cost["shards"].items():
                 info = BOSS_RESOURCE_DEFS[shard_id]
                 res_lines.append(f"{info['emoji']} {resources.get(shard_id, 0)}/{amount} {info['name']}")
-            res_lines.append(f"{coin_emoji}: <b>{user.get('coins', 0)}</b>")
+            res_lines.append(f"{coin_emoji}: <b>{format_num(user.get('coins', 0))}</b>")
             text = (
                 '<tg-emoji emoji-id="6267107250578395601">😃</tg-emoji> <b>Гравировка</b>\n\n'
                 f"{get_smith_item_blockquote(item)}\n"
@@ -8147,15 +8994,29 @@ async def show_smith_item(user_id: int, mode: str, iid: str, answer_func):
     else:
         await show_blacksmith(user_id, answer_func)
         return
+    if ready and mode in ("upgrade", "engrave"):
+        _ms, _mc, _msh = smith_max_plan(user, item, mode)
+        if _ms >= 2:
+            shards_txt = "".join(f" · {BOSS_RESOURCE_DEFS.get(sid, {}).get('emoji', '💎')} {n}" for sid, n in _msh.items())
+            text += (f"\n\n<blockquote>{PE_LEVELUP} <b>На максимум</b> одной кнопкой: "
+                     f"<b>+{_ms}</b> {'ур.' if mode == 'upgrade' else 'гравировки'} за {PE_COIN} <b>{format_num(_mc)}</b>{shards_txt}</blockquote>")
     rows = []
     if ready:
-        if mode == "upgrade":
+        if mode == "reforge":
+            button_text = f"🔥 Перековать · {format_num(get_reforge_cost(user, item))}"
+        elif mode == "upgrade":
             button_text = "\u2705 \u0423\u043b\u0443\u0447\u0448\u0438\u0442\u044c"
         elif mode == "engrave":
             button_text = "\u2705 \u0413\u0440\u0430\u0432\u0438\u0440\u043e\u0432\u0430\u0442\u044c"
         else:
             button_text = "⭐ Скрестить"
         rows.append([InlineKeyboardButton(text=button_text, callback_data=f"smith_do|{mode}|{iid}")])
+        if mode in ("upgrade", "engrave"):
+            max_steps, max_cost, _sh = smith_max_plan(user, item, mode)
+            if max_steps >= 2:
+                rows.append([InlineKeyboardButton(
+                    text=f"На максимум: +{max_steps} · {format_num(max_cost)}",
+                    callback_data=f"smith_do|{mode}_max|{iid}", icon_custom_emoji_id="6084922627736996647")])
     if mode == "fusion" and ready:
         boost_row = []
         for shard_id, percent in FUSION_SHARD_BOOSTS.items():
@@ -8174,7 +9035,136 @@ async def show_smith_item(user_id: int, mode: str, iid: str, answer_func):
     rows.append([InlineKeyboardButton(text="\u2b05\ufe0f \u041d\u0430\u0437\u0430\u0434", callback_data=f"smith_type|{mode}|{'armor' if item.get('item_type') == 'armor' else 'weapon'}")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
 
+# === Перековка: дорогая попытка поднять редкость предмета на ступень (главная «утечка» монет) ===
+REFORGE_ORDER = ["common", "uncommon", "rare", "epic", "legendary", "mythic", "nightmare"]
+REFORGE_CHANCES = {          # шанс успеха, %
+    "common": 15.0, "uncommon": 10.0, "rare": 6.0, "epic": 3.0, "legendary": 1.5, "mythic": 0.25,   # мифик → кошмар: специально очень тяжело
+}
+REFORGE_COSTS = {            # фиксированная цена одной попытки в монетах (не зависит от уровня игрока)
+    "common": 50_000, "uncommon": 150_000, "rare": 500_000,
+    "epic": 2_000_000, "legendary": 10_000_000, "mythic": 100_000_000,   # мифик → кошмар
+}
+
+
+def get_reforge_cost(user: dict, item: dict) -> int:
+    return int(REFORGE_COSTS.get(item.get("rarity"), 50_000))
+
+
+def rarity_premium_emoji(rarity: str) -> str:
+    return PREMIUM_RARITY_EMOJIS.get(rarity) or RARITIES.get(rarity, {}).get("emoji", "")
+
+
+def reforge_item(item: dict) -> str:
+    """Поднимает редкость на ступень: статы × (множитель новой / старой), уровень, гравировка, звёзды — как были.
+    Облик берётся у вещи новой редкости того же типа (оружие — того же вида, броня — того же слота)."""
+    old = item.get("rarity")
+    new = REFORGE_ORDER[REFORGE_ORDER.index(old) + 1]
+    ratio = RARITIES[new]["mult"] / RARITIES[old]["mult"]
+    ensure_item_base_stats(item)
+    if item.get("item_type") == "armor":
+        for key in ("base_hp", "base_mana", "base_stamina"):
+            if key in item:
+                item[key] = max(1, math.ceil(int(item[key]) * ratio))
+        lookup = "bracers" if item.get("slot") in ("bracers_left", "bracers_right") else item.get("slot")
+        pool = ARMOR.get(new, {}).get(lookup, [])
+    else:
+        lo, hi = item.get("base_dmg", item.get("dmg", (1, 1)))
+        item["base_dmg"] = (max(1, math.ceil(lo * ratio)), max(1, math.ceil(hi * ratio)))
+        item["dmg_mult"] = RARITIES[new]["mult"]
+        pool = [w for w in WEAPONS.get(new, []) if infer_weapon_type(w) == item.get("weapon_type")]
+    if pool:
+        tpl = random.choice(pool)
+        item["id"], item["name"], item["emoji"] = tpl["id"], tpl["name"], tpl["emoji"]
+    info = RARITIES[new]
+    item.update({"rarity": new, "rarity_name": info["name"], "rarity_emoji": info["emoji"], "rarity_color": info["color"]})
+    apply_item_fusion_stats(item)
+    if item.get("item_type") != "armor":
+        item["power"] = calculate_weapon_power(item)
+    return new
+
+
+async def smith_apply_reforge(user_id: int, iid: str, answer_func, popup_func=None):
+    lock = _reforge_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        user = await db.get_user(user_id)
+        item = get_user_item_by_iid(user, iid)
+        if not item:
+            if popup_func:
+                await popup_func("Предмет не найден.", show_alert=True)
+            return
+        chance = REFORGE_CHANCES.get(item.get("rarity"))
+        if chance is None:
+            if popup_func:
+                await popup_func("Эту редкость перековать нельзя.", show_alert=True)
+            return
+        cost = get_reforge_cost(user, item)
+        if int(user.get("coins", 0)) < cost:
+            if popup_func:
+                await popup_func(f"Нужно {format_num(cost)} монет.", show_alert=True)
+            return
+        user["coins"] = int(user.get("coins", 0)) - cost
+        st = user.setdefault("reforge_stats", {})
+        st["tries"] = int(st.get("tries", 0)) + 1
+        st["spent"] = int(st.get("spent", 0)) + cost
+        old_rarity = item.get("rarity")
+        success = random.random() * 100 < chance
+        if success:
+            new = reforge_item(item)
+            st["wins"] = int(st.get("wins", 0)) + 1
+            refresh_equipped_from_inventory(user)
+            if _RARITY_RANK.get(new, -1) >= _RARITY_RANK.get(ANNOUNCE_ITEM_MIN_RARITY, 99):
+                announce_item_drop(user_id, user, item, "перековка у кузнеца")
+        await save_runtime_state(user_id, user)
+    await write_activity_log(f"REFORGE {_log_user_name(user_id, user)} | {item.get('name')} {old_rarity} −{cost} → "
+                             + (f"УСПЕХ {item.get('rarity')}" if success else "неудача"))
+    if popup_func:
+        if success:
+            await popup_func(f"🔥 ПЕРЕКОВАНО! {RARITIES[old_rarity]['name']} → {RARITIES[item['rarity']]['name']}: {item.get('name')}", show_alert=True)
+        else:
+            await popup_func(f"Металл треснул — не вышло. −{format_num(cost)} монет.", show_alert=True)
+    await show_smith_item(user_id, "reforge", iid, answer_func)
+
+
+_reforge_locks: Dict[int, asyncio.Lock] = {}
+
+
+def smith_max_plan(user: dict, item: dict, mode: str) -> tuple:
+    """Сколько шагов улучшения/гравировки можно сделать сразу. → (шагов, монет, {осколок: штук})."""
+    coins = int(user.get("coins", 0) or 0)
+    steps, spent, shards = 0, 0, {}
+    if mode == "upgrade":
+        lvl, max_level = get_item_level(item), int(user.get("level", 1) or 1) + 5
+        while lvl < max_level and steps < 2000:
+            cost = smith_upgrade_cost_at(lvl)
+            if spent + cost > coins:
+                break
+            spent += cost
+            lvl += 1
+            steps += 1
+    elif mode == "engrave":
+        res = user.get("boss_loot") or {}
+        lvl = int(item.get("engraving_level", 0) or 0)
+        while True:
+            cost = ENGRAVING_COSTS.get(lvl + 1)
+            if not cost or spent + cost["coins"] > coins:
+                break
+            if any(int(res.get(sid, 0) or 0) < shards.get(sid, 0) + n for sid, n in cost["shards"].items()):
+                break
+            spent += cost["coins"]
+            for sid, n in cost["shards"].items():
+                shards[sid] = shards.get(sid, 0) + n
+            lvl += 1
+            steps += 1
+    return steps, spent, shards
+
+
 async def smith_apply(user_id: int, mode: str, iid: str, answer_func, popup_func=None):
+    if mode in ("upgrade_max", "engrave_max"):
+        await smith_apply_max(user_id, mode[:-4], iid, answer_func, popup_func)
+        return
+    if mode == "reforge":
+        await smith_apply_reforge(user_id, iid, answer_func, popup_func)
+        return
     user = await db.get_user(user_id)
     item = get_user_item_by_iid(user, iid)
     if not item:
@@ -8191,7 +9181,7 @@ async def smith_apply(user_id: int, mode: str, iid: str, answer_func, popup_func
         cost = get_smith_upgrade_cost(item)
         if user.get("coins", 0) < cost:
             if popup_func:
-                await popup_func(f"Нужно {cost} монет.", show_alert=True)
+                await popup_func(f"Нужно {format_num(cost)} монет.", show_alert=True)
             return
         user["coins"] -= cost
         apply_smith_level_upgrade(item)
@@ -8280,6 +9270,38 @@ async def smith_apply(user_id: int, mode: str, iid: str, answer_func, popup_func
         await popup_func("Готово!", show_alert=True)
     await show_smith_item(user_id, mode, iid, answer_func)
 
+async def smith_apply_max(user_id: int, mode: str, iid: str, answer_func, popup_func=None):
+    """Улучшение/гравировка сразу на максимум, на который хватает монет (и осколков)."""
+    user = await db.get_user(user_id)
+    item = get_user_item_by_iid(user, iid)
+    if not item:
+        if popup_func:
+            await popup_func("Предмет не найден.", show_alert=True)
+        return
+    steps, spent, shards = smith_max_plan(user, item, mode)
+    if steps <= 0:
+        if popup_func:
+            await popup_func("Сейчас не на что улучшать — не хватает монет или осколков, или уже максимум.", show_alert=True)
+        return
+    user["coins"] = int(user.get("coins", 0)) - spent
+    resources = user.setdefault("boss_loot", {})
+    for sid, n in shards.items():
+        resources[sid] = int(resources.get(sid, 0)) - n
+    before = get_item_level(item) if mode == "upgrade" else int(item.get("engraving_level", 0) or 0)
+    for _ in range(steps):
+        if mode == "upgrade":
+            apply_smith_level_upgrade(item)
+        else:
+            apply_smith_engraving(item)
+    after = get_item_level(item) if mode == "upgrade" else int(item.get("engraving_level", 0) or 0)
+    refresh_equipped_from_inventory(user)
+    await save_runtime_state(user_id, user)
+    if popup_func:
+        what = "Уровень" if mode == "upgrade" else "Гравировка"
+        await popup_func(f"{what}: {before} → {after} (+{steps}). Потрачено {format_num(spent)} монет.", show_alert=True)
+    await show_smith_item(user_id, mode, iid, answer_func)
+
+
 def get_skill_effect_text(user: dict, skill_id: str) -> str:
     level = get_skill_level(user, skill_id)
     if skill_id == "armor":
@@ -8299,7 +9321,7 @@ def get_skill_effect_text(user: dict, skill_id: str) -> str:
     if skill_id == "luck":
         return f"Удача: <b>+{level * 0.5:.1f}%</b>"
     if skill_id == "roll_speed":
-        return f"Интервал авторолла: <b>{get_auto_roll_interval(user)} сек.</b>"
+        return f"Интервал авторолла: <b>{format_roll_interval(user)} сек.</b>"
     if skill_id == "mana":
         return f"Мана: <b>{get_max_mana(user)}</b>"
     if skill_id == "stamina":
@@ -8308,6 +9330,12 @@ def get_skill_effect_text(user: dict, skill_id: str) -> str:
         return f"Монеты за рыбу: <b>×{get_fish_skill_mult(user):.1f}</b>"
     if skill_id == "farming":
         return f"Монеты за урожай: <b>×{get_farm_skill_mult(user):.1f}</b>"
+    if skill_id == "crit_damage":
+        return f"Крит. урон: <b>+{level * 3}%</b> (итого {get_crit_damage_percent(user):.0f}%)"
+    if skill_id == "evasion":
+        return f"Уклонение: <b>{get_evasion_chance(user):.0f}%</b>"
+    if skill_id == "greed":
+        return f"Монеты: <b>+{level}%</b>"
     return ""
 
 def is_skill_visible_for_user(user: dict, skill_id: str) -> bool:
@@ -8317,10 +9345,10 @@ def is_skill_visible_for_user(user: dict, skill_id: str) -> bool:
         return get_user_path(user) == "bow"
     return True
 
-def skill_bar(level: int, width: int = 10) -> str:
+def skill_bar(level: int, width: int = 10, max_level: int = SKILL_MAX_LEVEL) -> str:
     """Полоска прокачки скилла: ▰▰▰▱▱▱…"""
-    filled = max(0, min(width, round(width * int(level) / SKILL_MAX_LEVEL)))
-    return "▰" * filled + "▱" * (width - filled)
+    filled = max(0, min(width, round(width * int(level) / max(1, max_level))))
+    return pe_bar("gold", filled, width, "▰" * filled + "▱" * (width - filled))
 
 
 def skill_level_effect(skill_id: str, lvl: int) -> str:
@@ -8340,6 +9368,9 @@ def skill_level_effect(skill_id: str, lvl: int) -> str:
         "stamina": f"+{lvl * 2}% выносливости",
         "fishing": f"×{1 + SKILL_FISH_COIN_PER_LEVEL * lvl:.1f} монет за рыбу",
         "farming": f"×{1 + SKILL_FARM_COIN_PER_LEVEL * lvl:.1f} монет за урожай",
+        "crit_damage": f"+{lvl * 3}% крит. урона",
+        "evasion": f"+{lvl}% уклонения",
+        "greed": f"+{lvl}% монет",
     }
     return table.get(skill_id, "")
 
@@ -8368,7 +9399,7 @@ async def show_skills(user_id: int, answer_func):
             continue
         lvl = get_skill_level(user, skill_id)
         row.append(InlineKeyboardButton(
-            text=f"{lvl}/{SKILL_MAX_LEVEL}" + (" ★" if lvl >= SKILL_MAX_LEVEL else ""),
+            text=f"{lvl}/{skill_max_level(skill_id)}" + (" ★" if lvl >= skill_max_level(skill_id) else ""),
             callback_data=f"skill|{skill_id}",
             icon_custom_emoji_id=SKILL_BUTTON_EMOJI_IDS.get(skill_id),
         ))
@@ -8462,19 +9493,19 @@ async def show_skill_detail(user_id: int, skill_id: str, answer_func):
     points = get_skill_points(user)
     skill_emoji = skill_premium_emoji(skill_id, info.get("emoji", ""))
     effect_text = get_skill_effect_text(user, skill_id)
-    nxt = f"\n{PE_SPARK} Следующий уровень: <b>{html.escape(skill_level_effect(skill_id, level + 1))}</b>" if level < SKILL_MAX_LEVEL else f"\n{PE_TROPHY} <b>Максимальный уровень!</b>"
+    nxt = f"\n{PE_SPARK} Следующий уровень: <b>{html.escape(skill_level_effect(skill_id, level + 1))}</b>" if level < skill_max_level(skill_id) else f"\n{PE_TROPHY} <b>Максимальный уровень!</b>"
     text = (
         f"{skill_emoji} <b>{html.escape(info['name'])}</b>\n\n"
         f"<blockquote>{html.escape(info['description'])}\n"
         f"За уровень: <b>{html.escape(info['per_level'])}</b></blockquote>\n\n"
-        f"<blockquote><b>{skill_bar(level)}</b> {level}/{SKILL_MAX_LEVEL}\n"
+        f"<blockquote><b>{skill_bar(level, 10, skill_max_level(skill_id))}</b> {level}/{skill_max_level(skill_id)}\n"
         f"{PE_SPARK} Очки талантов: <b>{points}</b>\n"
         f"{effect_text}{nxt}</blockquote>"
     )
     rows = []
-    if level < SKILL_MAX_LEVEL:
+    if level < skill_max_level(skill_id):
         rows.append([InlineKeyboardButton(text="Вкачать", callback_data=f"skill_up|{skill_id}", icon_custom_emoji_id="5370831521039017384")])
-        max_add = min(points, SKILL_MAX_LEVEL - level)
+        max_add = min(points, skill_max_level(skill_id) - level)
         if max_add > 1:
             rows.append([InlineKeyboardButton(text=f"Вкачать всё (+{max_add})", callback_data=f"skill_up|{skill_id}|max", icon_custom_emoji_id="6084922627736996647")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="skills", icon_custom_emoji_id="5215361191051798408")])
@@ -8491,11 +9522,11 @@ async def upgrade_skill(user_id: int, skill_id: str, answer_func, popup_func=Non
             await popup_func("Нет очков талантов.", show_alert=True)
         return
     level = get_skill_level(user, skill_id)
-    if level >= SKILL_MAX_LEVEL:
+    if level >= skill_max_level(skill_id):
         if popup_func:
             await popup_func("Уже максимум.", show_alert=True)
         return
-    add = min(get_skill_points(user), SKILL_MAX_LEVEL - level) if all_points else 1
+    add = min(get_skill_points(user), skill_max_level(skill_id) - level) if all_points else 1
     user.setdefault("skills", {})[skill_id] = level + add
     user["skill_points"] = get_skill_points(user) - add
     recalculate_user_combat_stats(user, active_battles.get(user_id))
@@ -8526,6 +9557,8 @@ SKILL_NAME_ALIASES = {
     "скорость ролла": "roll_speed", "скорость": "roll_speed", "ролл": "roll_speed", "роллы": "roll_speed", "авторолл": "roll_speed",
     "мана": "mana", "выносливость": "stamina",
     "рыбалка": "fishing", "рыба": "fishing", "рыбак": "fishing", "рыбацкая жила": "fishing",
+    "сокрушение": "crit_damage", "крит урон": "crit_damage", "критурон": "crit_damage",
+    "уклонение": "evasion", "уклон": "evasion", "алчность": "greed", "жадность": "greed",
     "ферма": "farming", "огород": "farming", "фермер": "farming", "золотой урожай": "farming",
 }
 
@@ -8552,7 +9585,7 @@ def parse_skill_set_text(text: str) -> tuple:
         if not sid:
             unknown.append(name)
             continue
-        lvl = max(0, min(SKILL_MAX_LEVEL, lvl))
+        lvl = max(0, min(skill_max_level(sid), lvl))
         if sid in seen:
             entries[seen[sid]] = (sid, lvl)
         else:
@@ -8578,7 +9611,7 @@ def get_skill_set_entries(user: dict, slot: int) -> List[tuple]:
         except (TypeError, ValueError, IndexError, KeyError):
             continue
         if sid in SKILL_DEFS and lvl > 0:
-            out.append((sid, min(SKILL_MAX_LEVEL, lvl)))
+            out.append((sid, min(skill_max_level(sid), lvl)))
     return out
 
 
@@ -8697,7 +9730,7 @@ async def show_skill_set_slot(user_id: int, slot: int, answer_func, note: str = 
             info = SKILL_DEFS[sid]
             skill_lines.append(
                 f"{skill_premium_emoji(sid, info.get('emoji', ''))} <b>{html.escape(info['name'])}</b>\n"
-                f"<b>{skill_bar(lvl)}</b> {lvl}/{SKILL_MAX_LEVEL} · {html.escape(skill_level_effect(sid, lvl))}"
+                f"<b>{skill_bar(lvl, 10, skill_max_level(sid))}</b> {lvl}/{skill_max_level(sid)} · {html.escape(skill_level_effect(sid, lvl))}"
             )
         body = "\n\n".join(skill_lines)
         foot = f"{PE_SPARK} Нужно очков: <b>{pts}</b> · у тебя всего: <b>{total}</b>"
@@ -8935,7 +9968,7 @@ async def show_characteristics(user_id: int, answer_func):
         '<tg-emoji emoji-id="5431816358675366190">🆙</tg-emoji> Опыт: <b>+{:.1f}%</b>'.format(get_passive_xp_bonus_percent(user)),
         '<tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji> Монеты: <b>+{:.0f}%</b>'.format(coin_bonus),
         '<tg-emoji emoji-id="5395325195542078574">🍀</tg-emoji> Удача: <b>+{:.1f}%</b>'.format((get_luck_skill_multiplier(user) - 1) * 100),
-        '<tg-emoji emoji-id="5287473790735890430">⏳</tg-emoji> Интервал авторолла: <b>{} сек.</b>'.format(get_auto_roll_interval(user)),
+        '<tg-emoji emoji-id="5287473790735890430">⏳</tg-emoji> Интервал авторолла: <b>{} сек.</b>'.format(format_roll_interval(user)),
     ]
     if get_user_path(user) == "magic":
         mana_emoji = PATHS["magic"].get("premium_emoji", PATHS["magic"]["emoji"])
@@ -8946,7 +9979,7 @@ async def show_characteristics(user_id: int, answer_func):
     effects = (user.get("battle_effects") or {})
     battle_buff_lines = []
     if effects.get("aim_turns", 0) > 0:
-        battle_buff_lines.append(f"🎯 Прицеливание: крит +50%/+100% · ходов осталось: {effects['aim_turns']}")
+        battle_buff_lines.append(f"🎯 Прицеливание: крит +35%/+60% · ходов осталось: {effects['aim_turns']}")
     if effects.get("war_cry_turns", 0) > 0:
         battle_buff_lines.append(f"📣 Боевой клич: урон +30% · ходов осталось: {effects['war_cry_turns']}")
     if effects.get("shield_turns", 0) > 0:
@@ -9049,38 +10082,88 @@ async def confirm_path_select(user_id: int, path_id: str, answer_func):
     ])
     await answer_func(text, kb)
 
+PATH_LEVELS_PAGE = 10
+
+
 async def show_path_levels(user_id: int, answer_func, page: Optional[int] = None):
+    """Все уровни пути: пройденные, следующий и будущие (можно листать до 500)."""
     user = await db.get_user(user_id)
     path = get_user_path(user)
     if not path:
         await show_paths(user_id, answer_func)
         return
     level = get_path_level(user)
-    max_page = min((PATH_MAX_LEVEL - 1) // 5, (level - 1) // 5)
+    max_page = (PATH_MAX_LEVEL - 1) // PATH_LEVELS_PAGE
+    cur_page = min(max_page, level // PATH_LEVELS_PAGE if level < PATH_MAX_LEVEL else max_page)
     if page is None:
-        page = max_page
+        page = cur_page
     page = max(0, min(max_page, int(page)))
-    start = page * 5 + 1
-    end = min(PATH_MAX_LEVEL, start + 4)
+    start = page * PATH_LEVELS_PAGE + 1
+    end = min(PATH_MAX_LEVEL, start + PATH_LEVELS_PAGE - 1)
     path_emoji = PATHS[path].get("premium_emoji", PATHS[path]["emoji"])
+    done_e = '<tg-emoji emoji-id="5325593644122524396">✅</tg-emoji>'
+    lock_e = '<tg-emoji emoji-id="5296369303661067030">🔒</tg-emoji>'
     level_lines = []
     for idx in range(start, end + 1):
-        name, desc, _ = PATH_LEVELS[path][idx - 1]
-        mark = ' <tg-emoji emoji-id="5325593644122524396">✅</tg-emoji>' if idx <= level else ""
-        level_lines.append(f"<b>{idx}.</b> {html.escape(name)} — {html.escape(desc)}{mark}")
+        name, desc, eff = PATH_LEVELS[path][idx - 1]
+        skill = eff.get("skill")
+        sk = f" {PE_SPARK}" if skill else ""
+        if idx <= level:
+            level_lines.append(f"{done_e} <b>{idx}.</b> {html.escape(name)} — {html.escape(desc)}{sk}")
+        elif idx == level + 1:
+            level_lines.append(f"{PE_LEVELUP} <b>{idx}. {html.escape(name)}</b> — {html.escape(desc)}{sk}  <i>← следующий</i>")
+        else:
+            level_lines.append(f"{lock_e} <i>{idx}. {html.escape(name)} — {html.escape(desc)}</i>{sk}")
+    # что ещё впереди: сумма будущих прибавок и ближайший новый скилл
+    ahead: Dict[str, float] = {}
+    next_skill = None
+    for idx in range(level + 1, PATH_MAX_LEVEL + 1):
+        _n, _d, eff = PATH_LEVELS[path][idx - 1]
+        for k, v in eff.items():
+            if k == "skill":
+                if next_skill is None and v in PATH_SKILL_INFO:
+                    next_skill = (idx, v)
+            elif k in _PATH_BONUS_TEXT:
+                ahead[k] = ahead.get(k, 0.0) + float(v)
+    xp_have = int(user.get("path_xp", 0) or 0)
+    xp_need = get_path_xp_required(level) if level < PATH_MAX_LEVEL else 0
+    if level >= PATH_MAX_LEVEL:
+        progress = f"{PE_TROPHY} Путь пройден до конца!"
+    else:
+        progress = f"До {level + 1} уровня: <b>{format_num(xp_have)}/{format_num(xp_need)}</b> опыта"
+    ahead_text = ""
+    if ahead:
+        # реальная прибавка с учётом софт-капа: бонус на 500 уровне минус бонус сейчас
+        maxed = dict(user, path_level=PATH_MAX_LEVEL)
+        real = {k: get_path_bonus(maxed, k) - get_path_bonus(user, k) for k in ahead}
+        top = sorted(((k, v) for k, v in real.items() if v >= 0.05), key=lambda kv: -kv[1])[:5]
+        ahead_text = ("\n\n" + f"{PE_SPARK} <b>Впереди до {PATH_MAX_LEVEL} уровня</b>\n<blockquote>"
+                      + "\n".join(f"+{v:.1f}% {_PATH_BONUS_TEXT[k]}" for k, v in top)
+                      + (f"\nНовый скилл — на <b>{next_skill[0]}</b> уровне: {html.escape(PATH_SKILL_INFO[next_skill[1]].get('name', next_skill[1]))}"
+                         if next_skill else "")
+                      + "\n<i>Итоговая прибавка — уже с учётом ослабления больших бонусов.</i></blockquote>")
     text = (
-        f"{path_emoji} <b>{PATHS[path]['name']}:</b>\n\n"
-        f"<blockquote>Мастерство: <b>{level}/{PATH_MAX_LEVEL}</b> · блок <b>{page + 1}/{max_page + 1}</b></blockquote>\n\n"
+        f"{path_emoji} <b>{PATHS[path]['name']}</b> · уровни пути\n\n"
+        f"<blockquote>Мастерство: <b>{level}/{PATH_MAX_LEVEL}</b>\n{progress}\n"
+        f"Уровни <b>{start}–{end}</b> · страница <b>{page + 1}/{max_page + 1}</b></blockquote>\n\n"
         f"<blockquote>{chr(10).join(level_lines)}</blockquote>"
+        + ahead_text
     )
     rows = []
     nav = []
+    if page >= 5:
+        nav.append(InlineKeyboardButton(text="« 50", callback_data=f"path_levels|{page - 5}"))
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"path_levels|{page - 1}"))
     if page < max_page:
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"path_levels|{page + 1}"))
+    if page + 5 <= max_page:
+        nav.append(InlineKeyboardButton(text="50 »", callback_data=f"path_levels|{page + 5}"))
     if nav:
         rows.append(nav)
+    if page != cur_page:
+        rows.append([InlineKeyboardButton(text=f"К моему уровню ({level})", callback_data=f"path_levels|{cur_page}",
+                                          icon_custom_emoji_id="6084922627736996647")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="paths", icon_custom_emoji_id="5215361191051798408")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -9165,9 +10248,9 @@ MQ_ICON_BACK = "5215361191051798408"
 MQ_ICON_BROKEN = "5352669272575321097"
 
 
-def _mq_bar(value: float, maximum: float, width: int = 10) -> str:
+def _mq_bar(value: float, maximum: float, width: int = 10, theme: str = "green") -> str:
     filled = 0 if maximum <= 0 else max(0, min(width, round(width * value / maximum)))
-    return "▰" * filled + "▱" * (width - filled)
+    return pe_bar(theme, filled, width, "▰" * filled + "▱" * (width - filled))
 
 
 async def show_mannequin(user_id: int, answer_func):
@@ -9176,7 +10259,7 @@ async def show_mannequin(user_id: int, answer_func):
         await save_runtime_state(user_id, user)
     path = get_user_path(user)
     if not path:
-        await answer_func("🪵 <b>Манекен</b>\n\n<blockquote>Сначала выбери путь: <b>пути</b>.</blockquote>", None)
+        await answer_func("<tg-emoji emoji-id=\"5235516570628796933\">🪵</tg-emoji> <b>Манекен</b>\n\n<blockquote>Сначала выбери путь: <b>пути</b>.</blockquote>", None)
         return
     info = PATHS[path]
     mannequin = ensure_mannequin(user)
@@ -9199,7 +10282,7 @@ async def show_mannequin(user_id: int, answer_func):
         f"{MANNEQUIN_EMOJI} <b>{info['mannequin']}</b>\n\n"
         f"<blockquote>Статус: <b>{status}</b></blockquote>\n\n"
         f"<blockquote>{MANNEQUIN_TIME_EMOJI} Запас тренировок\n"
-        f"<b>{_mq_bar(train_secs, MANNEQUIN_MAX_TRAINING_SECONDS)}</b> {format_training_time(train_secs)}\n\n"
+        f"<b>{_mq_bar(train_secs, MANNEQUIN_MAX_TRAINING_SECONDS, 10, 'blue')}</b> {format_training_time(train_secs)}\n\n"
         f"{MANNEQUIN_REPAIR_EMOJI} Прочность\n"
         f"<b>{_mq_bar(durability, 100)}</b> {durability}%</blockquote>\n\n"
         f"<blockquote>{PE_SPARK} 1 минута тренировки = <b>{get_mannequin_xp_per_minute(user)} опыта мастерства</b> (растёт с уровнем пути)\n"
@@ -9299,7 +10382,7 @@ async def show_mannequin_time(user_id: int, answer_func):
     train_secs = get_display_training_seconds(mannequin)
     await answer_func(
         f"{MANNEQUIN_TIME_EMOJI} <b>Фарм времени</b>\n\n"
-        f"<blockquote>Запас тренировок\n<b>{_mq_bar(train_secs, MANNEQUIN_MAX_TRAINING_SECONDS)}</b> {format_training_time(train_secs)}\n\n"
+        f"<blockquote>Запас тренировок\n<b>{_mq_bar(train_secs, MANNEQUIN_MAX_TRAINING_SECONDS, 10, 'blue')}</b> {format_training_time(train_secs)}\n\n"
         f"Прочность\n<b>{_mq_bar(durability, 100)}</b> {durability}%</blockquote>\n\n"
         f"<blockquote>{PE_SPARK} Каждый удар даёт <b>+{MANNEQUIN_HIT_MINUTES} минут</b> тренировки.</blockquote>",
         kb,
@@ -9659,24 +10742,22 @@ PET_BUFF_NAMES = {
     "vampirism": "Вампиризм",
 }
 
-PET_SECOND_SLOT_PRESTIGE = 5  # второй слот питомца (раньше — со 150 уровня)
+PET_SLOT_PRESTIGES = [4, 5, 6, 7, 8]   # с какого престижа открывается слот питомца 1…5
+PET_MAX_SLOTS = len(PET_SLOT_PRESTIGES)
+PET_SECOND_SLOT_PRESTIGE = PET_SLOT_PRESTIGES[1]
 
 
 def get_pet_slots(user: Optional[dict]) -> int:
     prestige = get_rebirth_count(user)
-    if prestige >= PET_SECOND_SLOT_PRESTIGE:
-        return 2
-    if prestige >= 4:
-        return 1
-    return 0
+    return sum(1 for need in PET_SLOT_PRESTIGES if prestige >= need)
 
 def normalize_pet_storage(user: dict):
     user.setdefault("pets", [])
-    equipped = user.setdefault("equipped_pets", [None, None])
-    while len(equipped) < 2:
+    equipped = user.setdefault("equipped_pets", [None] * PET_MAX_SLOTS)
+    while len(equipped) < PET_MAX_SLOTS:
         equipped.append(None)
-    if len(equipped) > 2:
-        del equipped[2:]
+    if len(equipped) > PET_MAX_SLOTS:
+        del equipped[PET_MAX_SLOTS:]
     user.setdefault("pet_eggs", {})
     incubator = user.setdefault("pet_incubator", [{"egg_id": None, "started_at": 0, "ready_at": 0}])
     if not isinstance(incubator, list):
@@ -9776,7 +10857,7 @@ def get_pet_by_iid(user: dict, iid: Any) -> Optional[dict]:
     return None
 
 def get_equipped_pet(user: dict, slot: int) -> Optional[dict]:
-    equipped = user.get("equipped_pets", [None, None])
+    equipped = user.get("equipped_pets", [None] * PET_MAX_SLOTS)
     if slot < 0 or slot >= len(equipped) or not equipped[slot]:
         return None
     return get_pet_by_iid(user, equipped[slot])
@@ -10121,26 +11202,18 @@ async def show_pets(user_id: int, answer_func, rarity_filter: str = "", pet_filt
     elif not choosing_pet_group:
         lines.extend([
             "",
-            f"<blockquote>Слоты: <b>{slots}/2</b> · {cake}Зефирки: <b>{user.get('marshmallows', 0)}</b></blockquote>",
+            f"<blockquote>Слоты: <b>{slots}/{PET_MAX_SLOTS}</b> · {cake}Зефирки: <b>{user.get('marshmallows', 0)}</b></blockquote>",
         ])
     if messages:
         lines.append("\n<blockquote><b>Петы доели:</b>\n" + "\n".join(messages) + "</blockquote>")
-    equipped = user.get("equipped_pets", [None, None])
+    equipped = user.get("equipped_pets", [None] * PET_MAX_SLOTS)
     slot_lines = ["<b>Слоты:</b>"]
-    for idx in range(2):
+    for idx in range(PET_MAX_SLOTS):
         pet = get_equipped_pet(user, idx)
-        lock = "" if idx < slots else f" {lock_emoji}"
+        lock = "" if idx < slots else f" {lock_emoji} {PET_SLOT_PRESTIGES[idx]} престиж"
         slot_lines.append(f"{idx + 1}. {get_pet_emoji(pet)} {html.escape(pet['name'])}" if pet else f"{idx + 1}. Пусто{lock}")
     if not slot_selecting and not choosing_pet_group:
         lines.append("\n<blockquote>" + "\n".join(slot_lines) + "</blockquote>")
-    if not slot_selecting and not choosing_pet_group and user.get("pet_eggs"):
-        eggs = []
-        for egg_id, amount in user["pet_eggs"].items():
-            if amount:
-                egg = PET_EGGS.get(egg_id, {})
-                eggs.append(f"{egg.get('emoji', '🥚')} {egg.get('name', egg_id)} x{amount}")
-        if eggs:
-            lines.append("\n<blockquote><b>Яйца:</b>\n" + "\n".join(eggs) + "</blockquote>")
     if not user.get("pets"):
         lines.append("\n<blockquote>Петов пока нет. Купи яйцо в магазине питомцев.</blockquote>")
     elif rarity_filter and pet_filter and not filtered_pets:
@@ -10150,10 +11223,10 @@ async def show_pets(user_id: int, answer_func, rarity_filter: str = "", pet_filt
 
     rows = []
     if not rarity_filter and not slot_selecting:
-        for idx in range(2):
+        for idx in range(PET_MAX_SLOTS):
             pet = get_equipped_pet(user, idx)
             if idx >= slots:
-                lock_text = "4 престиж" if idx == 0 else f"{PET_SECOND_SLOT_PRESTIGE} престиж"
+                lock_text = f"{PET_SLOT_PRESTIGES[idx]} престиж"
                 rows.append([InlineKeyboardButton(text=f"Слот {idx + 1} · закрыт до {lock_text}", callback_data="noop")])
             else:
                 if pet:
@@ -10241,6 +11314,9 @@ async def show_pets(user_id: int, answer_func, rarity_filter: str = "", pet_filt
 async def show_pet_menu(user_id: int, answer_func):
     user = await db.get_user(user_id)
     messages = process_pet_feeds(user)
+    hatched = hatch_leftover_eggs(user_id, user)
+    if hatched:
+        messages = list(messages) + ["<b>Открылись яйца:</b>"] + hatched
     if messages:
         recalculate_user_combat_stats(user, active_battles.get(user_id))
         await save_runtime_state(user_id, user)
@@ -10251,17 +11327,14 @@ async def show_pet_menu(user_id: int, answer_func):
     lines = [
         f"{paw} <b>Пет</b>",
         "",
-        "<blockquote>Добро пожаловать в домик питомцев.\nВыбери пета, открой яйцо или загляни в магазин.</blockquote>",
+        "<blockquote>Добро пожаловать в домик питомцев.\nВыбери пета или загляни в магазин — яйца открываются сразу.</blockquote>",
         "",
         f"<blockquote>{cake} Зефирки: <b>{user.get('marshmallows', 0)}</b></blockquote>",
     ]
     if messages:
         lines.append("\n<blockquote><b>Петы доели:</b>\n" + "\n".join(messages) + "</blockquote>")
     rows = []
-    rows.append([
-        InlineKeyboardButton(text="Яйца", callback_data="pet_incubator", icon_custom_emoji_id="5332550902731535734"),
-        InlineKeyboardButton(text="Петсы", callback_data="pets", icon_custom_emoji_id="5355014719855944810"),
-    ])
+    rows.append([InlineKeyboardButton(text="Петсы", callback_data="pets", icon_custom_emoji_id="5355014719855944810")])
     rows.append([InlineKeyboardButton(text="Все питомцы", callback_data="pets_all|0", icon_custom_emoji_id="5258111319831227095")])
     rows.append([InlineKeyboardButton(text="Магазин питомцев", callback_data="pet_shop", icon_custom_emoji_id="5258194951434417615")])
     await answer_func("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
@@ -10276,7 +11349,7 @@ async def show_pet_detail(user_id: int, iid: int, answer_func, rarity_filter: st
         await show_pets(user_id, answer_func, rarity_filter, pet_filter)
         return
     slots = get_pet_slots(user)
-    equipped = user.setdefault("equipped_pets", [None, None])
+    equipped = user.setdefault("equipped_pets", [None] * PET_MAX_SLOTS)
     equipped_slot = next((idx for idx, current_iid in enumerate(equipped) if current_iid == iid), None)
     rows = []
     if equipped_slot is not None:
@@ -10319,7 +11392,12 @@ def return_incubating_eggs(user: dict) -> int:
 
 
 async def show_pet_incubator(user_id: int, answer_func):
-    """Экран «Яйца»: яйца открываются сразу, без инкубатора."""
+    """Вкладки «Яйца» больше нет: команды «яйца»/«инкубатор» ведут в домик питомцев,
+    где оставшиеся яйца открываются сами."""
+    await show_pet_menu(user_id, answer_func)
+
+
+async def _old_show_pet_incubator(user_id: int, answer_func):
     user = await db.get_user(user_id)
     if return_incubating_eggs(user):
         await db.save_user(user_id, user)
@@ -10341,6 +11419,44 @@ async def show_pet_incubator(user_id: int, answer_func):
     rows.append([InlineKeyboardButton(text="Магазин питомцев", callback_data="pet_shop", icon_custom_emoji_id="5440841102871517055")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="pet", icon_custom_emoji_id="5215361191051798408")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+def hatch_pet_now(user_id: int, user: dict, egg_id: str) -> Optional[dict]:
+    """Питомец из яйца сразу, без хранения яйца (награды ивента, старые яйца из запаса)."""
+    if egg_id not in PET_EGGS:
+        return None
+    pet = roll_pet_from_egg(egg_id, user)
+    pet["egg_id"] = egg_id
+    user.setdefault("pets", []).append(pet)
+    try:
+        announce_pet_drop(user_id, user, pet, egg_id)
+    except Exception as e:
+        print(f"[hatch] announce: {e}")
+    log_event_nowait(f"PET {user_id} | {PET_EGGS[egg_id]['name']} открылось сразу → {pet['name']} ({pet.get('rarity')})")
+    return pet
+
+
+def pet_hatch_line(pet: dict, egg_id: str) -> str:
+    rarity = pet.get("rarity")
+    r_icon = PET_RARITY_PREMIUM_EMOJIS.get(rarity, PET_RARITIES.get(rarity, {}).get("emoji", ""))
+    r_name = PET_RARITIES.get(rarity, {}).get("name", rarity)
+    egg = PET_EGGS.get(egg_id, {})
+    return (f"{egg.get('shop_emoji', egg.get('emoji', '🥚'))} {html.escape(egg.get('name', 'Яйцо'))} → "
+            f"{get_pet_emoji(pet)} <b>{html.escape(pet['name'])}</b> · {r_icon} {r_name}")
+
+
+def hatch_leftover_eggs(user_id: int, user: dict) -> List[str]:
+    """Вкладки «Яйца» больше нет: яйца, что остались в запасе, открываются сами."""
+    return_incubating_eggs(user)
+    eggs = normalize_pet_eggs(user)
+    lines = []
+    for egg_id, amount in list(eggs.items()):
+        for _ in range(max(0, int(amount or 0))):
+            pet = hatch_pet_now(user_id, user, egg_id)
+            if pet:
+                lines.append(pet_hatch_line(pet, egg_id))
+        user["pet_eggs"].pop(egg_id, None)
+    return lines
 
 
 async def open_pet_egg(user_id: int, egg_id: str) -> Optional[dict]:
@@ -11203,7 +12319,8 @@ async def cb_pets_slot(call: CallbackQuery):
 @dp.callback_query(F.data == "pet_incubator")
 async def cb_pet_incubator(call: CallbackQuery):
     await call.answer()
-    await show_pet_incubator(call.from_user.id, lambda t, kb: edit_for_user(call, t, kb))
+    # вкладки «Яйца» больше нет — оставшиеся яйца открываются сами в домике питомцев
+    await show_pet_menu(call.from_user.id, lambda t, kb: edit_for_user(call, t, kb))
 
 @dp.callback_query(F.data.startswith("pet_incubator_slot|"))
 async def cb_pet_incubator_slot(call: CallbackQuery):
@@ -11294,7 +12411,7 @@ async def cb_pet_equip(call: CallbackQuery):
     if not pet:
         await call.answer("Пет не найден.", show_alert=True)
         return
-    equipped = user.setdefault("equipped_pets", [None, None])
+    equipped = user.setdefault("equipped_pets", [None] * PET_MAX_SLOTS)
     for idx, current_iid in enumerate(equipped):
         if current_iid == iid:
             equipped[idx] = None
@@ -11335,7 +12452,7 @@ async def cb_pet_unequip_iid(call: CallbackQuery):
     except (ValueError, IndexError):
         await call.answer()
         return
-    equipped = user.setdefault("equipped_pets", [None, None])
+    equipped = user.setdefault("equipped_pets", [None] * PET_MAX_SLOTS)
     for idx, current_iid in enumerate(equipped):
         if current_iid == iid:
             equipped[idx] = None
@@ -11641,14 +12758,14 @@ HELP_COMMANDS_TEXT = (
         "<b>Профиль:</b> проф, ур, ст, престиж/пр, лф (реплаем — профиль игрока), шр (шансы роллов), сменить ник, био (+10% опыта)\n"
         "<b>Роллы:</b> ролл, задания/зд, топ/топы\n"
         "<b>Экип:</b> экип, пояс, куз/кузнец, реликварий (древняя, божественная и первородная экипировка)\n"
-        "<b>Боссы:</b> бс, бсс, бскд, ивент, рв (воскрешение), автоатака, стражи (боссы с реликвиями)\n"
+        "<b>Боссы:</b> бс, бсс, бскд, ивент, рв (воскрешение), автоатака, кратос (ежедневный босс), стражи (боссы с реликвиями)\n"
         "<b>Развитие:</b> скл/скиллы, хары, пути/путь, маник\n"
         "<b>Лут:</b> инв, ведьма, алхимик, алм, баффы/бафф\n"
         "<b>Петы:</b> пет, петсы, питомцы (все), яйца\n"
-        "<b>Новое:</b> луна (ивент «Кровавая луна»), грааль (Лунный грааль), бп (боевой пропуск), башня (подземелье), мб (мировой босс), сеты, плашки\n"
+        "<b>Новое:</b> лучшее (лучшее оружие и броня по редкостям), грааль (Лунный грааль), бп (боевой пропуск), башня (подземелье), мб (мировой босс), сеты, плашки\n"
         "<b>Отдых:</b> рыбалка, огород, чайная, кристалл, бестиарий, достижения, титулы, казино (казик 5к — со ставкой, казик топ)\n"
         "<b>Настройки:</b> уведомления (уведомления о боссах), стикеры выкл / стикеры вкл\n"
-        "<b>Прочее:</b> чародей/зачарователь, правила/rules, клан, клан босс\n"
+        "<b>Прочее:</b> промо КОД (активировать промокод), чародей/зачарователь, правила/rules, клан, лутиафан (клан босс)\n"
         "<b>Монеты:</b> ежедневка (ежедневный бонус), передать 1000 (реплаем на игрока), магазин, арп (автоперезапуск), донат (звёзды)\n"
         "<b>Топы:</b> топ уровень, топ сила, топ роллы, топ боссы, топ престиж, топ донат, топ кланов, топ кланов сила"
         "</blockquote>"
@@ -11674,7 +12791,10 @@ def build_help_text(is_admin: bool = False) -> str:
             "\n\n"
             '<tg-emoji emoji-id="5429519916971599983">💻</tg-emoji> <b>Админ</b>\n\n'
             "<blockquote>"
+            "<i>Числа можно сокращать: 5к, 1.5кк / 2м, 3б, 1т</i>\n"
             "онлайн, пинг (задержки бота)\n"
+            "админ+ / админ- (реплаем или с ID — только владелец), админы (список)\n"            "донат+ ID звёзды, донат- ID звёзды (ручная сумма в топ доната, можно реплаем)\n"            "промо+ КОД 10 (создать), промо+ КОД пет волк (награда), промо- КОД, промо? КОД, промокоды\n"
+            "эмодзипак статус / вкл / выкл / обновить (свой пак прем-эмодзи)\n"
             "замена / замены (украсить любой текст во всём боте), кнопка / кнопки (иконки на кнопках)\n"
             "эмодзи (премиум-эмодзи редкостей, ресурсов, боссов), экран (своё оформление экранов)\n"
             "сброс (реплай или сброс ID)\n"
@@ -11771,8 +12891,8 @@ async def text_set_nickname(message: Message):
     if not nickname or nickname.startswith("/"):
         await reply_to_user(message, "<blockquote>Напиши ник обычным текстом.</blockquote>")
         return
-    if len(nickname) < 2 or len(nickname) > 20:
-        await reply_to_user(message, "<blockquote>Ник должен быть от 2 до 20 символов.</blockquote>")
+    if len(nickname) < 1 or len(nickname) > 20:
+        await reply_to_user(message, "<blockquote>Ник должен быть от 1 до 20 символов.</blockquote>")
         return
     if any(char in nickname for char in "<>\n\r\t"):
         await reply_to_user(message, "<blockquote>В нике нельзя использовать переносы и символы < >.</blockquote>")
@@ -11837,7 +12957,7 @@ async def cmd_prestige(message: Message):
         await show_rebirth(message.from_user.id, lambda t, kb: reply_to_user(message, t, kb))
     except Exception as e:
         print(f"[cmd_prestige] failed for {message.from_user.id}: {e}")
-        await reply_to_user(message, "<blockquote>⚠️ Ошибка при открытии престижа, уже чиним.</blockquote>")
+        await reply_to_user(message, f"<blockquote>{PE_WARN} Ошибка при открытии престижа, уже чиним.</blockquote>")
 
 @dp.message(Command("top"))
 async def cmd_top(message: Message):
@@ -12093,7 +13213,7 @@ async def text_prestige(message: Message):
         await show_rebirth(message.from_user.id, lambda t, kb: reply_to_user(message, t, kb))
     except Exception as e:
         print(f"[text_prestige] failed for {message.from_user.id}: {e}")
-        await reply_to_user(message, "<blockquote>⚠️ Ошибка при открытии престижа, уже чиним.</blockquote>")
+        await reply_to_user(message, f"<blockquote>{PE_WARN} Ошибка при открытии престижа, уже чиним.</blockquote>")
 
 @dp.callback_query(F.data == "roll")
 async def cb_roll(call: CallbackQuery):
@@ -12326,7 +13446,7 @@ async def cb_smith_mode(call: CallbackQuery):
     except (ValueError, IndexError):
         await call.answer("Кузнец не понял действие.", show_alert=True)
         return
-    if mode not in {"upgrade", "engrave", "fusion"}:
+    if mode not in {"upgrade", "engrave", "fusion", "reforge"}:
         await call.answer("Кузнец не понял действие.", show_alert=True)
         return
     await show_smith_type(call.from_user.id, mode, lambda t, kb: edit_for_user(call, t, kb))
@@ -12339,7 +13459,7 @@ async def cb_smith_weapon(call: CallbackQuery):
     except (ValueError, IndexError):
         await call.answer("Кузнец не понял действие.", show_alert=True)
         return
-    if mode not in {"upgrade", "engrave", "fusion"}:
+    if mode not in {"upgrade", "engrave", "fusion", "reforge"}:
         await call.answer("Кузнец не понял действие.", show_alert=True)
         return
     try:
@@ -12356,7 +13476,7 @@ async def cb_smith_armor(call: CallbackQuery):
     except (ValueError, IndexError):
         await call.answer("Кузнец не понял действие.", show_alert=True)
         return
-    if mode not in {"upgrade", "engrave", "fusion"}:
+    if mode not in {"upgrade", "engrave", "fusion", "reforge"}:
         await call.answer("Кузнец не понял действие.", show_alert=True)
         return
     try:
@@ -12373,7 +13493,7 @@ async def cb_smith_type(call: CallbackQuery):
     except (ValueError, IndexError):
         await call.answer("Кузнец не понял тип предмета.", show_alert=True)
         return
-    if mode not in {"upgrade", "engrave", "fusion"} or item_type not in {"weapon", "armor"}:
+    if mode not in {"upgrade", "engrave", "fusion", "reforge"} or item_type not in {"weapon", "armor"}:
         await call.answer("Кузнец не понял тип предмета.", show_alert=True)
         return
     try:
@@ -12390,7 +13510,7 @@ async def cb_smith_rarity(call: CallbackQuery):
     except (ValueError, IndexError):
         await call.answer("Кузнец не понял редкость.", show_alert=True)
         return
-    if mode not in {"upgrade", "engrave", "fusion"} or item_type not in {"weapon", "armor"} or rarity not in RARITIES:
+    if mode not in {"upgrade", "engrave", "fusion", "reforge"} or item_type not in {"weapon", "armor"} or rarity not in RARITIES:
         await call.answer("Кузнец не понял редкость.", show_alert=True)
         return
     await show_smith_items(call.from_user.id, mode, item_type, rarity, lambda t, kb: edit_for_user(call, t, kb))
@@ -12403,7 +13523,7 @@ async def cb_smith_item(call: CallbackQuery):
     except (ValueError, IndexError):
         await call.answer("Кузнец не понял предмет.", show_alert=True)
         return
-    if mode not in {"upgrade", "engrave", "fusion"}:
+    if mode not in {"upgrade", "engrave", "fusion", "reforge"}:
         await call.answer("Кузнец не понял действие.", show_alert=True)
         return
     await show_smith_item(call.from_user.id, mode, iid, lambda t, kb: edit_for_user(call, t, kb))
@@ -12415,7 +13535,7 @@ async def cb_smith_do(call: CallbackQuery):
     except (ValueError, IndexError):
         await call.answer("Кузнец не понял предмет.", show_alert=True)
         return
-    if mode not in {"upgrade", "engrave", "fusion"}:
+    if mode not in {"upgrade", "engrave", "fusion", "reforge", "upgrade_max", "engrave_max"}:
         await call.answer("Кузнец не понял действие.", show_alert=True)
         return
     await smith_apply(call.from_user.id, mode, iid, lambda t, kb: edit_for_user(call, t, kb), call.answer)
@@ -12572,7 +13692,7 @@ async def cb_recycle_toggle(call: CallbackQuery):
         return
 
     coins, removed_count = await recycle_selected_weapons(uid)
-    await call.answer(f"Переработано: {removed_count}. +{coins} монет.", show_alert=True)
+    await call.answer(f"Переработано: {removed_count}. +{format_num(coins)} монет.", show_alert=True)
     await show_inv(uid, lambda t, kb: edit_for_user(call, t, kb))
 
 def is_item_equipped(user: dict, item: dict) -> bool:
@@ -12794,7 +13914,7 @@ async def cb_trash_recycle_toggle(call: CallbackQuery):
         return
 
     coins, removed_count = await recycle_selected_trash(uid)
-    await call.answer(f"Переработано: {removed_count}. +{coins} монет.", show_alert=True)
+    await call.answer(f"Переработано: {removed_count}. +{format_num(coins)} монет.", show_alert=True)
     await show_trash(uid, lambda t, kb: edit_for_user(call, t, kb))
 
 @dp.callback_query(F.data == "trash_recycle_cancel")
@@ -12829,7 +13949,7 @@ async def cb_claim_trash(call: CallbackQuery):
 
     if not trash:
         await call.answer()
-        await call.message.edit_text("🗑️ <b>Корзина пуста</b>\n\n<blockquote>Сюда попадают предметы, когда экипировка заполнена. Они хранятся 24 часа.</blockquote>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        await call.message.edit_text("<tg-emoji emoji-id=\"5445267414562389170\">🗑</tg-emoji> <b>Корзина пуста</b>\n\n<blockquote>Сюда попадают предметы, когда экипировка заполнена. Они хранятся 24 часа.</blockquote>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Назад", callback_data="equipment", icon_custom_emoji_id="5215361191051798408")]
         ]), parse_mode="HTML")
         return
@@ -12884,30 +14004,30 @@ async def cb_item_essence_ask(call: CallbackQuery):
     essence_text = f"{essence.get('emoji', '💎')} {essence.get('name', essence_id)} x1"
 
     if item.get("item_type") == "armor":
-        stat_line = f"<tg-emoji emoji-id=\"5404843113652970870\">❤️</tg-emoji> +{item.get('hp', 0)} HP"
+        stat_line = f"<tg-emoji emoji-id=\"5404843113652970870\">❤️</tg-emoji> +{format_num(item.get('hp', 0))} HP"
         slot_name = ARMOR_SLOT_NAMES.get(item.get("slot"), item.get("slot", ""))
-        type_line = f"📋 {slot_name}"
+        type_line = f"{armor_slot_icon(item.get('slot'))} {slot_name}"
     else:
         dmg = item.get("dmg", (0, 0))
-        stat_line = f"<tg-emoji emoji-id=\"5373173798633752502\">⚔️</tg-emoji> Урон: {dmg[0]}–{dmg[1]}"
+        stat_line = f"<tg-emoji emoji-id=\"5373173798633752502\">⚔️</tg-emoji> Урон: {format_num(dmg[0])}–{format_num(dmg[1])}"
         type_line = get_weapon_type_text(item)
 
     fusion_level = int(item.get("fusion_level", 0) or 0)
     fusion_line = f"<tg-emoji emoji-id=\"6269538837723090339\">⭐</tg-emoji> Скрещивание: <b>{fusion_level}/{MAX_FUSION_LEVEL}</b>\n" if fusion_level else ""
 
     text = (
-        "⚠️ <b>Подтверждение</b>\n\n"
+        f"{PE_WARN} <b>Подтверждение</b>\n\n"
         "<blockquote>"
         f"{item.get('emoji', '')} <b>{html.escape(item.get('name', 'Предмет'))}</b>\n"
         f"{rarity_emoji} <i>{html.escape(rarity_name)}</i>\n"
         f"{type_line}\n"
         f"<tg-emoji emoji-id=\"6269538837723090339\">⭐️</tg-emoji> Уровень: <b>{get_item_level(item)}</b>\n"
-        f"🪓 Гравировка: <b>{item.get('engraving_level', 0)}/{MAX_ENGRAVING_LEVEL}</b>\n"
+        f"{PE_ENGRAVE} Гравировка: <b>{item.get('engraving_level', 0)}/{MAX_ENGRAVING_LEVEL}</b>\n"
         f"{fusion_line}"
         f"{stat_line}"
         "</blockquote>\n\n"
         "<blockquote>"
-        "❗ <b>Предмет будет безвозвратно уничтожен</b> и превращён в:\n"
+        f"{PE_WARN} <b>Предмет будет безвозвратно уничтожен</b> и превращён в:\n"
         f"{essence_text}"
         "</blockquote>\n\n"
         "<blockquote>Действие <b>нельзя отменить</b>. Продолжить?</blockquote>"
@@ -13077,7 +14197,7 @@ async def cb_upgrade_weapon(call: CallbackQuery):
 
     cost = get_upgrade_cost(weapon)
     if u.get("coins", 0) < cost:
-        await call.answer(f"Нужно {cost} монет. У тебя {u.get('coins', 0)}.", show_alert=True)
+        await call.answer(f"Нужно {format_num(cost)} монет. У тебя {format_num(u.get('coins', 0))}.", show_alert=True)
         return
 
     ensure_item_base_stats(weapon)
@@ -13096,16 +14216,61 @@ async def cb_upgrade_weapon(call: CallbackQuery):
         u["equipped"] = weapon
 
     await db.save_user(uid, u)
-    await call.answer(f"Улучшено до +{weapon['upgrade_level']}! −{cost} монет.", show_alert=True)
+    await call.answer(f"Улучшено до +{weapon['upgrade_level']}! −{format_num(cost)} монет.", show_alert=True)
     await call.message.edit_text(
         get_item_card_text(weapon),
         reply_markup=get_item_card_keyboard(weapon, u, copy_idx),
         parse_mode="HTML",
     )
 
+# === Один бой — одно окно ===
+# Если бой открыть повторно (например, снова «бс»), появлялись два сообщения с кнопками, и,
+# переключаясь между ними, можно было бить вдвое чаще. Теперь бой привязан к одному окну:
+# кнопки работают только в самом новом сообщении боя, у старого они убираются.
+BATTLE_MIN_TURN_GAP = 0.9   # не чаще одного хода в N секунд
+
+
+async def _battle_strip_window(bot, win):
+    try:
+        _battle_render_pending.pop(tuple(win), None)
+        await bot.edit_message_reply_markup(chat_id=win[0], message_id=win[1], reply_markup=None)
+    except Exception:
+        pass
+
+
+async def battle_window_ok(call: CallbackQuery, turn: bool = False) -> bool:
+    battle = active_battles.get(call.from_user.id)
+    msg = call.message
+    if not battle or msg is None or isinstance(msg, _HeadlessMessage):
+        return True
+    try:
+        cur = [msg.chat.id, msg.message_id]
+    except AttributeError:
+        return True
+    win = battle.get("win")
+    if not win or list(win) == cur:
+        battle["win"] = cur
+    elif win[0] != cur[0] or cur[1] > win[1]:
+        battle["win"] = cur          # открыли бой заново — работает новое окно, у старого убираем кнопки
+        asyncio.create_task(_battle_strip_window(call.bot, win))
+    else:
+        await call.answer("Этот бой открыт в другом окне ниже — жми кнопки там.")
+        asyncio.create_task(_battle_strip_window(call.bot, cur))
+        return False
+    if turn:
+        now = time.time()
+        if now - float(battle.get("turn_at", 0) or 0) < BATTLE_MIN_TURN_GAP:
+            await call.answer()
+            return False
+        battle["turn_at"] = now
+    return True
+
+
 @dp.callback_query(F.data.startswith("battle_attack"))
 async def cb_battle_attack(call: CallbackQuery):
     uid = call.from_user.id
+    if not await battle_window_ok(call, turn=True):
+        return
     lock = battle_locks.setdefault(uid, asyncio.Lock())
     if lock.locked():
         await call.answer("Ход уже выполняется.")
@@ -13124,10 +14289,14 @@ async def cb_battle_attack(call: CallbackQuery):
 
 @dp.callback_query(F.data == "battle_skills")
 async def cb_battle_skills(call: CallbackQuery):
+    if not await battle_window_ok(call):
+        return
     await show_battle_skills(call)
 
 @dp.callback_query(F.data == "battle_skill_back")
 async def cb_battle_skill_back(call: CallbackQuery):
+    if not await battle_window_ok(call):
+        return
     battle = active_battles.get(call.from_user.id)
     if not battle:
         await call.answer("Боя нет.", show_alert=True)
@@ -13138,6 +14307,8 @@ async def cb_battle_skill_back(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("battle_skill|"))
 async def cb_battle_skill(call: CallbackQuery):
     uid = call.from_user.id
+    if not await battle_window_ok(call, turn=True):
+        return
     lock = battle_locks.setdefault(uid, asyncio.Lock())
     async with lock:
         skill_id = call.data.split("|", 1)[1]
@@ -13148,6 +14319,8 @@ async def cb_battle_skill(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("battle_skill_target|"))
 async def cb_battle_skill_target(call: CallbackQuery):
     uid = call.from_user.id
+    if not await battle_window_ok(call, turn=True):
+        return
     lock = battle_locks.setdefault(uid, asyncio.Lock())
     async with lock:
         try:
@@ -13194,6 +14367,9 @@ async def process_battle_attack(call: CallbackQuery, target_idx: Optional[int] =
             active_skill = battle.get(ACTIVE_BATTLE_SKILL_KEY)
             if active_skill in TOGGLE_BATTLE_SKILLS:
                 block_reason = get_battle_skill_block_reason(user, battle, active_skill)
+                if not block_reason and get_skill_resource_cost(user, active_skill)[0] == "hp_percent" \
+                        and battle.get("player_hp", 0) < battle.get("player_max_hp", 1) * TOGGLE_HP_SKILL_MIN_HP:
+                    block_reason = "мало HP"   # скилл за HP при низком здоровье сам выключается
                 if block_reason:
                     battle.pop(ACTIVE_BATTLE_SKILL_KEY, None)
                     await save_battle_state_throttled(uid, user, force=True)
@@ -13245,7 +14421,7 @@ async def process_battle_attack(call: CallbackQuery, target_idx: Optional[int] =
                 call,
                 get_battle_text(battle, player_log)
                 + "\n\n<blockquote><tg-emoji emoji-id=\"5226431245918942763\">🏆</tg-emoji> <b>Победа!</b>"
-                + f"\n<tg-emoji emoji-id=\"5463046637842608206\">🪙</tg-emoji> +{coins} монет · <tg-emoji emoji-id=\"5370831521039017384\">✨</tg-emoji> +{format_num(xp)} опыта"
+                + f"\n<tg-emoji emoji-id=\"5463046637842608206\">🪙</tg-emoji> +{format_num(coins)} монет · <tg-emoji emoji-id=\"5370831521039017384\">✨</tg-emoji> +{format_num(xp)} опыта"
                 + level_text + "</blockquote>",
             )
             return
@@ -13385,6 +14561,8 @@ async def cb_belt_armor_v2(call: CallbackQuery):
 
 @dp.callback_query(F.data == "battle_flee")
 async def cb_battle_flee(call: CallbackQuery):
+    if not await battle_window_ok(call):
+        return
     battle = active_battles.get(call.from_user.id)
     if not battle:
         await call.answer("Эта битва уже завершена.", show_alert=True)
@@ -13415,6 +14593,8 @@ async def cb_battle_flee_cancel(call: CallbackQuery):
 
 @dp.callback_query(F.data == "battle_flee_confirm")
 async def cb_battle_flee_confirm(call: CallbackQuery):
+    if not await battle_window_ok(call):
+        return
     battle = active_battles.get(call.from_user.id)
     if not battle:
         await call.answer("Эта битва уже завершена.", show_alert=True)
@@ -13501,7 +14681,7 @@ async def cb_admin_pet_take(call: CallbackQuery):
     ]
     user["equipped_pets"] = [
         None if str(slot) == str(iid) else slot
-        for slot in user.get("equipped_pets", [None, None])
+        for slot in user.get("equipped_pets", [None] * PET_MAX_SLOTS)
     ]
     while len(user["equipped_pets"]) < 2:
         user["equipped_pets"].append(None)
@@ -13734,6 +14914,17 @@ def find_boss_unit_template(unit_id: str, boss: Optional[dict] = None) -> Option
     return None
 
 
+def battle_enemy_emoji(enemy: dict, boss: Optional[dict] = None) -> str:
+    """Премиум-эмодзи врага в бою (берём из свежего шаблона — так работают и замены через «эмодзи»)."""
+    template = find_boss_unit_template(enemy.get("id"), boss) if enemy.get("id") else None
+    if enemy.get("id") and "pe_tag" in globals() and not (template or {}).get("premium_emoji"):
+        tag = pe_tag("m:" + str(enemy["id"])) or pe_tag("b:" + str(enemy["id"]))
+        if tag:
+            return tag
+    return ((template or {}).get("premium_emoji") or enemy.get("premium_emoji")
+            or (template or {}).get("emoji") or enemy.get("emoji", ""))
+
+
 def get_current_boss_template(battle: dict) -> dict:
     """Свежий шаблон босса из BOSSES (в сохранённом бою может лежать устаревшая копия)."""
     stored = battle.get("boss") or {}
@@ -13860,7 +15051,7 @@ def create_enemy(player_level: int) -> dict:
 
 def health_bar(current: int, maximum: int) -> str:
     filled = max(0, min(10, round(current / maximum * 10))) if maximum else 0
-    return "█" * filled + "░" * (10 - filled)
+    return pe_bar("hp", filled, 10, "▰" * filled + "▱" * (10 - filled))
 
 HP_EMOJI = '<tg-emoji emoji-id="5404843113652970870">💊</tg-emoji>'
 BOSS_BATTLE_EMOJI = '<tg-emoji emoji-id="5947121436723252849">👑</tg-emoji>'
@@ -13873,97 +15064,126 @@ CRIT_EMOJI = '<tg-emoji emoji-id="5368451104134685900">💥</tg-emoji>'
 MANA_EMOJI = '<tg-emoji emoji-id="5287734091523829559">🔮</tg-emoji>'
 STAMINA_EMOJI = '<tg-emoji emoji-id="5819022417917383759">🔊</tg-emoji>'
 
+def hp_bar(current: int, maximum: int, n: int = 8) -> str:
+    """Короткая полоска здоровья ▰▰▰▱▱ для экранов боя."""
+    if not maximum:
+        return ""
+    filled = max(0, min(n, round(max(0, current) / maximum * n)))
+    if current > 0 and filled == 0:
+        filled = 1
+    return pe_bar("hp", filled, n, "▰" * filled + "▱" * (n - filled))
+
+
 def get_battle_resource_lines(battle: dict) -> str:
-    lines = []
+    """Мана/выносливость одной строкой (для совместимости — с переводом строки в начале)."""
+    parts = []
     if battle.get("max_mana", 0) > 0:
-        lines.append(f"{MANA_EMOJI} {max(0, int(battle.get('mana', 0)))}/{int(battle.get('max_mana', 0))}")
+        parts.append(f"{MANA_EMOJI} {max(0, int(battle.get('mana', 0)))}/{int(battle.get('max_mana', 0))}")
     if battle.get("max_stamina", 0) > 0:
-        lines.append(f"{STAMINA_EMOJI} {max(0, int(battle.get('stamina', 0)))}/{int(battle.get('max_stamina', 0))}")
-    return ("\n" + "\n".join(lines)) if lines else ""
+        parts.append(f"{STAMINA_EMOJI} {max(0, int(battle.get('stamina', 0)))}/{int(battle.get('max_stamina', 0))}")
+    return ("\n" + " · ".join(parts)) if parts else ""
+
 
 def get_battle_active_effects_line(battle: dict) -> str:
     effects = battle.get("effects", {})
     parts = []
     if effects.get("aim_turns", 0) > 0:
-        parts.append(f"🎯 Прицеливание ({effects['aim_turns']})")
+        parts.append(f"<tg-emoji emoji-id=\"5373268949339227455\">🎯</tg-emoji>{effects['aim_turns']}")
     if effects.get("war_cry_turns", 0) > 0:
-        parts.append(f"📣 Боевой клич ({effects['war_cry_turns']})")
+        parts.append(f"<tg-emoji emoji-id=\"5949477861940268473\">💢</tg-emoji>{effects['war_cry_turns']}")
     if effects.get("shield_turns", 0) > 0:
-        parts.append(f"<tg-emoji emoji-id=\"5287786962571241490\">🛡</tg-emoji> Щит ({effects['shield_turns']})")
+        parts.append(f"<tg-emoji emoji-id=\"5287786962571241490\">🛡</tg-emoji>{effects['shield_turns']}")
     if effects.get("stun_turns", 0) > 0:
-        parts.append(f"<tg-emoji emoji-id=\"5463274047771000031\">😵</tg-emoji> Стан ({effects['stun_turns']})")
+        parts.append(f"<tg-emoji emoji-id=\"5463274047771000031\">😵</tg-emoji>{effects['stun_turns']}")
     if effects.get("enemy_weak_turns", 0) > 0:
-        parts.append(f"<tg-emoji emoji-id=\"5354961788678978979\">🤕</tg-emoji> Слабость врагов ({effects['enemy_weak_turns']})")
+        parts.append(f"<tg-emoji emoji-id=\"5354961788678978979\">🤕</tg-emoji>{effects['enemy_weak_turns']}")
     if effects.get("enemy_vuln_turns", 0) > 0:
-        parts.append(f"<tg-emoji emoji-id=\"5368451104134685900\">💥</tg-emoji> Уязвимость ({effects['enemy_vuln_turns']})")
+        parts.append(f"<tg-emoji emoji-id=\"5368451104134685900\">💥</tg-emoji>{effects['enemy_vuln_turns']}")
     poison_turns = max((int(((e.get("dot") or {}).get("poison") or {}).get("turns", 0)) for e in battle.get("enemies", []) if e.get("hp", 0) > 0), default=0)
     if poison_turns > 0:
-        parts.append(f"<tg-emoji emoji-id=\"5474265685125271190\">🩸</tg-emoji> Яд ({poison_turns})")
-    return ("\n⚡ " + " · ".join(parts)) if parts else ""
+        parts.append(f"<tg-emoji emoji-id=\"5474265685125271190\">🩸</tg-emoji>{poison_turns}")
+    return ("\n" + PE_SPARK + " " + "  ".join(parts)) if parts else ""
 
 def battle_block(text: str) -> str:
     return f"<blockquote>{text}</blockquote>"
 
+BATTLE_LOG_MAX_LINES = 6   # длиннее — лог сворачивается (раскрывается по нажатию)
+
+
+# Сокращения лога боя: значок уже говорит, что это (урон, вампиризм, удар по тебе) — слова лишние
+BATTLE_LOG_SHORT = [
+    ("Твой урон: промах", "промах"),
+    ("Твой урон: ", ""),
+    ("Урон по тебе: ", ""),
+    ("Ответный удар: ", ""),
+    ("Вампиризм: ", ""),
+    ("Ранение: ", ""),
+    (" HP/ход на 2 хода", " HP/ход ×2"),
+    ("Цель повержена.", "повержен"),
+    ("Противники оглушены и пропускают ход", "враги оглушены"),
+    (". Противники ходят первыми.", ""),
+    ("Рейд начался. В каждой волне сначала бьют враги, потом ты.", "Рейд начался — враги бьют первыми."),
+]
+
+
+def shorten_battle_log(text: str) -> str:
+    for a_, b_ in BATTLE_LOG_SHORT:
+        text = text.replace(a_, b_)
+    return text
+
+
 def format_battle_log(log: str) -> str:
+    """Весь лог хода — одной цитатой (раньше каждая строка была отдельным блоком и экран раздувался)."""
     if not log:
         return ""
-    blocks = []
-    for raw_line in str(log).splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        blocks.append(battle_block(line))
-    return "\n".join(blocks)
+    lines = [shorten_battle_log(ln.strip()) for ln in str(log).splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    tag = "<blockquote expandable>" if len(lines) > BATTLE_LOG_MAX_LINES else "<blockquote>"
+    return tag + "\n".join(lines) + "</blockquote>"
+
+
+def _battle_player_line(battle: dict) -> str:
+    hp, mx = max(0, int(battle["player_hp"])), int(battle["player_max_hp"])
+    res = get_battle_resource_lines(battle).strip()
+    return (f"{PLAYER_EMOJI} {HP_EMOJI} <b>{format_num(hp)}</b>/{format_num(mx)} {hp_bar(hp, mx)}"
+            + (f"\n{res}" if res else ""))
+
 
 def get_boss_battle_text(battle: dict, log: str = "Твой ход.") -> str:
     wave = battle.get("wave", 1)
-    hard_label = " · <b>хард</b>" if battle.get("hard_mode") else ""
-    title = f"{BOSS_BATTLE_EMOJI} <b>Боссы</b>{hard_label}"
-    enemies = battle.get("enemies", [])
-    enemy_lines = []
-    for idx, enemy in enumerate(enemies, 1):
-        status = "✓" if enemy["hp"] <= 0 else f"{max(0, enemy['hp'])}/{enemy['max_hp']}"
-        enemy_lines.append(
-            battle_block(f"{idx}. {enemy['emoji']} <b>{html.escape(enemy['name'])}</b> · {HP_EMOJI} {status}")
-        )
-
-    boss = battle.get("boss", next(iter(BOSSES.values())))
-    boss_power = get_effective_boss_power(boss, bool(battle.get("hard_mode")))
-    boss_note = battle_block(f'<tg-emoji emoji-id="5332336747072208845">🔥</tg-emoji> Сила босса: <b>{format_num(boss_power)}</b>') if wave == 4 else ""
-    player_block = battle_block(
-        f"{PLAYER_EMOJI} <b>Твоё HP:</b>\n"
-        f"{HP_EMOJI} <b>{max(0, battle['player_hp'])}/{battle['player_max_hp']}</b>"
-        f"{get_battle_resource_lines(battle)}"
-        f"{get_battle_active_effects_line(battle)}"
-    )
-    parts = [f"{title} · волна <b>{wave}/4</b>"]
-    if boss_note:
-        parts.append(boss_note)
-    parts.extend(enemy_lines)
-    parts.append(player_block)
+    head = f"{BOSS_BATTLE_EMOJI} <b>Рейд</b> · волна <b>{wave}/4</b>"
+    if battle.get("hard_mode"):
+        head += " · <b>хард</b>"
+    if wave == 4:
+        boss = battle.get("boss", next(iter(BOSSES.values())))
+        head += f' · <tg-emoji emoji-id="5332336747072208845">🔥</tg-emoji>{format_num(get_effective_boss_power(boss, bool(battle.get("hard_mode"))))}'
+    lines = []
+    for idx, enemy in enumerate(battle.get("enemies", []), 1):
+        emo = battle_enemy_emoji(enemy, battle.get("boss"))
+        name = html.escape(enemy["name"])
+        if enemy["hp"] <= 0:
+            lines.append(f"{emo} <s>{name}</s> {PE_SKULL}")
+        else:
+            lines.append(f"<b>{idx}.</b> {emo} <b>{name}</b> · {HP_EMOJI}{format_num(enemy['hp'])} {hp_bar(enemy['hp'], enemy['max_hp'], 6)}")
+    parts = [head, battle_block("\n".join(lines)),
+             battle_block(_battle_player_line(battle) + get_battle_active_effects_line(battle))]
     formatted_log = format_battle_log(log)
     if formatted_log:
         parts.append(formatted_log)
-    return "\n\n".join(parts)
+    return "\n".join(parts)
+
 
 def format_farm_battle_text(battle: dict, log: str = "Твой ход.") -> str:
     enemy = battle["enemy"]
-    enemy_block = battle_block(
-        f"{enemy['emoji']} <b>{html.escape(enemy['name'])}</b> · ур. {enemy['level']}\n"
-        f"{HP_EMOJI} <b>{max(0, enemy['hp'])}/{enemy['max_hp']}</b>"
-    )
-    player_block = battle_block(
-        f"{PLAYER_EMOJI} <b>Твоё HP:</b>\n"
-        f"{HP_EMOJI} <b>{max(0, battle['player_hp'])}/{battle['player_max_hp']}</b>"
-        f"{get_battle_resource_lines(battle)}"
-    )
+    hp, mx = max(0, int(enemy["hp"])), int(enemy["max_hp"])
+    enemy_line = (f"{enemy['emoji']} <b>{html.escape(enemy['name'])}</b> · ур. {enemy['level']}\n"
+                  f"{HP_EMOJI} {format_num(hp)}/{format_num(mx)} {hp_bar(hp, mx)}")
+    parts = [battle_block(enemy_line), battle_block(_battle_player_line(battle))]
     formatted_log = format_battle_log(log)
-    return (
-        enemy_block
-        + "\n\n"
-        + player_block
-        + (f"\n\n{formatted_log}" if formatted_log else "")
-    )
+    if formatted_log:
+        parts.append(formatted_log)
+    return "\n".join(parts)
 
 def get_battle_text(battle: dict, log: str = "Твой ход.") -> str:
     if battle.get("mode") == "bosses":
@@ -13980,23 +15200,22 @@ def battle_keyboard(battle: Optional[dict] = None):
         elif len(alive) > 1:
             row = []
             for idx, enemy in alive:
-                row.append(InlineKeyboardButton(text=f"{enemy['emoji']} ⚔️", callback_data=f"battle_attack|{idx}"))
+                eid = premium_emoji_id(battle_enemy_emoji(enemy, battle.get("boss")))
+                row.append(InlineKeyboardButton(text=f"{idx + 1}" if eid else f"{enemy['emoji']} {idx + 1}",
+                                                callback_data=f"battle_attack|{idx}", icon_custom_emoji_id=eid))
             rows.append(row)
         else:
             rows.append([InlineKeyboardButton(text="Атаковать", callback_data="battle_attack", icon_custom_emoji_id="5373173798633752502")])
     else:
         rows.append([InlineKeyboardButton(text="Атаковать", callback_data="battle_attack", icon_custom_emoji_id="5373173798633752502")])
-    skill_button_text = "✅ 🔫" if battle and battle.get(ACTIVE_BATTLE_SKILL_KEY) else "🔫"
+    skill_on = bool(battle and battle.get(ACTIVE_BATTLE_SKILL_KEY))
     rows.append([
-        InlineKeyboardButton(text=skill_button_text, callback_data="battle_skills"),
-        InlineKeyboardButton(text="🎒", callback_data="battle_backpack"),
+        InlineKeyboardButton(text="Навыки · вкл" if skill_on else "Навыки", callback_data="battle_skills",
+                             icon_custom_emoji_id="5325762861539016690" if skill_on else "5373268949339227455"),
+        InlineKeyboardButton(text="Рюкзак", callback_data="battle_backpack", icon_custom_emoji_id="5854908544712707500"),
     ])
-    if battle and battle.get("mode") == "bosses":
-        if battle.get("auto"):
-            rows.append([InlineKeyboardButton(text="Остановить автобой", callback_data="battle_auto", icon_custom_emoji_id="5352669272575321097")])
-        else:
-            rows.append([InlineKeyboardButton(text="Автобой", callback_data="battle_auto", icon_custom_emoji_id="5346321684574003384")])
-    rows.append([InlineKeyboardButton(text="🏃 Сбежать", callback_data="battle_flee")])
+    # Автобой игроков убран (частые правки боя ловили флуд-бан Telegram). Автобосс админа работает без чата.
+    rows.append([InlineKeyboardButton(text="Сбежать", callback_data="battle_flee", icon_custom_emoji_id="5217572051237228647")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def battle_wait_keyboard():
@@ -14043,8 +15262,8 @@ async def edit_battle_message(call: CallbackQuery, text: str, reply_markup=None)
     чем Telegram успевает обновлять сообщение, промежуточные кадры пропускаются
     и показывается самое свежее состояние — без «Ход выполняется» и без флуд-лимитов."""
     msg = call.message
-    if msg is None:
-        return
+    if msg is None or isinstance(msg, _HeadlessMessage):
+        return   # автобосс админа идёт без чата — рисовать нечего, слоты правок не тратим
     key = (msg.chat.id, msg.message_id)
     _battle_last_text[key] = text
     _battle_render_pending[key] = (msg, call.from_user.id, text, reply_markup)
@@ -14057,25 +15276,83 @@ async def edit_battle_message(call: CallbackQuery, text: str, reply_markup=None)
             pass
 
 
+BATTLE_EDIT_MIN_INTERVAL = 1.2        # не чаще раза в N сек на одно сообщение боя (ручной бой)
+BATTLE_EDIT_MIN_INTERVAL_AUTO = 3.0   # автобой: ходы идут раз в 1.1 с, а экран обновляем раз в 3 с
+BATTLE_EDIT_GLOBAL_PER_SEC = 12       # всего правок боёв в секунду (остальное — уведомлениям и ответам; лимит Telegram ~30/с)
+_battle_edit_last: Dict[tuple, float] = {}
+_battle_fallback_at: Dict[int, float] = {}
+_battle_edit_global: List[float] = []
+_battle_flood_until: Dict[int, float] = {}   # флуд-пауза ПО ЧАТУ: один игрок, жмущий слишком часто, не замораживает бои всем
+
+
+async def _battle_edit_slot(key: tuple, owner_id: int):
+    """Ждёт, пока можно править: интервал на сообщение, общий лимит и флуд-пауза от Telegram."""
+    auto = bool((active_battles.get(owner_id) or {}).get("auto"))
+    interval = BATTLE_EDIT_MIN_INTERVAL_AUTO if auto else BATTLE_EDIT_MIN_INTERVAL
+    while True:
+        now = time.monotonic()
+        wait = max(_battle_flood_until.get(key[0], 0) - now, _bot_flood_until - now,
+                   min(_flood_ban.get("edit", 0) - time.time(), 30),
+                   _battle_edit_last.get(key, 0) + interval - now)
+        while _battle_edit_global and now - _battle_edit_global[0] > 1.0:
+            _battle_edit_global.pop(0)
+        if len(_battle_edit_global) >= BATTLE_EDIT_GLOBAL_PER_SEC:
+            wait = max(wait, 1.0 - (now - _battle_edit_global[0]))
+        if wait <= 0:
+            break
+        await asyncio.sleep(min(wait, 5.0))
+    now = time.monotonic()
+    _battle_edit_last[key] = now
+    _battle_edit_global.append(now)
+
+
 async def _battle_render_loop(key: tuple):
     while key in _battle_render_pending:
+        owner_id = _battle_render_pending[key][1]
+        await _battle_edit_slot(key, owner_id)          # пока ждём, кадры склеиваются — рисуем самый свежий
+        if key not in _battle_render_pending:
+            break
         msg, owner_id, text, reply_markup = _battle_render_pending.pop(key)
         try:
+            if chat_ban_left("edit", key[0]) > 0:
+                raise FloodPaused("правки в этом чате запрещены")
             await msg.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
         except Exception as e:
             error_text = str(e).lower()
             retry = getattr(e, "retry_after", None)
+            if isinstance(e, FloodPaused) or (retry and float(retry) >= FLOOD_BAN_MIN):
+                # Telegram запретил ПРАВИТЬ сообщения в этом чате — показываем бой новым сообщением,
+                # дальше игрок жмёт кнопки уже под ним
+                try:
+                    wait = _battle_fallback_at.get(key[0], 0) + 1.5 - time.monotonic()
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    _battle_fallback_at[key[0]] = time.monotonic()
+                    sent = await msg.answer(text, reply_markup=reply_markup, parse_mode="HTML")
+                    remember_interactive_owner(sent, owner_id, reply_markup)
+                except Exception as e2:
+                    print(f"[edit_battle_message] fallback: {e2}")
+                continue
             if retry:
-                # флуд-лимит: ждём и рисуем самое свежее состояние
+                # флуд-лимит: общая пауза для всех боёв, потом рисуем самое свежее состояние
+                _battle_flood_until[key[0]] = max(_battle_flood_until.get(key[0], 0), time.monotonic() + min(float(retry), 120) + 0.5)
                 _battle_render_pending.setdefault(key, (msg, owner_id, text, reply_markup))
-                await asyncio.sleep(float(retry) + 0.2)
                 continue
             if "message is not modified" not in error_text:
                 print(f"[edit_battle_message] failed: {e}")
     _battle_render_tasks.pop(key, None)
+    if len(_battle_edit_last) > 5000:   # не даём словарю расти бесконечно
+        cutoff = time.monotonic() - 600
+        for k in [k for k, t in _battle_edit_last.items() if t < cutoff]:
+            _battle_edit_last.pop(k, None)
 
-def boss_victory_keyboard() -> InlineKeyboardMarkup:
-    """Кнопка под сообщением о победе над боссом — сразу к списку быстрых боссов (бсс)."""
+def boss_victory_keyboard(boss: Optional[dict] = None) -> InlineKeyboardMarkup:
+    """Кнопка под сообщением о победе: к быстрым боссам (бсс), а после стража — обратно к стражам."""
+    if (boss or {}).get("location") == "sanctuary":
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="К стражам", callback_data="location|sanctuary",
+                                 icon_custom_emoji_id=premium_emoji_id(boss.get("premium_emoji", "")) or "5213305508034783384"),
+        ]])
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="К боссам", callback_data="quick_bosses", icon_custom_emoji_id="5947121436723252849"),
     ]])
@@ -14148,9 +15425,9 @@ PATH_SKILL_INFO = {
     "fortify": {"name": "Несокрушимость", "path": "melee", "cooldown": 7},
     "berserk": {"name": "Берсерк", "path": "melee", "cooldown": 8},
     "arrow_rain": {"name": "Град стрел", "path": "bow", "cooldown": 0},
-    "sniper_shot": {"name": "Снайперский выстрел", "path": "bow", "cooldown": 2},
+    "sniper_shot": {"name": "Снайперский выстрел", "path": "bow", "cooldown": 3},
     "aim": {"name": "Прицеливание", "path": "bow", "cooldown": 7},
-    "multi_shot": {"name": "Залп", "path": "bow", "cooldown": 4},
+    "multi_shot": {"name": "Залп", "path": "bow", "cooldown": 3},
     "eagle_eye": {"name": "Орлиный глаз", "path": "bow", "cooldown": 6},
     "pierce_shot": {"name": "Пробитие", "path": "bow", "cooldown": 5},
     "splash": {"name": "Сплэш", "path": "magic", "cooldown": 0},
@@ -14161,6 +15438,7 @@ PATH_SKILL_INFO = {
     "nova": {"name": "Полярная звезда", "path": "magic", "cooldown": 8},
 }
 TOGGLE_BATTLE_SKILLS = {"juggernaut", "arrow_rain", "splash"}
+TOGGLE_HP_SKILL_MIN_HP = 0.30   # скиллы, которые тратят HP (Джаггернаут), выключаются при HP ниже 30%
 ACTIVE_BATTLE_SKILL_KEY = "active_path_skill"
 
 def get_equipped_attack(user: dict) -> tuple[int, str]:
@@ -14344,9 +15622,9 @@ async def finish_boss_reward(call: CallbackQuery, battle: dict, user: dict, enem
         call,
         get_battle_text(battle, f"{enemy_log}\n{player_log}")
         + f"\n\n<blockquote><tg-emoji emoji-id=\"5226431245918942763\">🏆</tg-emoji> <b>Босс побеждён!</b>"
-        + f"\n<tg-emoji emoji-id=\"5433594926107481306\">⚪️</tg-emoji> +{coins} монет · <tg-emoji emoji-id=\"5431816358675366190\">🆙</tg-emoji> +{format_num(xp)} опыта"
+        + f"\n<tg-emoji emoji-id=\"5433594926107481306\">⚪️</tg-emoji> +{format_num(coins)} монет · <tg-emoji emoji-id=\"5431816358675366190\">🆙</tg-emoji> +{format_num(xp)} опыта"
         + drop_text + level_text + "</blockquote>",
-        reply_markup=boss_victory_keyboard(),
+        reply_markup=boss_victory_keyboard(boss),
     )
     await notify_completed_quests(
         uid,
@@ -14588,7 +15866,7 @@ async def apply_battle_skill(call: CallbackQuery, skill_id: str, target_idx: Opt
         else:
             target = alive[0]
         if skill_id == "multi_shot":
-            hit = max(1, math.ceil(base_damage * 0.70))
+            hit = max(1, math.ceil(base_damage * 0.75))
             total = 0
             for _ in range(3):
                 target["hp"] -= hit
@@ -14604,9 +15882,9 @@ async def apply_battle_skill(call: CallbackQuery, skill_id: str, target_idx: Opt
             damage = total
             player_log = f"{DAMAGE_EMOJI} <b>Шквал рун: 4×{hit} = −{total} HP</b>"
         elif skill_id == "pierce_shot":
-            damage = max(1, math.ceil(base_damage * 2.5))
+            damage = max(1, math.ceil(base_damage * 2.8))
             target["hp"] -= damage
-            player_log = f"{DAMAGE_EMOJI} <b>Пробитие: −{damage} HP</b> (игнор 20% брони)"
+            player_log = f"{DAMAGE_EMOJI} <b>Пробитие: −{damage} HP</b>"
         elif skill_id == "great_power":
             damage = max(1, math.ceil(base_damage * 5))
             target["hp"] -= damage
@@ -14615,14 +15893,20 @@ async def apply_battle_skill(call: CallbackQuery, skill_id: str, target_idx: Opt
             damage = max(1, math.ceil(base_damage * 2))
             target["hp"] -= damage
             player_log = f"{DAMAGE_EMOJI} <b>Твой урон: −{damage} HP</b>"
-            wound_dmg = max(1, math.ceil(target.get("max_hp", damage) * 0.05))
+            wound_dmg = max(1, math.ceil(damage * 0.25))
             target.setdefault("dot", {})["wound"] = {"damage": wound_dmg, "turns": 2}
             player_log += f"\n{VAMPIRISM_EMOJI} <b>Ранение: −{wound_dmg} HP/ход на 2 хода</b>"
         else:
             damage = max(1, math.ceil(base_damage * 2))
             target["hp"] -= damage
             player_log = f"{DAMAGE_EMOJI} <b>Твой урон: −{damage} HP</b>"
-    user["total_damage"] = user.get("total_damage", 0) + max(0, locals().get("damage", 0))
+    dealt = max(0, int(locals().get("damage", 0) or 0))
+    user["total_damage"] = user.get("total_damage", 0) + dealt
+    # вампиризм срабатывает и от урона навыков (раньше лечил только обычный удар)
+    if dealt > 0:
+        heal = apply_vampirism_heal(battle_user_context(user, battle), battle, dealt)
+        if heal > 0:
+            player_log += f"\n{VAMPIRISM_EMOJI} <b>Вампиризм: +{heal} HP</b>"
     add_path_attack_xp(user)
     cd = PATH_SKILL_INFO[skill_id]["cooldown"]
     if cd:
@@ -14735,10 +16019,10 @@ async def handle_boss_attack(
                 call,
                 get_battle_text(battle, f"{enemy_log}\n{player_log}")
                 + f"\n\n<blockquote>{win_emoji} <b>Босс побеждён!</b>"
-                + f"\n{coin_emoji} +{coins} монет · {xp_emoji} +{format_num(xp)} опыта"
+                + f"\n{coin_emoji} +{format_num(coins)} монет · {xp_emoji} +{format_num(xp)} опыта"
                 + drop_text
                 + level_text + "</blockquote>",
-                reply_markup=boss_victory_keyboard(),
+                reply_markup=boss_victory_keyboard(boss),
             )
             await notify_completed_quests(
                 uid,
@@ -14808,10 +16092,10 @@ async def handle_boss_attack(
                 call,
                 get_battle_text(battle, f"{enemy_log}\n{player_log}{dot_log}")
                 + f"\n\n<blockquote>{win_emoji} <b>Босс побеждён!</b>"
-                + f"\n{coin_emoji} +{coins} монет · {xp_emoji} +{format_num(xp)} опыта"
+                + f"\n{coin_emoji} +{format_num(coins)} монет · {xp_emoji} +{format_num(xp)} опыта"
                 + drop_text
                 + level_text + "</blockquote>",
-                reply_markup=boss_victory_keyboard(),
+                reply_markup=boss_victory_keyboard(boss),
             )
             await notify_completed_quests(
                 uid,
@@ -14885,7 +16169,7 @@ async def start_bosses(message: Message, user_id: Optional[int] = None, answer_f
         '<tg-emoji emoji-id="5217822164362739968">👑</tg-emoji> <b>Локации</b>\n\n'
         + "\n\n".join(f"<blockquote>{x}</blockquote>" for x in loc_lines)
         + f'\n\n<blockquote><tg-emoji emoji-id="5998843468716184159">❤️‍🔥</tg-emoji>Твой уровень: <b>{player_level}</b> · '
-        f'<tg-emoji emoji-id="5332336747072208845">🔥</tg-emoji>Сила: <b>{equipped_power}</b></blockquote>'
+        f'<tg-emoji emoji-id="5332336747072208845">🔥</tg-emoji>Сила: <b>{format_num(equipped_power)}</b></blockquote>'
     )
     kb = InlineKeyboardMarkup(inline_keyboard=loc_buttons)
     await _send(text, kb)
@@ -14926,7 +16210,10 @@ async def show_quick_bosses(message: Message, user_id: Optional[int] = None, ans
     rows = []
     row = []
     for boss in available_bosses:
-        row.append(InlineKeyboardButton(text=boss["emoji"], callback_data=f"quick_boss|{boss['id']}"))
+        icon = premium_emoji_id(boss.get("premium_emoji") or "")
+        # только прем-иконка: текст — невидимый символ (U+2800), Telegram не пускает пустой текст
+        row.append(InlineKeyboardButton(text="\u2800" if icon else boss["emoji"],
+                                        callback_data=f"quick_boss|{boss['id']}", icon_custom_emoji_id=icon))
         if len(row) == 5:
             rows.append(row)
             row = []
@@ -14993,7 +16280,7 @@ async def start_location(message: Message, user_id: Optional[int] = None, loc_id
         f"<blockquote>{loc['description']}</blockquote>\n\n"
         + "\n\n".join(f"<blockquote>{x}</blockquote>" for x in boss_lines)
         + f"\n\n<blockquote>4 волны: 3×3 врага и финальный босс\n"
-        f'<tg-emoji emoji-id="5332336747072208845">🔥</tg-emoji>Твоя сила: <b>{equipped_power}</b></blockquote>'
+        f'<tg-emoji emoji-id="5332336747072208845">🔥</tg-emoji>Твоя сила: <b>{format_num(equipped_power)}</b></blockquote>'
     )
     kb = InlineKeyboardMarkup(inline_keyboard=boss_buttons)
     await _send(text, kb)
@@ -15003,12 +16290,15 @@ async def start_boss_raid(message: Message, user_id: Optional[int] = None, boss_
     as_reply = user_id is None
     print(f"[start_boss_raid] uid={uid} boss_id={boss_id} answer_func={answer_func is not None}")
 
+    sent_holder: Dict[str, Any] = {}
+
     async def _send(text, kb):
         print(f"[start_boss_raid._send] sending, answer_func={answer_func is not None}")
         if answer_func:
             await answer_func(text, kb)
+            sent_holder["msg"] = message          # при нажатии кнопки редактируется это же сообщение
         else:
-            await send_owned_message(message, uid, text, reply_markup=kb, as_reply=as_reply)
+            sent_holder["msg"] = await send_owned_message(message, uid, text, reply_markup=kb, as_reply=as_reply)
 
     if uid in active_battles:
         battle = active_battles[uid]
@@ -15046,10 +16336,22 @@ async def start_boss_raid(message: Message, user_id: Optional[int] = None, boss_
     battle = create_boss_battle(player_level, boss, equipped_armor, user, hard_mode)
     active_battles[uid] = battle
     await save_runtime_state(uid, user)
+    auto_always = False   # автобой игроков отключён
+    if auto_always:
+        battle["auto"] = True  # кнопка сразу покажет «Остановить автобой»
     await _send(
-        get_battle_text(battle, "Рейд начался. В каждой волне сначала бьют враги, потом ты."),
+        get_battle_text(battle, "Рейд начался. В каждой волне сначала бьют враги, потом ты."
+                        + ("\n🔄 Автобой включён — бот бьёт сам." if auto_always else "")),
         battle_keyboard(battle),
     )
+    if auto_always and sent_holder.get("msg") is not None:
+        old = auto_battle_tasks.get(uid)
+        if old and not old.done():
+            old.cancel()
+        auto_battle_tasks[uid] = asyncio.create_task(
+            auto_battle_loop(uid, sent_holder["msg"], _AutoBattleUser(uid), battle))
+    elif auto_always:
+        battle.pop("auto", None)
 
 async def start_farm(message: Message, user_id: Optional[int] = None):
     uid = user_id or message.from_user.id
@@ -15691,12 +16993,11 @@ def parse_admin_amount_command(message: Message, usage: str) -> tuple[Optional[i
     if message.from_user.id not in ADMIN_IDS:
         return None, ""  # не админ — без подсказок, бот молчит
     parts = (message.text or "").split()
-    if len(parts) != 2:
-        return None, f"Напиши так: <b>{usage}</b> реплаем на игрока."
-    try:
-        amount = int(parts[1])
-    except ValueError:
-        return None, "Количество должно быть числом."
+    if len(parts) < 2:
+        return None, f"Напиши так: <b>{usage}</b> реплаем на игрока. Можно сокращать: 5к, 1.5кк, 2м."
+    amount = parse_short_number("".join(parts[1:]))
+    if amount is None:
+        return None, "Количество должно быть числом (можно 5к, 1.5кк, 2м, 3б)."
     if amount <= 0:
         return None, "Количество должно быть больше нуля."
     return amount, None
@@ -15738,8 +17039,8 @@ async def admin_adjust_coins(message: Message, give: bool):
     await save_runtime_state(target.id, user)
     await reply_to_user(
         message,
-        f"<tg-emoji emoji-id=\"5325762861539016690\">✅</tg-emoji> <b>{html.escape(target.first_name or 'Игрок')}</b>: {verb} <b>{amount}</b> монет.\n"
-        f"Баланс: <b>{old_coins}</b> → <b>{user['coins']}</b>.",
+        f"<tg-emoji emoji-id=\"5325762861539016690\">✅</tg-emoji> <b>{html.escape(target.first_name or 'Игрок')}</b>: {verb} <b>{format_num(amount)}</b> монет.\n"
+        f"Баланс: <b>{format_num(old_coins)}</b> → <b>{format_num(user['coins'])}</b>.",
         parse_mode="HTML",
     )
 
@@ -15958,8 +17259,8 @@ def parse_admin_pet_give_args(message: Message) -> tuple[Optional[str], Optional
 
     amount = 1
     args = parts[1:]
-    if len(args) >= 2 and args[-1].lstrip("-").isdigit():
-        amount = int(args[-1])
+    if len(args) >= 2 and is_short_number(args[-1]):
+        amount = parse_short_number(args[-1])
         args = args[:-1]
     if amount <= 0:
         return None, None, "Количество должно быть больше нуля."
@@ -16146,8 +17447,8 @@ async def admin_give_weapon(message: Message):
 
     amount = 1
     args = parts[1:]
-    if len(args) >= 2 and args[-1].lstrip("-").isdigit():
-        amount = int(args[-1])
+    if len(args) >= 2 and is_short_number(args[-1]):
+        amount = parse_short_number(args[-1])
         args = args[:-1]
     query = " ".join(args)
 
@@ -16191,7 +17492,7 @@ async def admin_give_weapon(message: Message):
     await save_runtime_state(target.id, user)
 
     rarity_info = RARITIES[rarity_key]
-    trash_note = f"\n⚠️ Экипировка заполнена, {trashed} шт. отправлено в корзину." if trashed else ""
+    trash_note = f"\n{PE_WARN} Экипировка заполнена, {trashed} шт. отправлено в корзину." if trashed else ""
     await reply_to_user(message,
         f"<tg-emoji emoji-id=\"5325762861539016690\">✅</tg-emoji> Выдано в экипировку: {weapon_def['emoji']} <b>{html.escape(weapon_def['name'])}</b> "
         f"({rarity_html(rarity_key, rarity_info['emoji'])} {rarity_info['name']}) x{given} "
@@ -16231,8 +17532,8 @@ async def admin_give_armor(message: Message):
         else:
             rest_args.append(a)
     args = rest_args
-    if len(args) >= 2 and args[-1].lstrip("-").isdigit():
-        amount = int(args[-1])
+    if len(args) >= 2 and is_short_number(args[-1]):
+        amount = parse_short_number(args[-1])
         args = args[:-1]
     query = " ".join(args)
 
@@ -16290,7 +17591,7 @@ async def admin_give_armor(message: Message):
 
     rarity_info = RARITIES[rarity_key]
     slot_name = " + ".join(ARMOR_SLOT_NAMES.get(sl, sl) for sl in give_slots)
-    trash_note = f"\n⚠️ Экипировка заполнена, {trashed} шт. отправлено в корзину." if trashed else ""
+    trash_note = f"\n{PE_WARN} Экипировка заполнена, {trashed} шт. отправлено в корзину." if trashed else ""
     await reply_to_user(message,
         f"<tg-emoji emoji-id=\"5325762861539016690\">✅</tg-emoji> Выдано в экипировку: {armor_piece['emoji']} <b>{html.escape(armor_piece['name'])}</b> "
         f"({rarity_info['emoji']} {rarity_info['name']}, {slot_name}) "
@@ -16353,8 +17654,8 @@ async def admin_adjust_boss_loot(message: Message, give: bool):
 
     amount = 1
     args = parts[1:]
-    if len(args) >= 2 and args[-1].lstrip("-").isdigit():
-        amount = int(args[-1])
+    if len(args) >= 2 and is_short_number(args[-1]):
+        amount = parse_short_number(args[-1])
         args = args[:-1]
     query = " ".join(args)
 
@@ -16457,8 +17758,8 @@ async def admin_adjust_potion(message: Message, give: bool):
 
     amount = 1
     args = parts[1:]
-    if len(args) >= 2 and args[-1].lstrip("-").isdigit():
-        amount = int(args[-1])
+    if len(args) >= 2 and is_short_number(args[-1]):
+        amount = parse_short_number(args[-1])
         args = args[:-1]
     query = " ".join(args)
 
@@ -16531,9 +17832,8 @@ async def admin_bulk_roll(message: Message):
         await reply_to_user(message, "Напиши так: <b>ролл 100</b>", parse_mode="HTML")
         return
 
-    try:
-        amount = int(parts[1])
-    except ValueError:
+    amount = parse_short_number(parts[1])
+    if amount is None:
         await reply_to_user(message, "Количество роллов должно быть числом.")
         return
 
@@ -16586,14 +17886,14 @@ async def admin_bulk_roll(message: Message):
         if rarity_counts.get(rarity, 0)
     ]
     level_text = (
-        f"\n⬆️ Получено уровней: <b>{total_levels_gained}</b> · текущий: <b>{user['level']}</b>"
+        f"\n<tg-emoji emoji-id=\"6084922627736996647\">🆙</tg-emoji> Получено уровней: <b>{total_levels_gained}</b> · текущий: <b>{user['level']}</b>"
         if total_levels_gained else ""
     )
     await reply_to_user(message, 
-        f"🎲 <b>Массовый ролл: {amount}</b>\n\n"
+        f"<tg-emoji emoji-id=\"5293998404404272267\">🎁</tg-emoji> <b>Массовый ролл: {amount}</b>\n\n"
         + ("\n".join(rarity_lines) if rarity_lines else "Без предметов")
         + f"\n\n<tg-emoji emoji-id=\"5373173798633752502\">⚔️</tg-emoji> В экипировку: <b>{added_to_inventory}</b>"
-        + f"\n🗑️ В корзину: <b>{sent_to_trash}</b>"
+        + f"\n<tg-emoji emoji-id=\"5445267414562389170\">🗑</tg-emoji> В корзину: <b>{sent_to_trash}</b>"
         + f"\n<tg-emoji emoji-id=\"5370831521039017384\">✨</tg-emoji> Опыт: <b>+{amount * get_chest_xp_reward(user)}</b>"
         + level_text,
         parse_mode="HTML",
@@ -16645,7 +17945,22 @@ async def perform_auto_roll_once(user_id: int) -> bool:
         await save_runtime_state(user_id)
         return False
     if len(session["items"]) >= get_auto_roll_bag_capacity(db.data.get(str(user_id))):
+        # Сумка заполнилась посреди работы (часто — сразу после автоперезапуска, когда места оставалось мало).
+        # Раньше авторолл молча вставал, и казалось, что перезапуск «не сработал» — теперь сообщаем.
         session["running"] = False
+        session["until"] = 0
+        u = db.data.get(str(user_id))
+        if isinstance(u, dict) and not u.get("auto_roll_bag_notified"):
+            u["auto_roll_bag_notified"] = True
+            u["auto_roll_end_notified"] = True
+            asyncio.create_task(send_user_notification(
+                user_id,
+                f"<blockquote>{PE_BOX} <b>Сумка авторолла полна</b>{PE_ALARM}\n"
+                "Авторолл остановлен — новым предметам некуда падать.</blockquote>\n\n"
+                f"<blockquote>Напиши <b>Ролл</b>, забери лут и запусти снова. "
+                f"Расширить сумку можно в <b>Магазине</b>.</blockquote>",
+                reply_markup=nav_kb(NAV_AUTOROLL, NAV_SHOP),
+            ))
         await save_runtime_state(user_id)
         return False
 
@@ -16655,29 +17970,33 @@ async def perform_auto_roll_once(user_id: int) -> bool:
         await save_runtime_state(user_id, user) if user else None
         return False
 
-    if random.random() < 0.5:
-        item = roll_weapon(user.get("level", 1), get_rebirth_count(user), user)
-    else:
-        item = roll_armor(user.get("level", 1), get_rebirth_count(user), user)
-    rarity = item["rarity"]
-    announce_item_drop(user_id, user, item, "авторолл")
-    rarity_stats = user.setdefault("rarity_stats", {rarity_key: 0 for rarity_key in RARITIES})
-    rarity_stats[rarity] = rarity_stats.get(rarity, 0) + 1
-    user["chests_opened"] = user.get("chests_opened", 0) + 1
-    starfall_add_points(user, SF_POINTS_ROLL)
-    add_xp(user, apply_xp_buff(user, get_chest_xp_reward(user)))
+    rolls_now = 1
+    if random.random() * 100 < get_auto_roll_double_chance(user) and len(session["items"]) + 1 < get_auto_roll_bag_capacity(user):
+        rolls_now = 2   # питомцы сверх лимита скорости: двойной ролл
+    for _roll_n in range(rolls_now):
+        if random.random() < 0.5:
+            item = roll_weapon(user.get("level", 1), get_rebirth_count(user), user)
+        else:
+            item = roll_armor(user.get("level", 1), get_rebirth_count(user), user)
+        rarity = item["rarity"]
+        announce_item_drop(user_id, user, item, "авторолл")
+        rarity_stats = user.setdefault("rarity_stats", {rarity_key: 0 for rarity_key in RARITIES})
+        rarity_stats[rarity] = rarity_stats.get(rarity, 0) + 1
+        user["chests_opened"] = user.get("chests_opened", 0) + 1
+        starfall_add_points(user, SF_POINTS_ROLL)
+        add_xp(user, apply_xp_buff(user, get_chest_xp_reward(user)))
 
-    essence_filters = set(user.get("auto_roll_essence", []))
-    filters = set(user.get("auto_roll_filters", []))
-    if rarity in essence_filters and rarity in AUTO_ROLL_ESSENCE_RARITIES:
-        # Автоутиль в эссенцию (эпик+): предмет сразу превращается в эссенцию редкости
-        add_boss_resource(user, get_essence_id_for_rarity(rarity), 1)
-    elif rarity in filters:
-        user["coins"] = user.get("coins", 0) + apply_coin_buff(user, RECYCLE_VALUES.get(rarity, 0))
-    else:
-        session["items"].append(item)
-    ensure_daily_stats(user)["rolls"] += 1
-    add_weekly_stat(user, "rolls")
+        essence_filters = set(user.get("auto_roll_essence", []))
+        filters = set(user.get("auto_roll_filters", []))
+        if rarity in essence_filters and rarity in AUTO_ROLL_ESSENCE_RARITIES:
+            # Автоутиль в эссенцию (эпик+): предмет сразу превращается в эссенцию редкости
+            add_boss_resource(user, get_essence_id_for_rarity(rarity), 1)
+        elif rarity in filters:
+            user["coins"] = user.get("coins", 0) + apply_coin_buff(user, RECYCLE_VALUES.get(rarity, 0))
+        else:
+            session["items"].append(item)
+        ensure_daily_stats(user)["rolls"] += 1
+        add_weekly_stat(user, "rolls")
 
     # Не пишем в базу на каждый ролл: состояние в памяти, в базу — не чаще раза в AUTO_ROLL_SAVE_INTERVAL
     await save_runtime_state_lazy(user_id, user)
@@ -16689,8 +18008,15 @@ async def auto_roll_loop(user_id: int):
         while get_auto_roll_session(user_id).get("running"):
             user = await db.get_user(user_id)
             await asyncio.sleep(get_auto_roll_interval(user))
-            if not await perform_auto_roll_once(user_id):
-                break
+            try:
+                if not await perform_auto_roll_once(user_id):
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # одна ошибка (например, сбой сохранения) больше не убивает авторолл насовсем
+                print(f"[auto_roll_loop] {user_id}: {e}")
+                await asyncio.sleep(5)
     finally:
         if auto_roll_tasks.get(user_id) is asyncio.current_task():
             auto_roll_tasks.pop(user_id, None)
@@ -16711,6 +18037,7 @@ async def start_auto_roll(user_id: int):
     session["running"] = True
     session["until"] = time.time() + duration
     user["auto_roll_end_notified"] = False
+    user["auto_roll_bag_notified"] = False
     await save_runtime_state(user_id, user)
     task = auto_roll_tasks.get(user_id)
     if not task or task.done():
@@ -16754,6 +18081,7 @@ async def show_auto_roll_menu(user_id: int, answer_func):
         session["until"] = 0
         running = False
         await notify_auto_roll_finished(user_id)
+        running = bool(session.get("running"))   # механизм мог сразу перезапустить авторолл
         await save_runtime_state(user_id, user)
 
     rarity_counts = {rarity: 0 for rarity in RARITIES}
@@ -16787,8 +18115,12 @@ async def show_auto_roll_menu(user_id: int, answer_func):
         "<blockquote>"
         f"{auto_emojis['status']}: <b>{status}</b>\n"
         f"{auto_emojis['time']}: <b>{time_text}</b>\n"
-        f"{auto_emojis['interval']} Интервал: <b>{interval} сек.</b>\n"
-        f"{auto_emojis['box']}: <b>{len(items)}/{bag_cap}</b></blockquote>\n\n"
+        f"{auto_emojis['interval']} Интервал: <b>{interval:g} сек.</b>"
+        + (" <i>(зелье скорости)</i>" if has_buff(user, "speed") else "")
+        + (f" <i>(питомцы −{get_pet_roll_speed_bonus(user)} сек.)</i>" if get_pet_roll_speed_bonus(user) else "")
+        + "\n"
+        + (f"Двойной ролл: <b>{get_auto_roll_double_chance(user)}%</b> <i>(скорость питомцев сверх лимита)</i>\n" if get_auto_roll_double_chance(user) else "")
+        + f"{auto_emojis['box']}: <b>{len(items)}/{bag_cap}</b></blockquote>\n\n"
         f"<blockquote>{rarity_text}</blockquote>"
     )
 
@@ -16910,10 +18242,13 @@ async def show_quests(user_id: int, answer_func):
         buttons.append([InlineKeyboardButton(text="Все задания выполнены", callback_data="noop", icon_custom_emoji_id="5325762861539016690")])
     buttons.append([InlineKeyboardButton(text="Все ветки и будущие задания", callback_data="qchains", icon_custom_emoji_id="5197269100878907942")])
 
-    await answer_func(
-        f'<tg-emoji emoji-id="5197269100878907942">✍️</tg-emoji> <b>Задания ({active_count})</b>\n\n<blockquote>Выбери задание, чтобы посмотреть прогресс и награду.</blockquote>',
-        InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
+    await answer_func(render_screen("задания", {"активных": active_count}), InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+register_screen("задания", "Задания (список)",
+                '<tg-emoji emoji-id="5197269100878907942">✍️</tg-emoji> <b>Задания ({активных})</b>\n\n'
+                "<blockquote>Выбери задание, чтобы посмотреть прогресс и награду.</blockquote>",
+                {"активных": "сколько заданий не сдано"})
 
 QUEST_CHAIN_NAMES = {
     "rolls": ("Роллы", "5303214794336125778"),
@@ -17127,7 +18462,7 @@ async def claim_quest_reward(user_id: int, quest_id: str, answer_func):
         place = "в экипировку" if weapon_in_inventory else "в корзину"
         weapon_text = f"\n{reward_weapon['emoji']} {html.escape(reward_weapon['name'])} добавлена {place}."
     level_text = f"\n<tg-emoji emoji-id=\"6084922627736996647\">🆙</tg-emoji> Новый уровень: <b>{user['level']}</b>" if levels_gained else ""
-    unlock_text = "\n🔁 Открыт авторолл. Напиши <b>ролл</b>." if quest.get("unlock_auto_roll") else ""
+    unlock_text = "\n<tg-emoji emoji-id=\"5346321684574003384\">🔄</tg-emoji> Открыт авторолл. Напиши <b>ролл</b>." if quest.get("unlock_auto_roll") else ""
     await answer_func(
         "<tg-emoji emoji-id=\"5293998404404272267\">🎁</tg-emoji> <b>Награда получена!</b>\n\n<blockquote>"
         f"<tg-emoji emoji-id=\"5463046637842608206\">🪙</tg-emoji> +{format_num(quest_coins)} монет\n"
@@ -17143,7 +18478,7 @@ async def claim_quest_reward(user_id: int, quest_id: str, answer_func):
 def get_xp_bar(current_xp: int, level: int) -> str:
     needed = get_level_xp_required(level)
     filled = max(0, min(10, round(current_xp / needed * 10))) if needed else 0
-    bar = "█" * filled + "░" * (10 - filled)
+    bar = pe_bar("xp", filled, 10, "█" * filled + "░" * (10 - filled))
     return f"{bar} {format_num(current_xp)}/{format_num(needed)}"
 
 # Плашки (владелец и т.п.) — показываются в «проф» и в «лф»
@@ -17199,18 +18534,26 @@ async def show_profile(message: Message):
     special_profile_banner = get_user_profile_banner(message.from_user.id, u)
     banner_text = f"\n\n{special_profile_banner}" if special_profile_banner else ""
 
-    await reply_to_user(message,
-        f"{profile_emojis['title']} <b>Профиль</b>"
-        f"{banner_text}\n\n<blockquote>"
-        f"{profile_emojis['power']} Сила: <b>{equipped_power}</b>\n"
-        f"{profile_emojis['armor']} Броня: <b>+{armor_hp} HP</b>\n"
-        f"{profile_emojis['name']}: <b>{name}</b>\n"
-        f"{profile_emojis['level']}: <b>{level}</b> (<b>{format_num(xp)}/{format_num(get_level_xp_required(level))}</b>)\n"
-        f"{profile_emojis['prestige']}: <b>{format_prestige_name(rebirths)}</b>\n"
-        f"{profile_emojis['coins']}: <b>{u.get('coins', 0)}</b>\n"
-        f"{profile_emojis['date']}: <b>{joined_text}</b></blockquote>",
-        parse_mode="HTML",
-    )
+    await reply_to_user(message, render_screen("профиль", {
+        "баннер": banner_text, "сила": format_num(equipped_power), "броня": format_num(armor_hp), "имя": name, "уровень": level,
+        "опыт": format_num(xp), "нужно": format_num(get_level_xp_required(level)),
+        "престиж": format_prestige_name(rebirths), "монеты": format_num(int(u.get('coins', 0) or 0)), "дата": joined_text,
+    }), parse_mode="HTML")
+
+
+register_screen("профиль", "Профиль", (
+    '<tg-emoji emoji-id="5442879640379076105">👤</tg-emoji> <b>Профиль</b>'
+    "{баннер}\n\n<blockquote>"
+    '<tg-emoji emoji-id="5332336747072208845">🔥</tg-emoji> Сила: <b>{сила}</b>\n'
+    '<tg-emoji emoji-id="5998843468716184159">❤️‍🔥</tg-emoji> Броня: <b>+{броня} HP</b>\n'
+    '<tg-emoji emoji-id="5837012579926412863">🪪</tg-emoji>: <b>{имя}</b>\n'
+    '<tg-emoji emoji-id="5431816358675366190">🆙</tg-emoji>: <b>{уровень}</b> (<b>{опыт}/{нужно}</b>)\n'
+    '<tg-emoji emoji-id="6278098265162387317">🤩</tg-emoji>: <b>{престиж}</b>\n'
+    '<tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji>: <b>{монеты}</b>\n'
+    '<tg-emoji emoji-id="5028418466000930064">📆</tg-emoji>: <b>{дата}</b></blockquote>'
+), {"баннер": "особый баннер (у донатеров/админов; пусто у остальных)", "сила": "сила экипировки", "броня": "HP от брони",
+    "имя": "ник со значками и титулами", "уровень": "уровень", "опыт": "текущий опыт", "нужно": "опыт до уровня",
+    "престиж": "перерождения", "монеты": "монеты", "дата": "дата регистрации"})
 
 async def show_level(message: Message):
     user = await db.get_user(message.from_user.id)
@@ -17218,17 +18561,20 @@ async def show_level(message: Message):
     xp = user.get("xp", 0)
     needed = get_level_xp_required(level)
     filled = max(0, min(10, round(xp / needed * 10))) if needed else 0
-    bar = "█" * filled + "░" * (10 - filled)
+    bar = pe_bar("xp", filled, 10, "█" * filled + "░" * (10 - filled))
     title_emoji = '<tg-emoji emoji-id="5431816358675366190">🆙</tg-emoji>'
     party_emoji = '<tg-emoji emoji-id="5375590976163167999">🥳</tg-emoji>'
     xp_emoji = '<tg-emoji emoji-id="5431631782455819233">🧪</tg-emoji>'
-    text = (
-        f"{title_emoji} <b>Уровень</b>\n\n"
-        f"<blockquote>Твой уровень: <b>{level}</b></blockquote>\n\n"
-        f"<blockquote><b>Красавчик!</b><b>{party_emoji}</b></blockquote>\n\n"
-        f"<blockquote>{bar} {format_num(xp)}/{format_num(needed)}{xp_emoji}</blockquote>"
-    )
+    text = render_screen("уровень", {"уровень": level, "полоска": bar, "опыт": format_num(xp), "нужно": format_num(needed)})
     await reply_to_user(message, text, parse_mode="HTML")
+
+
+register_screen("уровень", "Уровень", (
+    '<tg-emoji emoji-id="5431816358675366190">🆙</tg-emoji> <b>Уровень</b>\n\n'
+    "<blockquote>Твой уровень: <b>{уровень}</b></blockquote>\n\n"
+    '<blockquote><b>Красавчик!</b><b><tg-emoji emoji-id="5375590976163167999">🥳</tg-emoji></b></blockquote>\n\n'
+    '<blockquote>{полоска} {опыт}/{нужно}<tg-emoji emoji-id="5431631782455819233">🧪</tg-emoji></blockquote>'
+), {"уровень": "уровень", "полоска": "полоска прогресса", "опыт": "текущий опыт", "нужно": "опыт до уровня"})
 
 def format_percent(value: float) -> str:
     if value >= 1:
@@ -17281,7 +18627,7 @@ async def show_rebirth(user_id: int, answer_func):
         next_text = (
             f"{status}\n"
             f"Нужно: <b>{requirement['level']}</b> ур. и <b>{requirement['coins']}</b> {coin_emoji}\n"
-            f"Сейчас: <b>{user.get('level', 1)}</b> ур. и <b>{user.get('coins', 0)}</b> {coin_emoji}\n"
+            f"Сейчас: <b>{user.get('level', 1)}</b> ур. и <b>{format_num(user.get('coins', 0))}</b> {coin_emoji}\n"
             f"После престижа: <b>{max(1, int(user.get('level', 1) or 1) - requirement['level'] + 1)}</b> ур. "
             f"(спишется {requirement['level'] - 1} ур., лишние останутся)"
         )
@@ -17292,8 +18638,11 @@ async def show_rebirth(user_id: int, answer_func):
     text = (
         f"{prestige_emoji} <b>Престиж</b>\n\n"
         f"<blockquote>Текущий: <b>{format_prestige_name(rebirths)}</b>\n"
-        f"Опыт с роллов: <b>{xp_percent}%</b></blockquote>\n\n"
-        f"<b>Следующее:</b>\n\n"
+        f"Опыт с роллов: <b>{xp_percent}%</b>"
+        + (f"\n{PE_TROPHY} Звание: <b>Предел мира</b>" if prestige_has(user, 20) else "")
+        + "</blockquote>\n\n"
+        + f"<b>Открывается с престижем:</b>\n<blockquote>{prestige_unlocks_text(rebirths)}</blockquote>\n\n"
+        + f"<b>Следующее:</b>\n\n"
         f"<blockquote>{next_text}</blockquote>\n\n"
         f"<b>Шансы сейчас:</b>{luck_note}\n\n"
         "<blockquote>" + "\n".join(chance_lines) + "</blockquote>"
@@ -17377,6 +18726,59 @@ async def perform_rebirth(user_id: int, answer_func, answer_popup=None):
         await answer_popup(f"Престиж {user['rebirths']} получен! Уровень: {new_level}", show_alert=True)
     await show_rebirth(user_id, answer_func)
 
+@dp.message(lambda msg: msg.text and msg.text.strip().casefold() in ("дар престижа", "дар пр", "престиж дар"))
+async def text_prestige_gift(message: Message):
+    uid = message.from_user.id
+    user = await db.get_user(uid)
+    if not user:
+        return
+    if not prestige_has(user, 11):
+        need = 11 - get_rebirth_count(user)
+        await reply_to_user(message, f"{PE_CROSS} <b>Дар престижа</b> открывается с <b>11</b> престижа — осталось {need}.")
+        return
+    today = get_today_key()
+    if user.get("prestige_gift_day") == today:
+        await reply_to_user(message, f"{PE_CROSS} <b>Дар престижа</b> сегодня уже забран.\n\n<blockquote>Новый — после 00:00 МСК.</blockquote>")
+        return
+    g = get_prestige_gift(user)
+    for _ in range(g["luck"]):
+        add_potion_to_user(user, "luck_potion")
+    user["revive_scrolls"] = int(user.get("revive_scrolls", 0) or 0) + g["scrolls"]
+    res_line = give_star_boss_res(user, g["res"])
+    user["prestige_gift_day"] = today
+    await save_runtime_state(uid, user)
+    lines = [f'{POTION_PREMIUM_EMOJIS.get("luck_potion", "🍀")} +{g["luck"]} зелий удачи',
+             f"{PE_REVIVE} +{g['scrolls']} свитков воскрешения"]
+    if res_line:
+        lines.append(res_line)
+    title = f"{PE_TROPHY} <b>Дар престижа</b>" + (" · зелья ×2" if g["mult"] == 2 else "")
+    await reply_to_user(message, f"{title}\n\n<blockquote>" + "\n".join(lines) + "</blockquote>")
+
+
+@dp.message(lambda msg: msg.text and msg.text.strip().casefold() in ("благословение престижа", "благословение пр", "престиж благословение"))
+async def text_prestige_bless(message: Message):
+    uid = message.from_user.id
+    user = await db.get_user(uid)
+    if not user:
+        return
+    if not prestige_has(user, 14):
+        need = 14 - get_rebirth_count(user)
+        await reply_to_user(message, f"{PE_CROSS} <b>Благословение престижа</b> открывается с <b>14</b> престижа — осталось {need}.")
+        return
+    today = get_today_key()
+    if user.get("prestige_bless_day") == today:
+        await reply_to_user(message, f"{PE_CROSS} <b>Благословение престижа</b> сегодня уже получено.\n\n<blockquote>Новое — после 00:00 МСК.</blockquote>")
+        return
+    until = time.time() + PRESTIGE_BLESS_SECONDS
+    buffs = user.setdefault("active_buffs", {})
+    for key in ("luck", "xp", "coins"):
+        buffs[key] = max(float(buffs.get(key, 0) or 0), until)   # не сокращаем уже идущий бафф
+    user["prestige_bless_day"] = today
+    await save_runtime_state(uid, user)
+    await reply_to_user(message, f"{PE_TROPHY} <b>Благословение престижа</b>\n\n<blockquote>"
+                                 f"{T_CLOVER} +15% удачи · {PE_SPARK} +10% опыта · {T_COIN} +30% монет\nНа <b>{PRESTIGE_BLESS_SECONDS // 60} мин.</b></blockquote>")
+
+
 async def show_belt(message: Message):
     u = await db.get_user(message.from_user.id)
     await reply_to_user(message, 
@@ -17455,12 +18857,15 @@ async def show_stats(message: Message):
         f"{PREMIUM_RARITY_EMOJIS[rarity]} {RARITIES[rarity]['name']}: <b>{stats.get(rarity, 0)}</b>"
         for rarity in ROLL_RARITY_ORDER
     ]
-    await reply_to_user(message, 
-        f"{title_emoji} <b>Статистика выпадений</b>\n\n"
-        + "<blockquote>" + "\n".join(lines) + "</blockquote>"
-        + f"\n\n<blockquote>Всего роллов: <b>{u.get('chests_opened', 0)}</b></blockquote>",
-        parse_mode="HTML",
-    )
+    await reply_to_user(message, render_screen("статистика", {
+        "редкости": "\n".join(lines), "роллы": u.get('chests_opened', 0)}), parse_mode="HTML")
+
+
+register_screen("статистика", "Статистика выпадений", (
+    '<tg-emoji emoji-id="5231200819986047254">📊</tg-emoji> <b>Статистика выпадений</b>\n\n'
+    "<blockquote>{редкости}</blockquote>"
+    "\n\n<blockquote>Всего роллов: <b>{роллы}</b></blockquote>"
+), {"редкости": "сколько выпало каждой редкости", "роллы": "всего роллов"})
 
 async def recycle_selected_weapons(user_id: int) -> tuple:
     selected = recycle_sessions.pop(user_id, set())
@@ -17718,11 +19123,11 @@ async def show_trash(user_id, answer_func, page=0):
 
     if lines:
         text = (
-            f"🗑️ <b>Корзина</b> ({len(trash)} предметов, страница {page+1}/{total_pages})\n\n"
+            f"<tg-emoji emoji-id=\"5445267414562389170\">🗑</tg-emoji> <b>Корзина</b> ({len(trash)} предметов, страница {page+1}/{total_pages})\n\n"
             + "<blockquote>" + "\n".join(lines) + "</blockquote>"
         )
     else:
-        text = "🗑️ <b>Корзина пуста</b>\n\n<blockquote>Сюда попадают предметы, когда экипировка заполнена. Они хранятся 24 часа.</blockquote>"
+        text = "<tg-emoji emoji-id=\"5445267414562389170\">🗑</tg-emoji> <b>Корзина пуста</b>\n\n<blockquote>Сюда попадают предметы, когда экипировка заполнена. Они хранятся 24 часа.</blockquote>"
 
     if recycle_selected is not None:
         text += f"\n\n<blockquote><tg-emoji emoji-id=\"5445267414562389170\">🗑</tg-emoji> Переработка: выбрано <b>{len(recycle_selected)}</b>.</blockquote>"
@@ -17771,7 +19176,7 @@ def get_roll_result_text(
     hp_emoji = '<tg-emoji emoji-id="5404843113652970870">💊</tg-emoji>'
     level_up_emoji = '<tg-emoji emoji-id="5370632904571380120">⏏️</tg-emoji>'
     status = (
-        "⚠️ Экипировка заполнена. Предмет отправлен в корзину на 24 часа."
+        f"{PE_WARN} Экипировка заполнена. Предмет отправлен в корзину на 24 часа."
         if inventory_full else
         f"{success_emoji} Добавлено в экипировку."
     )
@@ -17784,9 +19189,9 @@ def get_roll_result_text(
         return (
             f"{item['emoji']} <b>{item_name}</b>\n\n<blockquote>"
             f"{rarity_emoji} {rarity_name}\n"
-            f"{slot_emoji} {slot_name}\n"
+            f"{armor_slot_icon(item.get('slot'))} {slot_name}\n"
             f"{level_emoji}<b>{item.get('level', 1)}</b> Уровень\n"
-            f"{hp_emoji} <b>+{item['hp']}</b> HP"
+            f"{hp_emoji} <b>+{format_num(item['hp'])}</b> HP"
             + (("\n" + "\n".join(resource_lines)) if resource_lines else "")
             + "</blockquote>\n\n"
             f"<blockquote>{status}{xp_text}{level_text}</blockquote>"
@@ -17797,7 +19202,7 @@ def get_roll_result_text(
             f"{rarity_emoji} {rarity_name}\n"
             f"{get_weapon_type_text(item)}\n"
             f"{level_emoji}<b>{item.get('weapon_level', 1)}</b> Уровень\n"
-            f"{damage_emoji} Урон: <b>{item['dmg'][0]}–{item['dmg'][1]}</b>\n"
+            f"{damage_emoji} Урон: <b>{format_num(item['dmg'][0])}–{format_num(item['dmg'][1])}</b>\n"
             f"{power_emoji} Сила: <b>{item.get('power', 0)}</b></blockquote>\n\n"
             f"<blockquote>{status}{xp_text}{level_text}</blockquote>"
         )
@@ -18099,7 +19504,8 @@ async def restore_runtime_state():
                 and len(session_items) < get_auto_roll_bag_capacity(user)
                 and not user.get("auto_roll_end_notified")
             ):
-                await notify_auto_roll_finished(uid, user, save_state=False)
+                # в фоне: при флуд-лимите уведомление может ждать минуты, а запуск бота ждать не должен
+                asyncio.create_task(notify_auto_roll_finished(uid, user, save_state=False))
                 changed = True
             if session_running:
                 auto_roll_tasks[uid] = asyncio.create_task(auto_roll_loop(uid))
@@ -18813,6 +20219,14 @@ async def show_clan_top(user_id: int, answer_func, by: str = "level"):
 @dp.message(Command("clan", "клан"))
 async def cmd_clan(message: Message):
     await show_clan(message.from_user.id, lambda t, kb: reply_to_user(message, t, kb))
+
+
+@dp.message(lambda msg: msg.text and msg.text.strip().casefold() in ("лутиафан", "кланбосс", "клановый босс"))
+async def text_clan_boss_short(message: Message):
+    """Лутиафан короткой командой (как «клан босс»)."""
+    if not await db.has_user(message.from_user.id):
+        return
+    await show_clan_boss(message.from_user.id, lambda t, kb: reply_to_user(message, t, kb))
 
 
 @dp.message(lambda msg: msg.text and message_command(msg) in ("клан", "clan"))
@@ -19644,10 +21058,10 @@ def get_clan_boss_damage_ranking(boss: dict) -> List[tuple]:
     return rows
 
 
-def roll_clan_boss_counter(user_ctx: dict, p: dict, boss: dict) -> tuple[int, str]:
+def roll_clan_boss_counter(user_ctx: dict, p: dict, boss: dict, dmg_mult: float = 1.0) -> tuple[int, str]:
     p["turn"] = int(p.get("turn", 0)) + 1
     tier = int(boss.get("tier", 1))
-    tier_mult = min(CLAN_BOSS_TIER_DMG_MAX, 1 + CLAN_BOSS_TIER_DMG_STEP * (tier - 1))
+    tier_mult = min(CLAN_BOSS_TIER_DMG_MAX, 1 + CLAN_BOSS_TIER_DMG_STEP * (tier - 1)) * dmg_mult
     special = p["turn"] % CLAN_BOSS_SPECIAL_EVERY == 0
     lo, hi = CLAN_BOSS_SPECIAL_PCT if special else CLAN_BOSS_HIT_PCT
     raw = math.ceil(p["max_hp"] * random.uniform(lo, hi) * tier_mult)
@@ -19667,17 +21081,12 @@ def get_clan_boss_text(clan: dict, boss: dict, user_id: int, log: str = "") -> s
     max_hp = max(1, int(boss.get("max_hp", 1)))
     pct = 100 * hp / max_hp
     ranking = get_clan_boss_damage_ranking(boss)
-    lines = [
-        f"{CLAN_BOSS_EMOJI} <b>{CLAN_BOSS_TITLE}</b>",
-        f"<i>Клан [{html.escape(str(clan.get('tag', '')))}] · тир {tier}</i>",
-        "",
-    ]
-    boss_block = [
-        f"{HP_EMOJI} {health_bar(hp, max_hp)} <b>{pct:.1f}%</b>",
-        f"<b>{format_num(hp)}</b> / {format_num(max_hp)} HP",
-        f"Участвуют: <b>{len(ranking)}</b> · до сброса: <b>{format_clan_boss_time(get_clan_boss_reset_left())}</b>",
-    ]
-    lines.append("<blockquote>" + "\n".join(boss_block) + "</blockquote>")
+    head = {
+        "тег": html.escape(str(clan.get('tag', ''))), "тир": tier, "полоска": health_bar(hp, max_hp),
+        "процент": f"{pct:.1f}", "hp": format_num(hp), "макс": format_num(max_hp), "участвуют": len(ranking),
+        "сброс": format_clan_boss_time(get_clan_boss_reset_left()),
+    }
+    lines = []
 
     p = (boss.get("players") or {}).get(str(user_id))
     if boss.get("defeated"):
@@ -19732,15 +21141,32 @@ def get_clan_boss_text(clan: dict, boss: dict, user_id: int, log: str = "") -> s
             else:
                 crit = f" {CRIT_EMOJI}" if r.get("crit") else ""
                 rec_lines.append(f"• {nm}: −{format_num(int(r.get('dmg', 0)))}{crit}")
-        lines.append("\n<b>Последние удары клана</b>\n<blockquote>" + "\n".join(rec_lines) + "</blockquote>")
+        lines.append("\n" + render_screen("лутиафан удары", {"список": "\n".join(rec_lines)}))
 
     if ranking:
         medals = ["🥇", "🥈", "🥉"]
         top_lines = []
         for i, (dmg, uid_str, pp) in enumerate(ranking[:3]):
             top_lines.append(f"{medals[i]} {clan_user_name_html(uid_str)} — {format_num(dmg)}")
-        lines.append("<b>Топ урона</b>\n<blockquote>" + "\n".join(top_lines) + "</blockquote>")
-    return "\n".join(lines)
+        lines.append(render_screen("лутиафан топ", {"список": "\n".join(top_lines)}))
+    head["остальное"] = "".join("\n" + x for x in lines)
+    return render_screen("лутиафан", head)
+
+
+register_screen("лутиафан", "Лутиафан (клановый босс)", (
+    f"{CLAN_BOSS_EMOJI} <b>{CLAN_BOSS_TITLE}</b>\n"
+    "<i>Клан [{тег}] · тир {тир}</i>\n\n"
+    f"<blockquote>{HP_EMOJI} {{полоска}} <b>{{процент}}%</b>\n"
+    "<b>{hp}</b> / {макс} HP\n"
+    "Участвуют: <b>{участвуют}</b> · до сброса: <b>{сброс}</b></blockquote>"
+    "{остальное}"
+), {"тег": "тег клана", "тир": "тир босса", "полоска": "полоска HP", "процент": "HP, %", "hp": "HP босса",
+    "макс": "максимум HP", "участвуют": "участников", "сброс": "время до сброса",
+    "остальное": "твоё состояние/награда, удары клана и топ урона (шаблоны «лутиафан удары» и «лутиафан топ»)"})
+register_screen("лутиафан удары", "Лутиафан — последние удары клана",
+                "<b>Последние удары клана</b>\n<blockquote>{список}</blockquote>", {"список": "последние удары"})
+register_screen("лутиафан топ", "Лутиафан — топ урона",
+                "<b>Топ урона</b>\n<blockquote>{список}</blockquote>", {"список": "топ-3 по урону"})
 
 
 def clan_boss_keyboard(boss: dict) -> InlineKeyboardMarkup:
@@ -19947,7 +21373,7 @@ async def clan_boss_hit(uid: int) -> tuple:
             else:
                 crit_text = f" | Крит{CRIT_EMOJI}" if crit else ""
                 player_log = f"{DAMAGE_EMOJI} <b>Твой урон: −{format_num(damage)}{crit_text}</b>"
-                heal = calc_vampirism_heal(ctx, damage, p["max_hp"])
+                heal = calc_vampirism_heal(ctx, damage, p["max_hp"], SHARED_BOSS_VAMP_CAP_MULT)
                 if heal > 0:
                     old_hp = p["hp"]
                     p["hp"] = min(p["max_hp"], old_hp + heal)
@@ -20217,7 +21643,10 @@ async def text_admin_clan(message: Message):
         if len(args) < 2 or not args[1].lstrip("-").isdigit():
             await reply_to_user(message, "Формат: <code>аклан ТЕГ склад болотный 50</code> (или <code>все</code>, минус — забрать)")
             return
-        amount = int(args[1])
+        amount = parse_short_number(args[1])
+        if amount is None:
+            await reply_to_user(message, "Количество должно быть числом (можно 5к, -2к).")
+            return
         rids = list(CLAN_RESOURCE_IDS) if args[0].lower() in ("все", "all") else [resolve_clan_resource(args[0])]
         if not rids[0]:
             await reply_to_user(message, "<tg-emoji emoji-id=\"5352669272575321097\">❌</tg-emoji> Ресурсы: " + ", ".join(CLAN_RESOURCE_SHORT.values()) + ", все")
@@ -20415,7 +21844,7 @@ async def text_admin_clan(message: Message):
 
     if sub in ("удалить", "delete"):
         if not args or args[0].lower() not in ("подтвердить", "confirm"):
-            await reply_to_user(message, f"⚠️ Точно удалить клан? Напиши <code>аклан {html.escape(str(clan.get('tag')))} удалить подтвердить</code>")
+            await reply_to_user(message, f"{PE_WARN} Точно удалить клан? Напиши <code>аклан {html.escape(str(clan.get('tag')))} удалить подтвердить</code>")
             return
         for uid_str in list((clan.get("members") or {}).keys()):
             u = db.data.get(uid_str)
@@ -20627,7 +22056,7 @@ async def build_player_info_text(target_id: int, user: dict, viewer_is_admin: bo
 
     main_block = (
         f"{e['power']} Сила: <b>{format_num(calculate_user_power(user))}</b>\n"
-        f"{e['armor']} Броня: <b>+{armor_hp} HP</b>\n"
+        f"{e['armor']} Броня: <b>+{format_num(armor_hp)} HP</b>\n"
         f"{e['name']}: <b>{name}</b>\n"
         f"{e['level']}: <b>{level}</b> (<b>{format_num(xp)}/{format_num(get_level_xp_required(level))}</b>)\n"
         f"{e['prestige']}: <b>{format_prestige_name(rebirths)}</b>\n"
@@ -20642,7 +22071,7 @@ async def build_player_info_text(target_id: int, user: dict, viewer_is_admin: bo
         info = PATHS[path]
         extra.append(f"{info.get('premium_emoji', info['emoji'])} Путь: <b>{info['name']}</b> · мастерство <b>{get_path_level(user)}/{PATH_MAX_LEVEL}</b>")
     else:
-        extra.append("Путь: <b>не выбран</b>")
+        extra.append('<tg-emoji emoji-id="5436082025704485068">🗺</tg-emoji> Путь: <b>не выбран</b>')
     clan = get_user_clan(user)
     if clan:
         role = ((clan.get("members") or {}).get(str(target_id)) or {}).get("role", "member")
@@ -20658,15 +22087,16 @@ async def build_player_info_text(target_id: int, user: dict, viewer_is_admin: bo
     weapon = user.get("equipped")
     if isinstance(weapon, dict):
         rarity = RARITIES.get(weapon.get("rarity"), {})
-        stars = get_fusion_stars(weapon) if weapon.get("fusion_level") else ""
+        rarity_pe = PREMIUM_RARITY_EMOJIS.get(weapon.get("rarity"), rarity.get("emoji", ""))
+        stars = ('<tg-emoji emoji-id="6269538837723090339">⭐</tg-emoji>' * len(get_fusion_stars(weapon))) if weapon.get("fusion_level") else ""
         gear.append(
             f"{e['sword']} {weapon.get('emoji', '')} <b>{html.escape(str(weapon.get('name', 'Оружие')))}</b> "
-            f"{rarity.get('emoji', '')} ур.{weapon.get('weapon_level', 1)}{(' ' + stars) if stars else ''}"
+            f"{rarity_pe} ур.{weapon.get('weapon_level', 1)}{(' ' + stars) if stars else ''}"
         )
     else:
         gear.append(f"{e['sword']} Оружие: <b>нет</b>")
     armor_count = sum(1 for piece in (user.get("equipped_armor") or {}).values() if piece)
-    gear.append(f"Надето брони: <b>{armor_count}/{len(ARMOR_SLOTS)}</b>")
+    gear.append(f'<tg-emoji emoji-id="5287786962571241490">🛡</tg-emoji> Надето брони: <b>{armor_count}/{len(ARMOR_SLOTS)}</b>')
     pet_parts = []
     for slot in range(get_pet_slots(user)):
         pet = get_equipped_pet(user, slot)
@@ -20700,12 +22130,14 @@ async def build_player_info_text(target_id: int, user: dict, viewer_is_admin: bo
         username = get_user_tg_username(user) or (getattr(tg_user, "username", None) or "")
         banned = await is_user_banned(target_id)
         admin_lines = [
-            f"ID: <code>{target_id}</code>",
-            f"Юзернейм: {('@' + html.escape(username)) if username else '<i>нет</i>'}",
-            f"Был в боте: <b>{_format_last_seen(user.get('last_seen_at'))}</b>",
-            f"Очки талантов: <b>{get_skill_points(user)}</b> · вложено: <b>{get_spent_skill_points(user)}</b>",
-            f"Предметов: <b>{len(user.get('inventory') or [])}</b>/{MAX_INVENTORY} · питомцев: <b>{len(user.get('pets') or [])}</b>",
-            f"Бан: <b>{'да' if banned else 'нет'}</b>",
+            f'{e["name"]} ID: <code>{target_id}</code>',
+            f'{e["title"]} Юзернейм: ' + (("@" + html.escape(username)) if username else "<i>нет</i>"),
+            f'<tg-emoji emoji-id="5287473790735890430">⏳</tg-emoji> Был в боте: <b>{_format_last_seen(user.get("last_seen_at"))}</b>',
+            f'<tg-emoji emoji-id="6325752533629273447">🧠</tg-emoji> Очки талантов: <b>{get_skill_points(user)}</b> · вложено: <b>{get_spent_skill_points(user)}</b>',
+            f'<tg-emoji emoji-id="5854908544712707500">📦</tg-emoji> Предметов: <b>{len(user.get("inventory") or [])}</b>/{MAX_INVENTORY} · '
+            f'{e["paw"]} питомцев: <b>{len(user.get("pets") or [])}</b>',
+            f'<tg-emoji emoji-id="5237947646672385924">🚫</tg-emoji> Бан: <b>{"да" if banned else "нет"}</b>'
+            + ("  · " + PE_STAR + " админ" if target_id in ADMIN_IDS else ""),
         ]
         text += f"\n\n{e['pc']} <b>Для админа</b>\n<blockquote>" + "\n".join(admin_lines) + "</blockquote>"
     return text
@@ -20758,21 +22190,47 @@ COIN_TRANSFER_MIN_AMOUNT = 1
 COIN_TRANSFER_MIN_LEVEL = 5          # с какого уровня можно отправлять (защита от твинков)
 COIN_TRANSFER_FEE_PERCENT = 0        # комиссия, % (0 — без комиссии)
 COIN_TRANSFER_CONFIRM_TTL = 5 * 60
-COIN_TRANSFER_DAILY_RECEIVE_LIMIT = 50_000  # сколько монет игрок может получить от других за сутки
+COIN_TRANSFER_DAILY_RECEIVE_LIMIT = 50_000  # минимум: сколько монет игрок может получить от других за сутки
+COIN_RECEIVE_PER_LEVEL_SQ = 300             # лимит растёт с уровнем получателя: 50к + 300 × уровень²
+
+
+def get_coin_receive_limit(user: Optional[dict]) -> int:
+    """Дневной лимит получения монет: растёт с уровнем (ур. 10 — 80к, 30 — 320к, 60 — 1.13м, 100 — 3.05м)."""
+    level = int((user or {}).get("level", 1) or 1)
+    raw = COIN_TRANSFER_DAILY_RECEIVE_LIMIT + COIN_RECEIVE_PER_LEVEL_SQ * level * level
+    return int(round(raw, -3))
 pending_coin_transfers: Dict[str, dict] = {}
 _coin_transfer_lock = asyncio.Lock()
 
 
-def parse_coin_amount(text: str) -> Optional[int]:
-    """1000, 1 000, 10к, 1.5к, 2м."""
-    t = (text or "").strip().lower().replace(" ", "").replace(",", ".")
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)(к|k|кк|м|m)?", t)
+# === Сокращения чисел: 5к, 1.5к, 2кк / 2м / 2млн, 3ккк / 3б / 3млрд, 1т / 1трлн ===
+_SHORT_NUM_MULT = {
+    "": 1, "к": 1_000, "k": 1_000, "тыс": 1_000,
+    "кк": 1_000_000, "kk": 1_000_000, "м": 1_000_000, "m": 1_000_000, "млн": 1_000_000,
+    "ккк": 1_000_000_000, "kkk": 1_000_000_000, "б": 1_000_000_000, "b": 1_000_000_000, "млрд": 1_000_000_000,
+    "т": 1_000_000_000_000, "t": 1_000_000_000_000, "трлн": 1_000_000_000_000,
+}
+_SHORT_NUM_RE = re.compile(r"([+-]?)(\d+(?:\.\d+)?)(к|k|тыс|кк|kk|м|m|млн|ккк|kkk|б|b|млрд|т|t|трлн)?")
+
+
+def parse_short_number(text) -> Optional[int]:
+    """Число с сокращением: «5к» → 5000, «1.5кк» → 1500000, «-2м» → -2000000. None — не число."""
+    t = str(text or "").strip().lower().replace(" ", "").replace("_", "").replace(",", ".")
+    m = _SHORT_NUM_RE.fullmatch(t)
     if not m:
         return None
-    value = float(m.group(1))
-    mult = {"к": 1_000, "k": 1_000, "кк": 1_000_000, "м": 1_000_000, "m": 1_000_000}.get(m.group(2) or "", 1)
-    amount = int(value * mult)
-    return amount if amount > 0 else None
+    value = float(m.group(2)) * _SHORT_NUM_MULT[m.group(3) or ""]
+    return int(round(-value if m.group(1) == "-" else value))
+
+
+def is_short_number(text) -> bool:
+    return parse_short_number(text) is not None
+
+
+def parse_coin_amount(text: str) -> Optional[int]:
+    """1000, 1 000, 10к, 1.5к, 2м / 2кк, 3б."""
+    amount = parse_short_number(text)
+    return amount if amount and amount > 0 else None
 
 
 def get_coins_received_today(user: Optional[dict]) -> int:
@@ -20782,7 +22240,7 @@ def get_coins_received_today(user: Optional[dict]) -> int:
 
 
 def get_coin_receive_left(user: Optional[dict]) -> int:
-    return max(0, COIN_TRANSFER_DAILY_RECEIVE_LIMIT - get_coins_received_today(user))
+    return max(0, get_coin_receive_limit(user) - get_coins_received_today(user))
 
 
 def format_time_until_daily_reset() -> str:
@@ -20806,7 +22264,11 @@ async def text_coin_transfer(message: Message):
         f"{COIN_E} <b>Передача монет</b>\n\n"
         "<blockquote>Ответь на сообщение игрока: <code>передать 1000</code>\n"
         "Можно сокращённо: <code>передать 10к</code>, <code>передать 1.5к</code>, <code>передать все</code>\n"
-        f"Один игрок может получить не больше <b>{format_num(COIN_TRANSFER_DAILY_RECEIVE_LIMIT)}</b> монет в день.</blockquote>"
+        "Сколько игрок может получить за день, зависит от его уровня: "
+        f"ур. 10 — <b>{format_num(get_coin_receive_limit({'level': 10}))}</b>, "
+        f"30 — <b>{format_num(get_coin_receive_limit({'level': 30}))}</b>, "
+        f"60 — <b>{format_num(get_coin_receive_limit({'level': 60}))}</b>, "
+        f"100 — <b>{format_num(get_coin_receive_limit({'level': 100}))}</b>.</blockquote>"
     )
     replied = message.reply_to_message
     if len(parts) < 2 or not replied or not replied.from_user:
@@ -20850,7 +22312,7 @@ async def text_coin_transfer(message: Message):
         return
 
     receiver = await db.get_user(target.id)
-    sender_is_admin = is_admin_user(uid)
+    sender_is_admin = False   # лимит получения действует для всех (админ выдаёт монеты командой «монеты+»)
     receive_left = get_coin_receive_left(receiver)
     if parts[1].lower() in ("все", "всё", "all") and not sender_is_admin:
         amount = min(amount, receive_left)
@@ -20860,14 +22322,14 @@ async def text_coin_transfer(message: Message):
             await reply_to_user(
                 message,
                 f"<tg-emoji emoji-id=\"5352669272575321097\">❌</tg-emoji> <b>{render_user_nickname(receiver, str('Игрок'))}</b> уже получил сегодня максимум "
-                f"<b>{format_num(COIN_TRANSFER_DAILY_RECEIVE_LIMIT)}</b> {COIN_E}.\n\n<blockquote>"
+                f"<b>{format_num(get_coin_receive_limit(receiver))}</b> {COIN_E}.\n\n<blockquote>"
                 f"Лимит обновится через {format_time_until_daily_reset()}.</blockquote>",
             )
         else:
             await reply_to_user(
                 message,
                 f"<blockquote><tg-emoji emoji-id=\"5352669272575321097\">❌</tg-emoji> Сегодня этому игроку можно передать ещё только <b>{format_num(receive_left)}</b> {COIN_E} "
-                f"(лимит {format_num(COIN_TRANSFER_DAILY_RECEIVE_LIMIT)} в день).</blockquote>",
+                f"(лимит {format_num(get_coin_receive_limit(receiver))} в день).</blockquote>",
             )
         return
     if not amount:
@@ -20888,7 +22350,7 @@ async def text_coin_transfer(message: Message):
         f"Сумма: <b>{format_num(amount)}</b> {COIN_E}{fee_line}\n"
         f"Спишется: <b>{format_num(amount + fee)}</b> · останется <b>{format_num(balance - amount - fee)}</b>"
         + ("" if sender_is_admin else
-           f"\nЛимит получателя сегодня: <b>{format_num(receive_left - amount)}</b> из {format_num(COIN_TRANSFER_DAILY_RECEIVE_LIMIT)} останется")
+           f"\nЛимит получателя сегодня: <b>{format_num(receive_left - amount)}</b> из {format_num(get_coin_receive_limit(receiver))} останется")
         + "</blockquote>\n\n"
         "Подтверди перевод — отменить его потом будет нельзя."
     )
@@ -20936,7 +22398,7 @@ async def cb_coin_transfer_confirm(call: CallbackQuery):
         if int(sender.get("coins", 0) or 0) < amount + fee:
             await call.answer("Не хватает монет.", show_alert=True)
             return
-        sender_is_admin = is_admin_user(pend["from"])
+        sender_is_admin = False   # лимит получения действует для всех
         if not sender_is_admin and amount > get_coin_receive_left(receiver):
             left = get_coin_receive_left(receiver)
             await call.answer(
@@ -20955,7 +22417,7 @@ async def cb_coin_transfer_confirm(call: CallbackQuery):
         await db.save_user(pend["to"], receiver)
     await write_activity_log(
         f"PAY {_log_user_name(pend['from'], sender)} → {_log_user_name(pend['to'], receiver)} | "
-        f"{amount} монет" + (f", комиссия {fee}" if fee else "")
+        f"{format_num(amount)} монет" + (f", комиссия {fee}" if fee else "")
     )
     sender_name = render_user_nickname(sender)
     receiver_name = render_user_nickname(receiver)
@@ -21043,10 +22505,9 @@ async def admin_adjust_essence(message: Message, give: bool):
             f"Редкость: {rarities_help} или по-русски (обычная, эпическая, кошмарная…), либо <code>все</code>.",
         )
         return
-    try:
-        amount = int(parts[2])
-    except ValueError:
-        await reply_to_user(message, "Количество должно быть числом.")
+    amount = parse_short_number(parts[2])
+    if amount is None:
+        await reply_to_user(message, "Количество должно быть числом (можно 5к, 1.5кк).")
         return
     if amount <= 0:
         await reply_to_user(message, "Количество должно быть больше нуля.")
@@ -21148,8 +22609,8 @@ async def admin_take_weapon(message: Message):
         return
     # «оруж- название [кол-во]» или «оруж- все»
     amount = None
-    if len(args) >= 2 and args[-1].isdigit():
-        amount = int(args[-1])
+    if len(args) >= 2 and is_short_number(args[-1]) and not args[-1].startswith("-"):
+        amount = parse_short_number(args[-1])
         args = args[:-1]
     query = " ".join(args).strip().lower()
     weapons = [it for it in (user.get("inventory") or []) if is_weapon_item(it)]
@@ -21428,6 +22889,8 @@ def build_battle_backpack_keyboard(user: dict, battle: dict) -> InlineKeyboardMa
 @dp.callback_query(F.data == "battle_backpack")
 async def cb_battle_backpack(call: CallbackQuery):
     uid = call.from_user.id
+    if not await battle_window_ok(call):
+        return
     battle = active_battles.get(uid)
     if not battle:
         await call.answer("Боя нет.", show_alert=True)
@@ -21444,6 +22907,8 @@ async def cb_battle_backpack(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("battle_throw|"))
 async def cb_battle_throw(call: CallbackQuery):
     uid = call.from_user.id
+    if not await battle_window_ok(call, turn=True):
+        return
     pid = call.data.split("|", 1)[1]
     lock = battle_locks.setdefault(uid, asyncio.Lock())
     async with lock:
@@ -22099,7 +23564,7 @@ def durability_bar(value: int, maximum: int, width: int = 10) -> str:
     filled = max(0, min(width, round(width * value / max(1, maximum))))
     if value > 0 and filled == 0:
         filled = 1
-    return "▰" * filled + "▱" * (width - filled)
+    return pe_bar("green", filled, width, "▰" * filled + "▱" * (width - filled))
 
 
 async def show_shop(user_id: int, answer_func):
@@ -22115,19 +23580,10 @@ async def show_shop(user_id: int, answer_func):
     else:
         state = f"{PE_GEAR} Состояние: <b>нет механизма</b> — купи заряды ниже"
     unlock_note = "" if user.get("auto_roll_unlocked") else "\n\n<i>Авторолл ещё не открыт — сначала выполни задание на роллы.</i>"
-    text = (
-        '<tg-emoji emoji-id="5440841102871517055">🛒</tg-emoji> <b>Магазин</b>\n\n'
-        f"<blockquote>{PE_RESTART} <b>Механизм автоперезапуска</b>\n"
-        "Когда авторолл заканчивает работу, механизм сам запускает его снова. "
-        "Каждый перезапуск стирает <b>1 прочность</b>; на нуле механизм ломается.\n"
-        "Не срабатывает, если сумка авторолла полна — сначала забери лут.</blockquote>\n\n"
-        f"<blockquote>{state}\n"
-        f"{PE_STATS} Перезапусков сделано: <b>{int(ar.get('used', 0))}</b>\n"
-        f"Монеты: <b>{format_num(int(user.get('coins', 0)))}</b> {coin}</blockquote>\n\n"
-        "<i>Включить, выключить и посмотреть механизм — команда <b>арп</b>.</i>\n\n"
-        + get_bag_shop_block(user)
-        + unlock_note
-    )
+    text = render_screen("магазин", {
+        "состояние": state, "перезапуски": int(ar.get('used', 0)), "монеты": format_num(int(user.get('coins', 0))),
+        "сумка": get_bag_shop_block(user), "заметка": unlock_note,
+    })
     rows = []
     for pack_id, pack in AUTORESTART_PACKS.items():
         price = get_autorestart_pack_price(user, pack_id)
@@ -22147,6 +23603,21 @@ async def show_shop(user_id: int, answer_func):
             icon_custom_emoji_id="5854908544712707500",
         )])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("магазин", "Магазин", (
+    '<tg-emoji emoji-id="5440841102871517055">🛒</tg-emoji> <b>Магазин</b>\n\n'
+    f"<blockquote>{PE_RESTART} <b>Механизм автоперезапуска</b>\n"
+    "Когда авторолл заканчивает работу, механизм сам запускает его снова. "
+    "Каждый перезапуск стирает <b>1 прочность</b>; на нуле механизм ломается.\n"
+    "Не срабатывает, если сумка авторолла полна — сначала забери лут.</blockquote>\n\n"
+    "<blockquote>{состояние}\n"
+    f"{PE_STATS} Перезапусков сделано: <b>{{перезапуски}}</b>\n"
+    'Монеты: <b>{монеты}</b> <tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji></blockquote>\n\n'
+    "<i>Включить, выключить и посмотреть механизм — команда <b>арп</b>.</i>\n\n"
+    "{сумка}{заметка}"
+), {"состояние": "состояние и прочность механизма", "перезапуски": "сделано перезапусков", "монеты": "монеты игрока",
+    "сумка": "блок сумки авторолла", "заметка": "подсказка, если авторолл не открыт"})
 
 
 PE_BAG = '<tg-emoji emoji-id="5854908544712707500">📦</tg-emoji>'
@@ -22337,6 +23808,7 @@ async def try_auto_restart(user_id: int, user: dict) -> Optional[str]:
     session["running"] = True
     session["until"] = time.time() + duration
     user["auto_roll_end_notified"] = False
+    user["auto_roll_bag_notified"] = False
     await save_runtime_state(user_id, user)
     task = auto_roll_tasks.get(user_id)
     if not task or task.done() or task is asyncio.current_task():
@@ -22435,7 +23907,7 @@ ANNOUNCE_CHANNEL_ID: Optional[int] = ANNOUNCE_CHANNEL_FIXED_ID
 ANNOUNCE_ITEM_MIN_RARITY = "nightmare"             # экипировка: только кошмарная (миф в канал не идёт)
 ANNOUNCE_PET_MIN_RARITY = "epic"                   # питомцы: эпик и выше
 ANNOUNCE_SETTINGS_FILE = persistent_path("lootify_settings.json")
-ANNOUNCE_SEND_INTERVAL = 1.5                       # пауза между постами (лимиты Telegram)
+ANNOUNCE_SEND_INTERVAL = 3.5                       # пауза между постами: в канал Telegram пускает ~20 постов в минуту
 _announce_queue: Optional[asyncio.Queue] = None
 _announce_last_error_at = 0.0
 
@@ -22705,8 +24177,8 @@ def validate_nickname(nickname: str) -> Optional[str]:
     """None — ник подходит, иначе текст ошибки (те же правила, что при регистрации)."""
     if not nickname or nickname.startswith("/"):
         return "Напиши ник обычным текстом."
-    if len(nickname) < 2 or len(nickname) > 20:
-        return "Ник должен быть от 2 до 20 символов."
+    if len(nickname) < 1 or len(nickname) > 20:
+        return "Ник должен быть от 1 до 20 символов."
     if any(char in nickname for char in "<>\n\r\t"):
         return "В нике нельзя использовать переносы и символы < >."
     return None
@@ -22727,7 +24199,7 @@ async def text_change_nickname(message: Message):
             f"<blockquote>Сейчас: <b>{render_user_nickname(user)}</b>\n"
             f"Цена: <b>{format_num(NICK_CHANGE_COST)}</b> {coin}</blockquote>\n\n"
             "Напиши: <code>сменить ник Новый Ник</code>\n"
-            "<i>От 2 до 20 символов. Премиум-эмодзи в нике сохранятся и будут видны в профиле, топах и клане.</i>",
+            "<i>От 1 до 20 символов. Премиум-эмодзи в нике сохранятся и будут видны в профиле, топах и клане.</i>",
         )
         return
     error = validate_nickname(new_nick)
@@ -22828,7 +24300,7 @@ def get_boss_revive_price(boss: dict) -> int:
 def get_boss_revive_limit(user: Optional[dict]) -> int:
     donor = get_donor_perk(user)
     return (BOSS_REVIVE_DAILY_LIMIT + (STAR_PASS_EXTRA_REVIVES if has_star_pass(user) else 0)
-            + (donor["revives"] if donor else 0))
+            + (donor["revives"] if donor else 0) + (PRESTIGE_EXTRA_REVIVES if prestige_has(user, 17) else 0))
 
 
 def get_boss_revives_left(user: dict) -> int:
@@ -23120,8 +24592,8 @@ def give_star_boss_res(user: dict, amount: int) -> str:
     return f"{info.get('emoji', '')} {html.escape(str(info.get('name', rid)))}: +{amount}"
 
 
-STAR_PRODUCT_ICONS = {'bossres2': '5109480514809497205', 'scroll10': '5346321684574003384', 'scroll40': '5346321684574003384', 'mech100': '5213214428958306222', 'coins': '5433594926107481306', 'starter': '5303214794336125778', 'pass30': '5328313337673439040'}
-STAR_PRODUCT_FALLBACK = {'bossres2': '💎', 'scroll10': '🔄', 'scroll40': '🔄', 'mech100': '🛠', 'coins': '⚪️', 'starter': '🎁', 'pass30': '🌟'}
+STAR_PRODUCT_ICONS = {'bossres2': '5109480514809497205', 'scroll10': '5346321684574003384', 'scroll40': '5346321684574003384', 'mech100': '5213214428958306222', 'coins': '5433594926107481306', 'starter': '5303214794336125778', 'pass30': '5328313337673439040', 'shards_s': '6325309396083543238', 'shards_l': '5794158469988753026'}
+STAR_PRODUCT_FALLBACK = {'bossres2': '💎', 'scroll10': '🔄', 'scroll40': '🔄', 'mech100': '🛠', 'coins': '⚪️', 'starter': '🎁', 'pass30': '🌟', 'shards_s': '💎', 'shards_l': '💎'}
 
 
 def star_product_icon_html(pid: str) -> str:
@@ -23174,6 +24646,16 @@ STAR_PRODUCTS.update({
     "coinbuff":  {"title": f"Свиток богатства ({STAR_BUFF_HOURS} ч)", "stars": 40,
                   "desc": f"+{int(STAR_BUFF_COINS * 100)}% монет отовсюду на {STAR_BUFF_HOURS} часов. Складывается с другими бонусами, повторная покупка продлевает.",
                   "give": {"buffs": {"star_coins": STAR_BUFF_HOURS * 3600}}},
+})
+
+STAR_PRODUCTS.update({
+    # --- Осколки гравировки (наборы III + IV) ---
+    "shards_s": {"title": "Набор осколков", "stars": 25,
+                 "desc": "20 осколков III уровня и 5 осколков IV уровня — для гравировки, скрещивания и переноса.",
+                 "give": {"relics": {"engraving_shard_3": 20, "engraving_shard_4": 5}}},
+    "shards_l": {"title": "Большой набор осколков", "stars": 70,
+                 "desc": "70 осколков III уровня и 20 осколков IV уровня — выгоднее малого набора.",
+                 "give": {"relics": {"engraving_shard_3": 70, "engraving_shard_4": 20}}},
 })
 
 STAR_PRODUCTS["lf_hide"] = {
@@ -23272,7 +24754,7 @@ def apply_star_product(user: dict, product_id: str) -> List[str]:
     if give.get("pass_days"):
         start = max(time.time(), float(user.get("star_pass_until", 0) or 0))
         user["star_pass_until"] = start + give["pass_days"] * 86400
-        until = datetime.utcfromtimestamp(user["star_pass_until"] + 3 * 3600).strftime("%d.%m.%Y")
+        until = datetime.fromtimestamp(user["star_pass_until"] + 3 * 3600, timezone.utc).replace(tzinfo=None).strftime("%d.%m.%Y")
         got.append(f"{PE_PASS} Пропуск активен до {until}")
     if STAR_PRODUCTS[product_id].get("once"):
         user.setdefault("star_once_bought", []).append(product_id)
@@ -23283,6 +24765,7 @@ STAR_SHOP_SECTIONS = [
     ("Пропуска", '<tg-emoji emoji-id="5328313337673439040">🌟</tg-emoji>', ["bp_premium", "pass30"]),
     ("Буст на сутки", '<tg-emoji emoji-id="5370831521039017384">✨</tg-emoji>', ["coinbuff"]),
     ("Усиления", '<tg-emoji emoji-id="5373173798633752502">⚔️</tg-emoji>', ["bossres2", "bossres10", "coins", "coins3", "potions5", "luck3", "zefir100", "mech100"]),
+    ("Осколки гравировки", '<tg-emoji emoji-id="5794158469988753026">💎</tg-emoji>', ["shards_s", "shards_l"]),
     ("Свитки воскрешения", '<tg-emoji emoji-id="5346321684574003384">🔄</tg-emoji>', ["scroll10", "scroll40", "scroll100"]),
     ("Разовые", '<tg-emoji emoji-id="5303214794336125778">🎁</tg-emoji>', ["starter", "lf_hide"]),
 ]
@@ -23292,6 +24775,7 @@ STAR_SHOP_SHORT = {
     "starter": "Набор новичка", "lf_hide": "Скрытый профиль",
     "bossres10": "10 ресурсов босса", "coins3": "Сундук монет", "scroll100": "100 свитков", "potions5": "5 зелий",
     "luck3": "3 зелья удачи", "zefir100": "100 зефирок", "coinbuff": "Свиток богатства",
+    "shards_s": "Осколки 20+5", "shards_l": "Осколки 70+20",
 }
 
 
@@ -23302,7 +24786,7 @@ async def show_star_shop(user_id: int, answer_func):
         await save_runtime_state(user_id, user)
     status = [f"{PE_REVIVE} Свитков: <b>{get_revive_scrolls(user)}</b>"]
     if has_star_pass(user):
-        until = datetime.utcfromtimestamp(float(user["star_pass_until"]) + 3 * 3600).strftime("%d.%m")
+        until = datetime.fromtimestamp(float(user["star_pass_until"]) + 3 * 3600, timezone.utc).replace(tzinfo=None).strftime("%d.%m")
         status.append(f"{PE_PASS} Пропуск до <b>{until}</b>")
     if get_bp_state(user).get("premium"):
         status.append(f"{PE_BP} Премиум сезона")
@@ -23329,24 +24813,31 @@ async def show_star_shop(user_id: int, answer_func):
             elif p["give"].get("boss_res"):
                 info = BOSS_RESOURCE_DEFS.get(get_star_boss_res_id(user) or "", {})
                 extra = f" · {info.get('emoji', '')} {html.escape(str(info.get('name', '')))}"
-            lines.append(f"{PE_STAR} <b>{p['title']}</b> — <b>{p['stars']}</b> ⭐{extra}")
+            lines.append(f"{PE_STAR} <b>{p['title']}</b> — <b>{p['stars']}</b> {PE_STAR}{extra}")
             btns.append(InlineKeyboardButton(text=f"{STAR_SHOP_SHORT.get(pid, p['title'])} · {p['stars']}⭐",
                                              callback_data=f"star_buy|{pid}", icon_custom_emoji_id="6269538837723090339"))
         if lines:
-            blocks.append(f"{icon} <b>{title}</b>\n<blockquote>" + "\n".join(lines) + "</blockquote>")
+            blocks.append(render_screen("лавка раздел", {"иконка": icon, "название": title, "товары": "\n".join(lines)}))
             rows += [btns[i:i + 2] for i in range(0, len(btns), 2)]
-    blocks.append(f'<tg-emoji emoji-id="5217822164362739968">👑</tg-emoji> <b>Косметика</b>\n'
-                  f"<blockquote>{PE_STAR} Плашки профиля — <b>{COSMETIC_BANNER_PRICE}</b> ⭐ за каждую</blockquote>")
+    blocks.append(render_screen("лавка раздел", {"иконка": '<tg-emoji emoji-id="5217822164362739968">👑</tg-emoji>',
+                                                 "название": "Косметика",
+                                                 "товары": f"{PE_STAR} Плашки профиля — <b>{COSMETIC_BANNER_PRICE}</b> ⭐ за каждую"}))
     rows.append([InlineKeyboardButton(text="Плашки профиля", callback_data="banners", icon_custom_emoji_id="5217822164362739968"),
                  InlineKeyboardButton(text="Описание товаров", callback_data="star_info", icon_custom_emoji_id="5197269100878907942")])
     rows.append([InlineKeyboardButton(text="Условия и поддержка", callback_data="star_terms", icon_custom_emoji_id="5197269100878907942")])
-    text = (
-        f"{PE_STAR} <b>Звёздная лавка</b>\n"
-        f"<i>Оплата звёздами Telegram прямо в чате · покупки поддерживают бота</i>\n\n"
-        f"<blockquote>" + " · ".join(status) + "</blockquote>\n\n"
-        + "\n\n".join(blocks)
-    )
+    text = render_screen("лавка", {"статус": " · ".join(status), "разделы": "\n\n".join(blocks)})
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("лавка", "Звёздная лавка (донат)", (
+    f"{PE_STAR} <b>Звёздная лавка</b>\n"
+    "<i>Оплата звёздами Telegram прямо в чате · покупки поддерживают бота</i>\n\n"
+    "<blockquote>{статус}</blockquote>\n\n"
+    "{разделы}"
+), {"статус": "свитки, пропуск, премиум сезона", "разделы": "разделы товаров (шаблон «лавка раздел»)"})
+register_screen("лавка раздел", "Звёздная лавка — раздел товаров",
+                "{иконка} <b>{название}</b>\n<blockquote>{товары}</blockquote>",
+                {"иконка": "эмодзи раздела", "название": "название раздела", "товары": "товары с ценами"})
 
 
 @dp.callback_query(F.data == "star_info")
@@ -23548,7 +25039,7 @@ async def text_admin_star_pass(message: Message):
             return
         start = max(time.time(), float(user.get("star_pass_until", 0) or 0))
         user["star_pass_until"] = start + days * 86400
-        until = datetime.utcfromtimestamp(user["star_pass_until"] + 3 * 3600).strftime("%d.%m.%Y")
+        until = datetime.fromtimestamp(user["star_pass_until"] + 3 * 3600, timezone.utc).replace(tzinfo=None).strftime("%d.%m.%Y")
         await save_runtime_state(target_id, user)
         await write_activity_log(f"ADMIN {_log_user_name(message.from_user.id)} | выдал пропуск {days} дн. {_log_user_name(target_id, user)} (до {until})")
         await reply_to_user(message, f"{PE_OK} <b>{name}</b>: пропуск на <b>{days}</b> дн. {PE_PASS} Активен до <b>{until}</b>.")
@@ -23732,9 +25223,9 @@ ARMOR_SET_INFO = {
     "legendary": {"name": "Божественный сет",     "mult": 1.8},
     "mythic":    {"name": "Сет апокалипсиса",     "mult": 2.0},
     "nightmare": {"name": "Сет кошмаров",         "mult": 2.2},
-    "ancient":   {"name": "Сет праотцов",         "mult": 2.8},
-    "divine":    {"name": "Сет серафима",         "mult": 3.4},
-    "primordial": {"name": "Сет Генезиса",        "mult": 4.2},
+    "ancient":   {"name": "Сет праотцов",         "mult": 3.2},
+    "divine":    {"name": "Сет серафима",         "mult": 4.0},
+    "primordial": {"name": "Сет Генезиса",        "mult": 5.0},
 }
 # частей → (HP %, урон %) при множителе редкости 1.0
 ARMOR_SET_TIERS = [(6, 7.0, 7.0), (4, 4.0, 3.0), (2, 2.0, 0.0)]
@@ -24089,18 +25580,14 @@ async def show_tower(user_id: int, answer_func, result: str = ""):
     coins, xp = tower_floor_reward(user, floor)
     lives = tower_lives_left(t)
     w_coins, w_scrolls = tower_week_reward(max(1, int(t["best_week"])))
-    text = (
-        f"{PE_TOWER} <b>Подземелье · этаж {floor}</b>\n\n" + week_text +
-        (f"<blockquote>{result}</blockquote>\n\n" if result else "") +
-        f"<blockquote>{enemy['emoji']} <b>{html.escape(enemy['name'])}</b>\n"
-        f"{HP_EMOJI} HP: <b>{format_num(enemy['hp'])}</b> · удар {format_num(enemy['dmg'][0])}–{format_num(enemy['dmg'][1])}\n"
-        f'<tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji> За этаж: <b>{format_num(coins)}</b> монет · <b>{format_num(xp)}</b> опыта</blockquote>\n\n'
-        f'<blockquote><tg-emoji emoji-id="5998843468716184159">❤️‍🔥</tg-emoji> Жизней сегодня: <b>{lives}/{TOWER_DAILY_LIVES}</b> (тратятся только при поражении)\n'
-        f"{PE_TROPHY} Лучший этаж недели: <b>{t['best_week']}</b> · рекорд: <b>{t['best_all']}</b>\n"
-        f'<tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji> Награда недели сейчас: <b>{format_num(w_coins if t["best_week"] else 0)}</b> монет'
-        + (f" и {w_scrolls} {ru_plural(w_scrolls, 'свиток', 'свитка', 'свитков')}" if t["best_week"] and w_scrolls else "") +
-        f"\n{PE_HOURGLASS} <i>Сброс и награда — в понедельник 00:00 МСК.</i></blockquote>"
-    )
+    text = render_screen("подземелье", {
+        "этаж": floor, "неделя итог": week_text, "результат": f"<blockquote>{result}</blockquote>\n\n" if result else "",
+        "враг эмодзи": enemy['emoji'], "враг": html.escape(enemy['name']), "hp": format_num(enemy['hp']),
+        "удар": f"{format_num(enemy['dmg'][0])}–{format_num(enemy['dmg'][1])}", "монеты": format_num(coins),
+        "опыт": format_num(xp), "жизни": lives, "жизней": TOWER_DAILY_LIVES, "лучший": t['best_week'],
+        "рекорд": t['best_all'], "награда недели": format_num(w_coins if t["best_week"] else 0),
+        "свитки": (f" и {w_scrolls} {ru_plural(w_scrolls, 'свиток', 'свитка', 'свитков')}" if t["best_week"] and w_scrolls else ""),
+    })
     rows = []
     if lives > 0:
         rows.append([InlineKeyboardButton(text=f"Штурмовать этаж {floor}", callback_data="tower|one", icon_custom_emoji_id="5382325570782641346")])
@@ -24109,6 +25596,22 @@ async def show_tower(user_id: int, answer_func, result: str = ""):
         rows.append([InlineKeyboardButton(text="Жизни кончились — завтра снова", callback_data="noop", icon_custom_emoji_id="5352669272575321097")])
     rows.append([InlineKeyboardButton(text="Топ башни", callback_data="top|tower|all", icon_custom_emoji_id="5947236241199074198")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("подземелье", "Подземелье (башня)", (
+    f"{PE_TOWER} <b>Подземелье · этаж {{этаж}}</b>\n\n"
+    "{неделя итог}{результат}"
+    "<blockquote>{враг эмодзи} <b>{враг}</b>\n"
+    f"{HP_EMOJI} HP: <b>{{hp}}</b> · удар {{удар}}\n"
+    '<tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji> За этаж: <b>{монеты}</b> монет · <b>{опыт}</b> опыта</blockquote>\n\n'
+    '<blockquote><tg-emoji emoji-id="5998843468716184159">❤️‍🔥</tg-emoji> Жизней сегодня: <b>{жизни}/{жизней}</b> (тратятся только при поражении)\n'
+    f"{PE_TROPHY} Лучший этаж недели: <b>{{лучший}}</b> · рекорд: <b>{{рекорд}}</b>\n"
+    '<tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji> Награда недели сейчас: <b>{награда недели}</b> монет{свитки}'
+    f"\n{PE_HOURGLASS} <i>Сброс и награда — в понедельник 00:00 МСК.</i></blockquote>"
+), {"этаж": "текущий этаж", "неделя итог": "сообщение о недельной награде (когда выдана)", "результат": "итог боя",
+    "враг эмодзи": "эмодзи врага", "враг": "имя врага", "hp": "HP врага", "удар": "урон врага",
+    "монеты": "монеты за этаж", "опыт": "опыт за этаж", "жизни": "осталось жизней", "жизней": "жизней в день",
+    "лучший": "лучший этаж недели", "рекорд": "рекорд", "награда недели": "монеты недели", "свитки": "свитки недели (если есть)"})
 
 
 _tower_locks: Dict[int, asyncio.Lock] = {}
@@ -24264,7 +25767,7 @@ def world_boss_active() -> bool:
 
 def _next_world_boss_spawn(after: float) -> float:
     """Ближайшее 19:00 МСК после указанного момента."""
-    msk = datetime.utcfromtimestamp(after) + timedelta(hours=3)
+    msk = datetime.fromtimestamp(after, timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
     target = msk.replace(hour=WORLD_BOSS_SPAWN_HOUR_MSK, minute=0, second=0, microsecond=0)
     if target <= msk:
         target += timedelta(days=1)
@@ -24397,7 +25900,7 @@ WEEKDAYS_RU_NOM = ["понедельник", "вторник", "среда", "ч
 
 def format_msk_weekday_date(ts: float) -> str:
     """«в среду, 08.10», «сегодня (среда, 08.10)» или «завтра (…)» — по московскому времени."""
-    target = (datetime.utcfromtimestamp(ts) + timedelta(hours=3)).date()
+    target = (datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).date()
     today = get_msk_now().date()
     date_s = target.strftime("%d.%m")
     if target == today:
@@ -24496,7 +25999,7 @@ async def world_boss_hit(uid: int) -> tuple:
                     log = f"{DAMAGE_EMOJI} <b>Твой удар: промах</b>"
                 else:
                     log = f"{DAMAGE_EMOJI} <b>Твой урон: −{format_num(damage)}</b>" + (f" | Крит{CRIT_EMOJI}" if crit else "")
-                    heal = calc_vampirism_heal(ctx, damage, p["max_hp"])
+                    heal = calc_vampirism_heal(ctx, damage, p["max_hp"], SHARED_BOSS_VAMP_CAP_MULT)
                     if heal > 0 and p["hp"] < p["max_hp"]:
                         old_hp = p["hp"]
                         p["hp"] = min(p["max_hp"], p["hp"] + heal)
@@ -24575,6 +26078,792 @@ async def text_admin_world_boss_spawn(message: Message):
             return
         await spawn_world_boss()
     await reply_to_user(message, f"{PE_OK} {WORLD_BOSS_NAME} призван. HP: <b>{format_num(_world_boss['max_hp'])}</b>.")
+
+
+# ============================================================
+# === Кратос: ежедневный общий босс ===
+# Появляется каждый день в KRATOS_SPAWN_HOUR_MSK, живёт KRATOS_LIFETIME_HOURS. Бьют все игроки сразу.
+# Награда — только «Трофеи Кратоса» (по доле урона, топ-3 и добивание — больше). Монет не даёт.
+# Трофеи меняются в «Кузнице Кратоса» на ценное.  Команды: «кратос», «кратос магазин»; админ: «кратос спавн».
+# ============================================================
+KRATOS_NAME = "Кратос"
+KRATOS_EMOJI_ID = "5812255572388482653"   # премиум-эмодзи Кратоса
+KRATOS_EMOJI_PLAIN = "🎲"
+KRATOS_SPAWN_HOUR_MSK = 14
+KRATOS_LIFETIME_HOURS = 8
+KRATOS_HITS_PER_PLAYER = 4000          # ≈ 4000 ударов каждого активного игрока (у мирового босса 600)
+KRATOS_MIN_HP = 100_000_000
+KRATOS_MIN_LEVEL = 10
+KRATOS_TIER = 3                      # бьёт сильнее мирового босса
+KRATOS_ESCAPE_MULT = 0.3
+KRATOS_DMG_MULT = 0.6                # удары Кратоса: 60% от формулы Лутиафана (≈2–3% HP, спецудар ≈5–6%)
+KRATOS_VAMP_CAP_MULT = 1.0           # вампиризм против Кратоса — обычный, без усиления
+KRATOS_TROPHY = "kratos_trophy"
+NOTIFY_KRATOS = "kratos"
+BOSS_RESOURCE_DEFS[KRATOS_TROPHY] = {
+    "id": KRATOS_TROPHY, "name": "Трофей Кратоса",
+    "emoji": '<tg-emoji emoji-id="5226431245918942763">🏆</tg-emoji>', "kind": "trophy",
+}
+_kratos: Dict[str, Any] = {}
+_kratos_lock = asyncio.Lock()
+_kratos_last_save = 0.0
+
+
+def kratos_emoji() -> str:
+    return (f'<tg-emoji emoji-id="{KRATOS_EMOJI_ID}">{KRATOS_EMOJI_PLAIN}</tg-emoji>' if KRATOS_EMOJI_ID
+            else KRATOS_EMOJI_PLAIN)
+
+
+def kratos_icon() -> str:
+    return KRATOS_EMOJI_ID or "5373173798633752502"
+
+
+async def _load_kratos():
+    global _kratos
+    try:
+        data = await load_kv("kratos")
+        _kratos = data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[kratos] load: {e}")
+        _kratos = {}
+
+
+async def _save_kratos_db():
+    try:
+        await save_kv("kratos", json.loads(json.dumps(_kratos, default=str)))
+    except Exception as e:
+        print(f"[kratos] save: {e}")
+
+
+def _save_kratos(force: bool = False):
+    global _kratos_last_save
+    if not force and time.time() - _kratos_last_save < 3:
+        return
+    _kratos_last_save = time.time()
+    try:
+        asyncio.get_running_loop().create_task(_save_kratos_db())
+    except RuntimeError:
+        pass
+
+
+def kratos_active() -> bool:
+    b = _kratos
+    return bool(b) and not b.get("defeated") and not b.get("escaped") and time.time() < float(b.get("ends_at", 0))
+
+
+def _next_kratos_spawn(after: float) -> float:
+    msk = datetime.fromtimestamp(after, timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
+    target = msk.replace(hour=KRATOS_SPAWN_HOUR_MSK, minute=0, second=0, microsecond=0)
+    if target <= msk:
+        target += timedelta(days=1)
+    return (target - timedelta(hours=3) - datetime(1970, 1, 1)).total_seconds()
+
+
+def compute_kratos_hp() -> int:
+    now, total = time.time(), 0.0
+    for u in db.data.values():
+        if not isinstance(u, dict) or int(u.get("level", 1) or 1) < KRATOS_MIN_LEVEL:
+            continue
+        if now - float(u.get("last_seen_at", 0) or 0) > 3 * 86400:
+            continue
+        total += estimate_clan_boss_member_damage(u) * KRATOS_HITS_PER_PLAYER
+    return max(KRATOS_MIN_HP, int(total))
+
+
+async def spawn_kratos() -> None:
+    global _kratos
+    hp = compute_kratos_hp()
+    now = time.time()
+    number = int(_kratos.get("number", 0) or 0) + 1
+    _kratos = {
+        "number": number, "name": KRATOS_NAME, "hp": hp, "max_hp": hp, "tier": KRATOS_TIER,
+        "spawned_at": now, "ends_at": now + KRATOS_LIFETIME_HOURS * 3600,
+        "next_spawn_at": _next_kratos_spawn(now + 3600),
+        "players": {}, "recent": [], "defeated": False, "escaped": False, "rewarded": False,
+    }
+    _save_kratos(force=True)
+    await write_activity_log(f"KRATOS | появился #{number}, HP {hp}")
+    text = (
+        f"<blockquote>{kratos_emoji()} <b>{KRATOS_NAME}</b> сошёл на землю{PE_ALARM}</blockquote>\n\n"
+        f"<blockquote>Бог войны вызывает всех. HP: <b>{format_num(hp)}</b>\n"
+        f"{PE_HOURGLASS} Уйдёт через <b>{KRATOS_LIFETIME_HOURS} ч</b>.\n"
+        f"{BOSS_RESOURCE_DEFS[KRATOS_TROPHY]['emoji']} Награда — <b>Трофеи Кратоса</b> по доле урона.</blockquote>"
+    )
+    kb = nav_kb(("К Кратосу", "kr|ref", kratos_icon()))
+    for uid_str, u in list(db.data.items()):
+        if isinstance(u, dict) and int(u.get("level", 1) or 1) >= KRATOS_MIN_LEVEL \
+                and now - float(u.get("last_seen_at", 0) or 0) < 3 * 86400 and notify_enabled(u, NOTIFY_KRATOS):
+            await send_user_notification(int(uid_str), text, reply_markup=kb)
+
+
+def kratos_trophies_for(place: int, dmg: int, total: int, n: int, killer: bool, escaped: bool) -> int:
+    share = dmg / max(1, total) * n            # 1.0 — средний вклад
+    base = 2 + 6 * min(2.0, share)             # 2…14
+    base += {1: 6, 2: 4, 3: 2}.get(place, 0) + (2 if killer else 0)
+    if escaped:
+        base *= KRATOS_ESCAPE_MULT
+    return max(1, int(round(base)))
+
+
+async def finish_kratos(escaped: bool, killer_id: Optional[int] = None) -> None:
+    b = _kratos
+    if b.get("rewarded"):
+        return
+    b.update({"rewarded": True, "defeated": not escaped, "escaped": escaped})
+    if killer_id:
+        b["killer"] = killer_id
+    ranking = get_clan_boss_damage_ranking(b)
+    total = max(1, sum(r[0] for r in ranking))
+    n = max(1, len(ranking))
+    _save_kratos(force=True)
+    t_emoji = BOSS_RESOURCE_DEFS[KRATOS_TROPHY]["emoji"]
+    for place, (dmg, uid_str, p) in enumerate(ranking, start=1):
+        user = db.data.get(uid_str)
+        if not isinstance(user, dict):
+            continue
+        is_killer = bool(killer_id) and str(killer_id) == uid_str
+        got = kratos_trophies_for(place, dmg, total, n, is_killer, escaped)
+        add_boss_resource(user, KRATOS_TROPHY, got)
+        user["kratos_kills"] = int(user.get("kratos_kills", 0) or 0) + (0 if escaped else 1)
+        await db.save_user(int(uid_str), user)
+        head = (f"{kratos_emoji()} <b>{KRATOS_NAME}</b> ушёл, но запомнил вас" if escaped
+                else f"{PE_TROPHY} <b>{KRATOS_NAME}</b> повержен{PE_ALARM}")
+        await send_user_notification(
+            int(uid_str),
+            f"<blockquote>{head}</blockquote>\n\n"
+            f"<blockquote>Твоё место: <b>{place}</b> из {n} · урон <b>{format_num(dmg)}</b> ({100 * dmg / total:.1f}%)\n"
+            f"{t_emoji} Трофеи Кратоса: <b>+{got}</b>" + (" (добивание +2)" if is_killer else "")
+            + f"\nВсего трофеев: <b>{int((user.get('boss_loot') or {}).get(KRATOS_TROPHY, 0))}</b></blockquote>",
+            reply_markup=nav_kb(("Кузница Кратоса", "kr|shop", "5213214428958306222")),
+        )
+    await write_activity_log(f"KRATOS | #{b.get('number')} {'ушёл' if escaped else 'повержен'}, участников {len(ranking)}")
+
+
+async def kratos_loop():
+    await _load_kratos()
+    while True:
+        try:
+            await db.load()
+            b, now = _kratos, time.time()
+            if b and not b.get("rewarded") and now >= float(b.get("ends_at", 0) or 0) and b.get("spawned_at"):
+                async with _kratos_lock:
+                    await finish_kratos(escaped=True)
+            next_at = float(b.get("next_spawn_at", 0) or 0) if b else 0
+            if not next_at:
+                _kratos["next_spawn_at"] = _next_kratos_spawn(now)
+                _save_kratos(force=True)
+            elif not kratos_active() and now >= next_at:
+                async with _kratos_lock:
+                    await spawn_kratos()
+        except Exception as e:
+            print(f"[kratos_loop] {e}")
+        await asyncio.sleep(30)
+
+
+def get_kratos_text(user_id: int, log: str = "") -> str:
+    b = _kratos
+    user = db.data.get(str(user_id)) or {}
+    trophies = int((user.get("boss_loot") or {}).get(KRATOS_TROPHY, 0) or 0)
+    t_emoji = BOSS_RESOURCE_DEFS[KRATOS_TROPHY]["emoji"]
+    head = f"{kratos_emoji()} <b>К Р А Т О С</b> {kratos_emoji()}\n<i>Бог войны спускается каждый день — один на всех.</i>\n\n"
+    if not kratos_active():
+        nxt = float(b.get("next_spawn_at") or 0) or _next_kratos_spawn(time.time())
+        last = ""
+        if b.get("defeated"):
+            last = f"\n{PE_TROPHY} Прошлый: повержен{(' — добил ' + clan_user_name_html(b.get('killer'))) if b.get('killer') else ''}."
+        elif b.get("escaped"):
+            last = f"\n{PE_DODGE} Прошлый: ушёл непобеждённым."
+        return (
+            head
+            + f"<blockquote>{PE_SKULL} Сейчас Кратоса нет.{last}\n"
+            f"{PE_HOURGLASS} Появится через <b>{format_clan_boss_time(max(0, int(nxt - time.time())))}</b>\n"
+            f"{PE_CALENDAR} <b>{format_msk_weekday_date(nxt)}</b> в {KRATOS_SPAWN_HOUR_MSK}:00 МСК</blockquote>\n\n"
+            f"<blockquote>{t_emoji} Твои трофеи: <b>{trophies}</b> — трать в «Кузнице Кратоса».</blockquote>"
+        )
+    hp, max_hp = max(0, int(b["hp"])), max(1, int(b["max_hp"]))
+    ranking = get_clan_boss_damage_ranking(b)
+    total = max(1, sum(r[0] for r in ranking))
+    me = (b.get("players") or {}).get(str(user_id))
+    my_line = ""
+    if me:
+        place = next((i for i, r in enumerate(ranking, 1) if r[1] == str(user_id)), None)
+        my_line = (f"\n{DAMAGE_EMOJI} Твой урон: <b>{format_num(int(me.get('damage', 0)))}</b> ({100 * int(me.get('damage', 0)) / total:.1f}%)"
+                   + (f" · место {place}" if place else "")
+                   + f"\n{HP_EMOJI} Твоё HP: <b>{format_num(max(0, int(me.get('hp', 0))))}</b> / {format_num(int(me.get('max_hp', 1)))}")
+        vamp = get_vampirism_percent(user) if isinstance(user, dict) and user else 0
+        if vamp > 0:
+            cap_hp = math.floor(int(me.get("max_hp", 1)) * get_vampirism_heal_cap_percent(user) * SHARED_BOSS_VAMP_CAP_MULT / 100)
+            my_line += (f"\n{VAMPIRISM_EMOJI} Вампиризм: <b>{vamp:.1f}%</b> · до <b>{format_num(cap_hp)}</b> HP за удар"
+                        + (f" · вылечено всего <b>{format_num(int(me.get('heal_total', 0)))}</b>" if me.get("heal_total") else ""))
+        else:
+            my_line += f"\n{VAMPIRISM_EMOJI} Вампиризма нет — его дают навыки, путь ближнего боя и питомцы"
+        if me.get("sk_buff"):
+            my_line += f"\n{PE_BLOOD} Усиление: <b>+{me['sk_buff'][0]}%</b> урона · ещё {me['sk_buff'][1]} уд."
+        if me.get("sk_def"):
+            my_line += f"\n{PE_SET} Щит: <b>−{me['sk_def'][0]}%</b> урона Кратоса · ещё {me['sk_def'][1]} уд."
+    top = "\n".join(f"{TOP_PLACE_EMOJIS.get(i, str(i) + '.')} {clan_user_name_html(r[1])} — {format_num(r[0])}"
+                    for i, r in enumerate(ranking[:3], start=1)) or "Пока никто не осмелился."
+    skills = kratos_user_skills(user) if isinstance(user, dict) and user else []
+    cds = (me or {}).get("sk_cd") or {}
+    skills_block = ""
+    if skills:
+        icon = {"dmg": CRIT_EMOJI, "buff": PE_BLOOD, "def": PE_SET}
+        skills_block = (f"{PE_SPARK} <b>Твои навыки</b>\n<blockquote expandable>" + "\n".join(
+            f"{icon[KRATOS_SKILLS[sk][0]]} <b>{PATH_SKILL_INFO[sk]['name']}</b> — {kratos_skill_desc(sk)}"
+            + (f" · {PE_HOURGLASS} {cds[sk]} уд." if int(cds.get(sk, 0) or 0) > 0 else f" · {PE_OK}")
+            for sk in skills) + "</blockquote>\n\n")
+    left = max(0, int(float(b["ends_at"]) - time.time()))
+    return (
+        head
+        + f"<blockquote>{HP_EMOJI} {health_bar(hp, max_hp)} <b>{100 * hp / max_hp:.1f}%</b>\n"
+        f"<b>{format_num(hp)}</b> / {format_num(max_hp)} HP\n"
+        f"{PE_HOURGLASS} Уйдёт через <b>{format_clan_boss_time(left)}</b> · {PE_MEMBERS} участников: <b>{len(ranking)}</b>{my_line}</blockquote>\n\n"
+        + (f"<blockquote>{log}</blockquote>\n\n" if log else "")
+        + skills_block
+        + f"{PE_TROPHY} <b>Топ урона</b>\n<blockquote>{top}</blockquote>\n\n"
+        f"<blockquote>{t_emoji} Твои трофеи: <b>{trophies}</b> · награда по доле урона, топ-3 и добивание — больше</blockquote>"
+    )
+
+
+def kratos_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    rows = []
+    if kratos_active():
+        rows.append([InlineKeyboardButton(text="Атаковать", callback_data="kr|atk", icon_custom_emoji_id=kratos_icon())])
+        user = db.data.get(str(user_id)) if user_id else None
+        if isinstance(user, dict):
+            p = (_kratos.get("players") or {}).get(str(user_id)) or {}
+            cds = p.get("sk_cd") or {}
+            row = []
+            for sk in kratos_user_skills(user):
+                cd = int(cds.get(sk, 0) or 0)
+                name = PATH_SKILL_INFO[sk]["name"]
+                row.append(InlineKeyboardButton(
+                    text=f"{name} · {cd}" if cd else name, callback_data=f"kr|sk|{sk}",
+                    icon_custom_emoji_id="5287473790735890430" if cd else KRATOS_SKILL_ICONS[KRATOS_SKILLS[sk][0]]))
+                if len(row) == 2:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+        rows.append([InlineKeyboardButton(text="Рейтинг", callback_data="kr|top", icon_custom_emoji_id="5947236241199074198"),
+                     InlineKeyboardButton(text="Обновить", callback_data="kr|ref", icon_custom_emoji_id="5346321684574003384")])
+        rows.append([InlineKeyboardButton(text="Автоатака", callback_data="aatk|menu", icon_custom_emoji_id="5346321684574003384")])
+    else:
+        rows.append([InlineKeyboardButton(text="Обновить", callback_data="kr|ref", icon_custom_emoji_id="5346321684574003384")])
+    rows.append([InlineKeyboardButton(text="Кузница Кратоса", callback_data="kr|shop", icon_custom_emoji_id="5213214428958306222")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# Одиночные навыки пути против Кратоса (массовые — Джаггернаут, Град стрел, Сплэш — тут не нужны).
+# Откат считается в ударах по Кратосу (как ходы в рейде).
+KRATOS_SKILLS = {
+    # урон: множитель удара
+    "great_power":  ("dmg", 5.0),  "pierce_shot": ("dmg", 2.8), "nova": ("dmg", 3.0),
+    "sniper_shot":  ("dmg", 2.0),  "blast_wave":  ("dmg", 2.0), "multi_shot": ("dmg", 2.25),
+    "rune_barrage": ("dmg", 2.0),
+    # усиление: +% урона на N ударов
+    "war_cry":   ("buff", 30, 3), "blood_rage": ("buff", 40, 3), "berserk": ("buff", 60, 2),
+    "aim":       ("buff", 25, 2), "eagle_eye":  ("buff", 20, 4),
+    # защита: −% урона Кратоса на N ударов
+    "fortify":   ("def", 35, 3), "magic_shield": ("def", 50, 2), "arcane_shield": ("def", 40, 2),
+}
+KRATOS_SKILL_ICONS = {"dmg": "5368451104134685900", "buff": "5332336747072208845", "def": "5287786962571241490"}
+
+
+def kratos_skill_desc(sk: str) -> str:
+    kind, *vals = KRATOS_SKILLS[sk]
+    if kind == "dmg":
+        return f"удар ×{vals[0]:g}"
+    if kind == "buff":
+        return f"+{vals[0]}% урона на {vals[1]} уд."
+    return f"−{vals[0]}% урона Кратоса на {vals[1]} уд."
+
+
+def kratos_user_skills(user: dict) -> List[str]:
+    if path_weapon_mismatch(user):
+        return []
+    return [sk for sk in get_unlocked_path_skills(user) if sk in KRATOS_SKILLS]
+
+
+async def kratos_hit(uid: int, skill: Optional[str] = None) -> tuple:
+    user = await db.get_user(uid)
+    if not user:
+        return None, True, ""
+    if int(user.get("level", 1) or 1) < KRATOS_MIN_LEVEL:
+        return f"Кратос доступен с {KRATOS_MIN_LEVEL} уровня.", False, ""
+    alert, silent, log = None, False, ""
+    async with _kratos_lock:
+        if not kratos_active():
+            alert = "Сейчас Кратоса нет."
+        else:
+            b, now = _kratos, time.time()
+            p = get_clan_boss_player(b, uid, user)
+            if p.get("hp", 0) <= 0:
+                alert = f"💀 Ты в нокауте. Восстановление: {format_clan_boss_time(float(p.get('ko_until', 0)) - now)}"
+            elif now - float(p.get("last_hit", 0)) < CLAN_BOSS_HIT_COOLDOWN:
+                silent = True
+            else:
+                cds = p.setdefault("sk_cd", {})
+                if skill:
+                    if skill not in kratos_user_skills(user):
+                        return "Этот навык тебе недоступен (нужен свой путь и оружие пути).", False, ""
+                    if int(cds.get(skill, 0) or 0) > 0:
+                        return f"{PATH_SKILL_INFO[skill]['name']}: откат ещё {cds[skill]} уд.", False, ""
+                    kind_, cost_ = get_skill_resource_cost(user, skill)
+                    if kind_ == "hp_percent" and cost_ > 0:
+                        hp_cost = max(1, math.ceil(int(p["hp"]) * cost_ / 100))
+                        if int(p["hp"]) - hp_cost <= 0:
+                            return "Слишком мало HP для этого навыка.", False, ""
+                        p["hp"] = int(p["hp"]) - hp_cost
+                p["last_hit"] = now
+                for k in list(cds):
+                    cds[k] = max(0, int(cds[k]) - 1)
+                skill_note = ""
+                if skill:
+                    cds[skill] = int(PATH_SKILL_INFO[skill].get("cooldown", 0) or 0)
+                    kind_, *vals = KRATOS_SKILLS[skill]
+                    skill_note = f"{PE_SPARK} <b>{PATH_SKILL_INFO[skill]['name']}</b>"
+                    if kind_ == "buff":
+                        p["sk_buff"] = [int(vals[0]), int(vals[1])]
+                        skill_note += f" — +{vals[0]}% урона на {vals[1]} уд."
+                    elif kind_ == "def":
+                        p["sk_def"] = [int(vals[0]), int(vals[1])]
+                        skill_note += f" — щит −{vals[0]}% на {vals[1]} уд."
+                ctx = dict(user)
+                ctx["battle_effects"] = {}
+                damage, _ = get_equipped_attack(ctx)
+                if skill and KRATOS_SKILLS[skill][0] == "dmg":
+                    damage = math.ceil(damage * KRATOS_SKILLS[skill][1])
+                    skill_note += f" — удар ×{KRATOS_SKILLS[skill][1]:g}"
+                buff = p.get("sk_buff")
+                if buff and int(buff[1]) > 0:
+                    damage = math.ceil(damage * (1 + int(buff[0]) / 100))
+                    buff[1] = int(buff[1]) - 1
+                    if buff[1] <= 0:
+                        p.pop("sk_buff", None)
+                damage, notes = roll_player_attack_effects(ctx, damage)
+                damage = max(0, min(int(damage), int(b["hp"])))
+                missed, crit = "промах" in notes, "крит" in notes
+                b["hp"] = int(b["hp"]) - damage
+                p["hits"] = int(p.get("hits", 0)) + 1
+                p["damage"] = int(p.get("damage", 0)) + damage
+                user["total_damage"] = int(user.get("total_damage", 0)) + damage
+                if missed:
+                    log = f"{DAMAGE_EMOJI} <b>Твой удар: промах</b>"
+                else:
+                    log = f"{DAMAGE_EMOJI} <b>Твой урон: −{format_num(damage)}</b>" + (f" | Крит{CRIT_EMOJI}" if crit else "")
+                if skill_note:
+                    log = skill_note + "\n" + log
+                # Вампиризм — на каждом попавшем ударе (раньше срабатывал только с навыком).
+                p["last_heal"] = 0
+                if not missed and damage > 0:
+                    heal = calc_vampirism_heal(ctx, damage, p["max_hp"], KRATOS_VAMP_CAP_MULT)
+                    if heal > 0 and p["hp"] < p["max_hp"]:
+                        old_hp = p["hp"]
+                        p["hp"] = min(p["max_hp"], p["hp"] + heal)
+                        log += f"\n{VAMPIRISM_EMOJI} <b>Вампиризм: +{format_num(p['hp'] - old_hp)} HP</b>"
+                        p["last_heal"] = int(p["hp"] - old_hp)
+                        p["heal_total"] = int(p.get("heal_total", 0)) + int(p["hp"] - old_hp)
+                if b["hp"] <= 0:
+                    b["hp"] = 0
+                    log += f"\n\n{PE_TROPHY} <b>Ты сразил бога войны!</b>"
+                    await finish_kratos(escaped=False, killer_id=uid)
+                else:
+                    b["tier"] = KRATOS_TIER
+                    enemy_dmg, enemy_log = roll_clan_boss_counter(ctx, p, b, KRATOS_DMG_MULT)
+                    enemy_log = enemy_log.replace("Жадный укус", "Клинки Хаоса").replace("Удар хвостом", "Удар Левиафана")
+                    shield = p.get("sk_def")
+                    if shield and int(shield[1]) > 0 and enemy_dmg > 0:
+                        cut = math.ceil(enemy_dmg * int(shield[0]) / 100)
+                        enemy_dmg -= cut
+                        enemy_log += f"\n{PE_SET} Щит поглотил <b>{format_num(cut)}</b>"
+                        shield[1] = int(shield[1]) - 1
+                        if shield[1] <= 0:
+                            p.pop("sk_def", None)
+                    p["hp"] = int(p["hp"]) - enemy_dmg
+                    log += "\n" + enemy_log
+                    if p["hp"] <= 0:
+                        p["hp"] = 0
+                        p["ko_until"] = now + CLAN_BOSS_KO_SECONDS
+                        log += f"\n{PE_SKULL} <b>Нокаут!</b> Вернёшься через {format_clan_boss_time(CLAN_BOSS_KO_SECONDS)}."
+                    _save_kratos()
+                await _save_user_throttled(uid, user, force=bool(_kratos.get("defeated")))
+    return alert, silent, log
+
+
+# --- Кузница Кратоса: обмен трофеев ---
+KRATOS_SHOP = {
+    # id: (название, цена в трофеях, иконка)
+    "scroll":  ("Свиток воскрешения", 4, "5346321684574003384"),
+    "luck":    ("Зелье удачи", 3, "5395325195542078574"),
+    "res":     ("Ресурс сильнейшего босса", 5, "5109480514809497205"),
+    "shard4":  ("Осколок IV уровня", 6, "5794158469988753026"),
+    "fusion":  ("Гарантия скрещивания (1 раз)", 60, "6269538837723090339"),
+}
+
+
+def kratos_buy(user: dict, item_id: str) -> tuple:
+    if item_id not in KRATOS_SHOP:
+        return False, "Такого товара нет."
+    name, price, _icon = KRATOS_SHOP[item_id]
+    res = user.setdefault("boss_loot", {})
+    have = int(res.get(KRATOS_TROPHY, 0) or 0)
+    if have < price:
+        return False, f"Нужно {price} трофеев, у тебя {have}."
+    if item_id == "res" and not get_star_boss_res_id(user):
+        return False, "Пока нет доступного босса с ресурсом."
+    res[KRATOS_TROPHY] = have - price
+    if item_id == "scroll":
+        user["revive_scrolls"] = int(user.get("revive_scrolls", 0) or 0) + 1
+    elif item_id == "luck":
+        add_potion_to_user(user, "luck_potion")
+    elif item_id == "res":
+        give_star_boss_res(user, 1)
+    elif item_id == "shard4":
+        add_boss_resource(user, "engraving_shard_4", 1)
+    elif item_id == "fusion":
+        g = user.get("fusion_guarantee")
+        left = int(g.get("left", 0) or 0) if isinstance(g, dict) and g.get("left") is not None else 0
+        user["fusion_guarantee"] = {"left": left + 1, "by": "kratos", "ts": time.time()}
+    return True, f"Куплено: {name} (−{price} трофеев)"
+
+
+def get_kratos_shop_text(user: dict, note: str = "") -> str:
+    t_emoji = BOSS_RESOURCE_DEFS[KRATOS_TROPHY]["emoji"]
+    have = int((user.get("boss_loot") or {}).get(KRATOS_TROPHY, 0) or 0)
+    lines = "\n".join(f'<tg-emoji emoji-id="{icon}">▫️</tg-emoji> {html.escape(name)} — <b>{price}</b> {t_emoji}'
+                      for name, price, icon in KRATOS_SHOP.values())
+    return (
+        f"{PE_TOOL} <b>К У З Н И Ц А   К Р А Т О С А</b>\n"
+        "<i>Трофеи бога войны меняются только здесь.</i>\n\n"
+        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
+        + f"<blockquote>{t_emoji} Твои трофеи: <b>{have}</b></blockquote>\n\n"
+        f"<b>Товары</b>\n<blockquote>{lines}</blockquote>\n\n"
+        f"<i>{PE_SPARK} Трофеи дают только за бой с Кратосом — каждый день в {KRATOS_SPAWN_HOUR_MSK}:00 МСК.</i>"
+    )
+
+
+def kratos_shop_keyboard(user: dict) -> InlineKeyboardMarkup:
+    have = int((user.get("boss_loot") or {}).get(KRATOS_TROPHY, 0) or 0)
+    rows, row = [], []
+    for item_id, (name, price, icon) in KRATOS_SHOP.items():
+        short = name.split(" (")[0]
+        row.append(InlineKeyboardButton(text=f"{short} · {price}", callback_data=f"kr|buy|{item_id}",
+                                        icon_custom_emoji_id=icon if have >= price else "5296369303661067030"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="К Кратосу", callback_data="kr|ref", icon_custom_emoji_id=kratos_icon())])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+_kratos_shop_locks: Dict[int, asyncio.Lock] = {}
+
+
+@dp.callback_query(F.data.startswith("kr|"))
+async def cb_kratos(call: CallbackQuery):
+    uid = call.from_user.id
+    parts = call.data.split("|")
+    action = parts[1] if len(parts) > 1 else "ref"
+    if not await db.has_user(uid):
+        await call.answer()
+        return
+    if action in ("atk", "sk"):
+        skill = parts[2] if action == "sk" and len(parts) > 2 else None
+        alert, silent, log = await kratos_hit(uid, skill)
+        if silent:
+            await call.answer()
+            return
+        if alert:
+            await call.answer(alert, show_alert=True)
+            return
+        await call.answer()
+        await edit_for_user(call, get_kratos_text(uid, log), kratos_keyboard(uid))
+        return
+    if action == "buy" and len(parts) > 2:
+        async with _kratos_shop_locks.setdefault(uid, asyncio.Lock()):
+            user = await db.get_user(uid)
+            ok, msg = kratos_buy(user, parts[2])
+            if ok:
+                await save_runtime_state(uid, user)
+                await write_activity_log(f"KRATOS SHOP {_log_user_name(uid, user)} | {msg}")
+        if not ok:
+            await call.answer(msg, show_alert=True)
+            return
+        await call.answer("Куплено!")
+        await edit_for_user(call, get_kratos_shop_text(user, f"{PE_OK} {html.escape(msg)}"), kratos_shop_keyboard(user))
+        return
+    await call.answer()
+    if action == "shop":
+        user = await db.get_user(uid)
+        await edit_for_user(call, get_kratos_shop_text(user), kratos_shop_keyboard(user))
+        return
+    if action == "top":
+        ranking = get_clan_boss_damage_ranking(_kratos) if _kratos else []
+        total = max(1, sum(r[0] for r in ranking))
+        lines = [f"{TOP_PLACE_EMOJIS.get(i, str(i) + '.')} {clan_user_name_html(r[1])} — <b>{format_num(r[0])}</b> ({100 * r[0] / total:.1f}%)"
+                 + (" ← ты" if r[1] == str(uid) else "") for i, r in enumerate(ranking[:15], start=1)]
+        await edit_for_user(call, f"{PE_TROPHY} <b>Рейтинг урона · {KRATOS_NAME}</b>\n\n<blockquote>" + ("\n".join(lines) or "Пока пусто.") + "</blockquote>",
+                            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="К Кратосу", callback_data="kr|ref", icon_custom_emoji_id=kratos_icon())]]))
+        return
+    await edit_for_user(call, get_kratos_text(uid), kratos_keyboard(uid))
+
+
+@dp.message(lambda msg: msg.text and msg.text.strip().casefold() in ("кратос", "kratos", "кратос магазин", "кузница кратоса"))
+async def text_kratos(message: Message):
+    uid = message.from_user.id
+    if not await db.has_user(uid):
+        return
+    if "магазин" in message.text.casefold() or "кузница" in message.text.casefold():
+        user = await db.get_user(uid)
+        await reply_to_user(message, get_kratos_shop_text(user), kratos_shop_keyboard(user))
+        return
+    await reply_to_user(message, get_kratos_text(uid), kratos_keyboard(uid))
+
+
+@dp.message(lambda msg: msg.text and msg.text.casefold().strip() in ("кратос спавн", "кратос старт"))
+async def text_admin_kratos_spawn(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    async with _kratos_lock:
+        if kratos_active():
+            await reply_to_user(message, "Кратос уже на поле боя.")
+            return
+        await spawn_kratos()
+    await reply_to_user(message, f"{PE_OK} {KRATOS_NAME} призван. HP: <b>{format_num(_kratos['max_hp'])}</b>.")
+
+
+# ============================================================
+# === Перенос улучшений (у Кузнеца) ===
+# Гравировка и звёзды скрещивания переходят со старого предмета на новый того же типа
+# (оружие → оружие, броня → тот же слот) и не ниже редкостью. Что было у нового — уходит старому (обмен).
+# Дорого: монеты + осколки IV + эссенции редкости нового предмета + трофеи Кратоса.
+# ============================================================
+TRANSFER_COST_BAGS = 25            # монеты: столько «мешков» (как у перековки)
+TRANSFER_MIN_COINS = 1_000_000
+TRANSFER_SHARDS_PER_ENGRAVE = 3    # осколков IV за каждый переносимый уровень гравировки
+TRANSFER_ESSENCE_PER_STAR = 2      # эссенций редкости НОВОГО предмета за каждую переносимую звезду
+TRANSFER_KRATOS_TROPHIES = 40
+
+
+def _engrave_mult(from_level: int, to_level: int) -> float:
+    m = 1.0
+    for lvl in range(from_level + 1, to_level + 1):
+        m *= get_engraving_step_mult(lvl)
+    return m
+
+
+def _scale_item_base(item: dict, factor: float) -> None:
+    ensure_item_base_stats(item)
+    if item.get("item_type") == "armor":
+        for key in ("base_hp", "base_mana", "base_stamina"):
+            if key in item:
+                item[key] = max(1, math.ceil(int(item[key]) * factor))
+    else:
+        lo, hi = item.get("base_dmg", item.get("dmg", (1, 1)))
+        item["base_dmg"] = (max(1, math.ceil(lo * factor)), max(1, math.ceil(hi * factor)))
+
+
+def transfer_compatible(src: dict, dst: dict) -> bool:
+    if not src or not dst or str(src.get("iid")) == str(dst.get("iid")):
+        return False
+    if (src.get("item_type") == "armor") != (dst.get("item_type") == "armor"):
+        return False
+    if src.get("item_type") == "armor" and src.get("slot") != dst.get("slot"):
+        lk = lambda s: "bracers" if s in ("bracers_left", "bracers_right") else s
+        if lk(src.get("slot")) != lk(dst.get("slot")):
+            return False
+    # RARITY_ORDER идёт от высшей к низшей: меньше индекс — выше редкость
+    return RARITY_ORDER.index(dst.get("rarity")) <= RARITY_ORDER.index(src.get("rarity")) \
+        if dst.get("rarity") in RARITY_ORDER and src.get("rarity") in RARITY_ORDER else False
+
+
+def transfer_plan(user: dict, src: dict, dst: dict) -> dict:
+    se, de = int(src.get("engraving_level", 0) or 0), int(dst.get("engraving_level", 0) or 0)
+    sf, df = int(src.get("fusion_level", 0) or 0), int(dst.get("fusion_level", 0) or 0)
+    eng = max(0, se - de)
+    stars = max(0, sf - df)
+    coins = max(TRANSFER_MIN_COINS, int(round(int(get_star_coin_pack_amount(user) or 0) * TRANSFER_COST_BAGS, -3)))
+    need = {}
+    if eng:
+        need["engraving_shard_4"] = math.ceil(eng * TRANSFER_SHARDS_PER_ENGRAVE)
+    if stars:
+        need[get_essence_id_for_rarity(dst.get("rarity"))] = stars * TRANSFER_ESSENCE_PER_STAR
+    need[KRATOS_TROPHY] = TRANSFER_KRATOS_TROPHIES
+    res = user.get("boss_loot") or {}
+    missing = {rid: n - int(res.get(rid, 0) or 0) for rid, n in need.items() if int(res.get(rid, 0) or 0) < n}
+    if int(user.get("coins", 0) or 0) < coins:
+        missing["coins"] = coins - int(user.get("coins", 0) or 0)
+    return {"eng": eng, "stars": stars, "se": se, "de": de, "sf": sf, "df": df,
+            "coins": coins, "need": need, "missing": missing, "useful": bool(eng or stars)}
+
+
+def apply_transfer(user: dict, src: dict, dst: dict, plan: dict) -> None:
+    user["coins"] = int(user.get("coins", 0)) - plan["coins"]
+    res = user.setdefault("boss_loot", {})
+    for rid, n in plan["need"].items():
+        res[rid] = int(res.get(rid, 0) or 0) - n
+    if plan["eng"]:
+        f = _engrave_mult(plan["de"], plan["se"])
+        _scale_item_base(dst, f)
+        _scale_item_base(src, 1 / f)
+        dst["engraving_level"], src["engraving_level"] = plan["se"], plan["de"]
+    if plan["stars"]:
+        dst["fusion_level"], src["fusion_level"] = plan["sf"], plan["df"]
+        dst["fusion_pity"] = src["fusion_pity"] = 0
+    for it in (src, dst):
+        apply_item_fusion_stats(it)
+        if it.get("item_type") != "armor":
+            it["power"] = calculate_weapon_power(it)
+    refresh_equipped_from_inventory(user)
+
+
+TR_ENGRAVE = '<tg-emoji emoji-id="6267107250578395601">😃</tg-emoji>'
+TR_ARROW = '<tg-emoji emoji-id="5346321684574003384">🔄</tg-emoji>'
+
+
+def _transfer_item_line(item: dict) -> str:
+    return (f"{rarity_premium_emoji(item.get('rarity'))} <b>{html.escape(str(item.get('name', '?')))}</b>"
+            f" · <i>{RARITIES.get(item.get('rarity'), {}).get('name', '')}</i>\n"
+            f"      {PE_LEVELUP} {get_item_level(item)} ур. · {TR_ENGRAVE} {int(item.get('engraving_level', 0) or 0)}/{MAX_ENGRAVING_LEVEL}"
+            f" · {PE_STAR} {int(item.get('fusion_level', 0) or 0)}/{MAX_FUSION_LEVEL}")
+
+
+def _transfer_btn_text(item: dict) -> str:
+    return (f"{item.get('name', '?')} · {RARITIES.get(item.get('rarity'), {}).get('name', '')[:4]}. · "
+            f"г{int(item.get('engraving_level', 0) or 0)} ⭐{int(item.get('fusion_level', 0) or 0)}")
+
+
+async def show_transfer_sources(user_id: int, answer_func, note: str = ""):
+    user = await db.get_user(user_id)
+    items = [it for it in user.get("inventory", []) if int(it.get("engraving_level", 0) or 0) or int(it.get("fusion_level", 0) or 0)]
+    items.sort(key=lambda it: (-int(it.get("engraving_level", 0) or 0) - 10 * int(it.get("fusion_level", 0) or 0)))
+    smith = '<tg-emoji emoji-id="5080591035768242999">📱</tg-emoji>'
+    text = (
+        f"{TR_ARROW} <b>П Е Р Е Н О С   У Л У Ч Ш Е Н И Й</b> {TR_ARROW}\n"
+        "<i>Горн Терентия переплавляет силу из старой вещи в новую</i>\n\n"
+        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
+        + f"<blockquote>{smith} <b>Терентий</b>\n«Гравировку и звёзды я перекую на новую вещь — того же вида и не хуже редкостью. "
+        "Только металл такой работы стоит дорого.»</blockquote>\n\n"
+        f"{PE_SPARK} <b>Что переносится</b>\n"
+        f"<blockquote>{TR_ENGRAVE} Гравировка · {PE_STAR} Звёзды скрещивания\n"
+        "<i>Оружие → оружие, броня → тот же слот. Что было у новой вещи — достаётся старой.</i></blockquote>\n\n"
+        f"{PE_TOOL} <b>Цена</b>\n"
+        f"<blockquote>{PE_COIN} Монеты — <b>{TRANSFER_COST_BAGS}</b> мешков\n"
+        f"{BOSS_RESOURCE_DEFS['engraving_shard_4']['emoji']} Осколки IV — <b>{TRANSFER_SHARDS_PER_ENGRAVE:g}</b> за уровень гравировки\n"
+        f"{PE_STAR} Эссенции редкости новой вещи — <b>{TRANSFER_ESSENCE_PER_STAR}</b> за звезду\n"
+        f"{BOSS_RESOURCE_DEFS[KRATOS_TROPHY]['emoji']} Трофеи Кратоса — <b>{TRANSFER_KRATOS_TROPHIES}</b></blockquote>\n\n"
+        + (f"{PE_LEVELUP} <b>Шаг 1 из 3</b> — с какой вещи перенести?" if items
+           else f"<blockquote>{PE_CROSS} <i>Нет вещей с гравировкой или звёздами.</i></blockquote>")
+    )
+    rows = [[InlineKeyboardButton(text=_transfer_btn_text(it), callback_data=f"tr|src|{it['iid']}",
+                                  icon_custom_emoji_id=rarity_icon_id(it.get("rarity")))] for it in items[:15]]
+    rows.append([InlineKeyboardButton(text="К кузнецу", callback_data="shx|back", icon_custom_emoji_id="5215361191051798408")])
+    await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def show_transfer_targets(user_id: int, src_iid: str, answer_func):
+    user = await db.get_user(user_id)
+    src = get_user_item_by_iid(user, src_iid)
+    if not src:
+        await show_transfer_sources(user_id, answer_func, f"{PE_CROSS} Предмет не найден.")
+        return
+    items = [it for it in user.get("inventory", []) if transfer_compatible(src, it)]
+    items.sort(key=lambda it: (RARITY_ORDER.index(it.get("rarity")) if it.get("rarity") in RARITY_ORDER else 99, -get_item_level(it)))
+    text = (
+        f"{TR_ARROW} <b>Перенос улучшений</b>\n\n"
+        f"<b>Откуда</b>\n<blockquote>{_transfer_item_line(src)}</blockquote>\n\n"
+        + (f"{PE_LEVELUP} <b>Шаг 2 из 3</b> — на какую вещь перенести?" if items else
+           f"<blockquote>{PE_CROSS} <i>Нет подходящих вещей: нужна того же типа и не ниже редкостью.</i></blockquote>")
+    )
+    rows = [[InlineKeyboardButton(text=_transfer_btn_text(it), callback_data=f"tr|to|{src_iid}|{it['iid']}",
+                                  icon_custom_emoji_id=rarity_icon_id(it.get("rarity")))] for it in items[:15]]
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="tr|menu", icon_custom_emoji_id="5215361191051798408")])
+    await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def show_transfer_confirm(user_id: int, src_iid: str, dst_iid: str, answer_func):
+    user = await db.get_user(user_id)
+    src, dst = get_user_item_by_iid(user, src_iid), get_user_item_by_iid(user, dst_iid)
+    if not src or not dst or not transfer_compatible(src, dst):
+        await show_transfer_sources(user_id, answer_func, f"{PE_CROSS} Эти предметы не подходят для переноса.")
+        return
+    plan = transfer_plan(user, src, dst)
+    res = user.get("boss_loot") or {}
+    cost_lines = [f"{PE_COIN} Монеты: <b>{format_num(plan['coins'])}</b> (у тебя {format_num(int(user.get('coins', 0)))})"]
+    for rid, n in plan["need"].items():
+        info = BOSS_RESOURCE_DEFS.get(rid, {})
+        have = int(res.get(rid, 0) or 0)
+        cost_lines.append(f"{info.get('emoji', '▫️')} {html.escape(info.get('name', rid))}: <b>{n}</b> "
+                          f"({PE_OK if have >= n else PE_CROSS} {have})")
+    what = []
+    if plan["eng"]:
+        what.append(f"{TR_ENGRAVE} Гравировка: {plan['de']} → <b>{plan['se']}</b>  <i>(старой останется {plan['de']})</i>")
+    if plan["stars"]:
+        what.append(f"{PE_STAR} Звёзды: {plan['df']} → <b>{plan['sf']}</b>  <i>(старой останется {plan['df']})</i>")
+    ready = plan["useful"] and not plan["missing"]
+    text = (
+        f"{TR_ARROW} <b>Перенос улучшений</b>\n\n"
+        f"<b>Откуда</b>\n<blockquote>{_transfer_item_line(src)}</blockquote>\n"
+        f"<b>Куда</b>\n<blockquote>{_transfer_item_line(dst)}</blockquote>\n\n"
+        + (f"{PE_SPARK} <b>Что перейдёт</b>\n<blockquote>" + "\n".join(what) + "</blockquote>\n\n" if what else
+           f"<blockquote>{PE_CROSS} Переносить нечего — у новой вещи гравировка и звёзды не ниже.</blockquote>\n\n")
+        + f"{PE_TOOL} <b>Цена</b>\n<blockquote>" + "\n".join(cost_lines) + "</blockquote>\n\n"
+        + (f"{PE_LEVELUP} <b>Шаг 3 из 3</b> — всё готово, подтверждай." if ready else
+           (f"<i>{PE_HOURGLASS} Собери недостающее (отмечено {PE_CROSS}) и возвращайся.</i>" if plan["useful"] else ""))
+    )
+    rows = []
+    if plan["useful"] and not plan["missing"]:
+        rows.append([InlineKeyboardButton(text=f"Перенести · {format_num(plan['coins'])}", callback_data=f"tr|do|{src_iid}|{dst_iid}",
+                                          icon_custom_emoji_id="5325762861539016690")])
+    elif plan["useful"]:
+        rows.append([InlineKeyboardButton(text="Не хватает ресурсов", callback_data="noop", icon_custom_emoji_id="5296369303661067030")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=f"tr|src|{src_iid}", icon_custom_emoji_id="5215361191051798408")])
+    await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+_transfer_locks: Dict[int, asyncio.Lock] = {}
+
+
+@dp.callback_query(F.data.startswith("tr|"))
+async def cb_transfer(call: CallbackQuery):
+    uid = call.from_user.id
+    parts = call.data.split("|")
+    edit = lambda t, kb: edit_for_user(call, t, kb)
+    action = parts[1] if len(parts) > 1 else "menu"
+    if action == "src" and len(parts) > 2:
+        await call.answer()
+        await show_transfer_targets(uid, parts[2], edit)
+        return
+    if action == "to" and len(parts) > 3:
+        await call.answer()
+        await show_transfer_confirm(uid, parts[2], parts[3], edit)
+        return
+    if action == "do" and len(parts) > 3:
+        async with _transfer_locks.setdefault(uid, asyncio.Lock()):
+            user = await db.get_user(uid)
+            src, dst = get_user_item_by_iid(user, parts[2]), get_user_item_by_iid(user, parts[3])
+            if not src or not dst or not transfer_compatible(src, dst):
+                await call.answer("Предметы не подходят.", show_alert=True)
+                return
+            plan = transfer_plan(user, src, dst)
+            if not plan["useful"]:
+                await call.answer("Переносить нечего.", show_alert=True)
+                return
+            if plan["missing"]:
+                await call.answer("Не хватает ресурсов.", show_alert=True)
+                return
+            apply_transfer(user, src, dst, plan)
+            await save_runtime_state(uid, user)
+        await write_activity_log(f"TRANSFER {_log_user_name(uid, user)} | {src.get('name')} → {dst.get('name')} "
+                                 f"гравировка {plan['de']}→{plan['se']}, звёзды {plan['df']}→{plan['sf']}, −{plan['coins']}")
+        await call.answer("Улучшения перенесены!", show_alert=True)
+        await show_smith_item(uid, "engrave", parts[3], edit)
+        return
+    await call.answer()
+    await show_transfer_sources(uid, edit)
 
 
 # ============================================================
@@ -24684,6 +26973,7 @@ async def award_daily_tops(day: str) -> None:
         await write_activity_log(f"DAYTOP | {day} {cat}: награждено {len(ranking)}")
 
     for uid_str, e in per_user.items():
+      try:
         user = e["user"]
         for _ in range(e["potions"]):
             add_potion_to_user(user, "luck_potion")
@@ -24714,6 +27004,8 @@ async def award_daily_tops(day: str) -> None:
             f"<blockquote>{PE_PASS} Значок в профиле на сутки:\n<b>{get_weekly_title(user)}</b></blockquote>",
             reply_markup=nav_kb(("Топы", DAILY_TOP_CATEGORIES[first_cat]["top_cb"], "5947236241199074198")),
         )
+      except Exception as ex:
+        print(f"[award_daily_tops] {uid_str}: {ex}")
     # «Итоги дня» в канал анонсов больше не постятся — в канал идут только выпадения питомцев и экипировки
 
 
@@ -24736,8 +27028,12 @@ async def daily_rewards_loop():
             if not state.get("last_day"):
                 state["last_day"] = today  # первый запуск: начинаем с сегодняшнего дня
             elif state["last_day"] != today:
-                await award_daily_tops(state["last_day"])
+                # сначала помечаем день награждённым и сохраняем, потом раздаём:
+                # иначе ошибка посреди раздачи или перезапуск приводили к повторной выдаче каждую минуту
+                award_day = state["last_day"]
                 state["last_day"] = today
+                await save_kv("daily_rewards", state)
+                await award_daily_tops(award_day)
             await save_kv("daily_rewards", state)
             try:
                 with open(DAILY_REWARDS_FILE, "w", encoding="utf-8") as f:
@@ -24754,7 +27050,7 @@ WEEKLY_REWARDS_TEXT = (
     "<blockquote>Каждый день в 00:00 МСК награждаются <b>первые 3 места</b> в топах:\n"
     "• роллы и боссы <b>за день</b>;\n"
     "• общие: уровень, роллы и боссы за всё время, сила, престиж.</blockquote>\n\n"
-    "<blockquote>🥇 1-е место: 3 зелья удачи, 3 свитка, 1 ресурс последнего босса\n"
+    "<blockquote><tg-emoji emoji-id=\"5870508673385630878\">🥇</tg-emoji> 1-е место: 3 зелья удачи, 3 свитка, 1 ресурс последнего босса\n"
     "🥈 2-е место: 2 зелья удачи, 2 свитка\n"
     "🥉 3-е место: 1 зелье удачи, 1 свиток\n"
     "Всем трём — значок в профиле на сутки. Награды за разные топы складываются.</blockquote>\n\n"
@@ -24970,7 +27266,7 @@ def bp_claimable_levels(bp: dict) -> tuple:
 
 def bp_bar(xp_in_level: int) -> str:
     filled = max(0, min(10, round(10 * xp_in_level / BP_XP_PER_LEVEL)))
-    return "▰" * filled + "▱" * (10 - filled)
+    return pe_bar("orange", filled, 10, "▰" * filled + "▱" * (10 - filled))
 
 
 MONTHS_RU = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август",
@@ -25112,7 +27408,7 @@ async def show_bp_list(user_id: int, page: int, answer_func):
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"bp|list|{page + 1}"))
     await answer_func(
         f"{PE_BP} <b>Награды сезона «{bp_season_title(bp['season'])}»</b>\n"
-        f"<i>{PE_OK} забрано · {PE_GIFT} можно забрать · 🔒 впереди · {PE_BP} премиум</i>\n\n"
+        f"<i>{PE_OK} забрано · {PE_GIFT} можно забрать · <tg-emoji emoji-id=\"5296369303661067030\">🔒</tg-emoji> впереди · {PE_BP} премиум</i>\n\n"
         + "\n\n".join(blocks),
         InlineKeyboardMarkup(inline_keyboard=[nav, [InlineKeyboardButton(text="К пропуску", callback_data="bp|ref", icon_custom_emoji_id="5215361191051798408")]]),
     )
@@ -25376,7 +27672,7 @@ def hobby_progress_line(user: dict, kind: str) -> str:
     if lvl >= HOBBY_MAX_LEVEL:
         return f"уровень <b>{lvl}</b> — максимум!"
     xp, need = int(user.get(f"{kind}_xp", 0) or 0), hobby_xp_needed(lvl, kind)
-    return f"уровень <b>{lvl}</b> · {_progress_bar(xp, need)} {xp}/{need}"
+    return f"уровень <b>{lvl}</b> · {_progress_bar(xp, need, 8, "xp")} {xp}/{need}"
 
 
 def fishing_cooldown(user: dict) -> float:
@@ -25422,9 +27718,9 @@ FISH_RARITY_LABEL = {"crucian": "обычная", "perch": "обычная", "pi
                      "sturgeon": "эпическая", "goldfish": "легендарная", "whale": "мифическая"}
 
 
-def _progress_bar(done: float, total: float, width: int = 8) -> str:
+def _progress_bar(done: float, total: float, width: int = 8, theme: str = "green") -> str:
     filled = max(0, min(width, round(width * done / max(1e-9, total))))
-    return "▰" * filled + "▱" * (width - filled)
+    return pe_bar(theme, filled, width, "▰" * filled + "▱" * (width - filled))
 
 
 async def show_fishing(user_id: int, answer_func, note: str = ""):
@@ -25439,22 +27735,33 @@ async def show_fishing(user_id: int, answer_func, note: str = ""):
     left = max(0, int(fishing_cooldown(user) - (time.time() - float(user.get("fish_last", 0) or 0))))
     ready = "клюёт — можно закидывать!" if left <= 0 else f"следующий заброс через {left} сек."
     coin = '<tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji>'
-    text = (
-        f"{PE_FISH} <b>Рыбалка</b>\n"
-        f"<i>{ready}</i>\n\n"
-        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
-        + f"{F_BAG} <b>Садок</b>\n<blockquote>" + ("\n".join(lines) if lines else "Пусто — закидывай удочку!") + "</blockquote>\n\n"
-        f"<blockquote>{coin} Улов стоит: <b>{format_num(total_value)}</b>\n"
-        f"{PE_TROPHY} Поймано всего: <b>{format_num(int(user.get('fish_caught', 0)))}</b>\n"
-        f"{PE_LEVELUP} Навык рыбака: {hobby_progress_line(user, 'fish')}\n"
-        f"      заброс раз в {fishing_cooldown(user):g} с · цены +{4 * hobby_level(user, 'fish')}% · редкая рыба чаще\n"
-        f"{POTION_PREMIUM_EMOJIS.get('luck_potion', '🍀')} Удача помогает ловить редкую рыбу</blockquote>"
-    )
+    text = render_screen("рыбалка", {
+        "статус": ready, "заметка": f"<blockquote>{note}</blockquote>\n\n" if note else "",
+        "садок": "\n".join(lines) if lines else "Пусто — закидывай удочку!",
+        "стоимость": format_num(total_value), "поймано": format_num(int(user.get('fish_caught', 0))),
+        "навык": hobby_progress_line(user, 'fish'), "заброс": f"{fishing_cooldown(user):g}",
+        "бонус": 4 * hobby_level(user, 'fish'),
+    })
     rows = [[InlineKeyboardButton(text="Закинуть удочку", callback_data="fish|cast", icon_custom_emoji_id="5343609421316521960")]]
     if total_value:
         rows.append([InlineKeyboardButton(text=f"Продать улов · {format_num(total_value)}", callback_data="fish|sell", icon_custom_emoji_id="5433594926107481306")])
     rows.append([InlineKeyboardButton(text="Какая рыба водится", callback_data="fish|info", icon_custom_emoji_id="5382210409824525356")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("рыбалка", "Рыбалка", (
+    f"{PE_FISH} <b>Рыбалка</b>\n"
+    "<i>{статус}</i>\n\n"
+    "{заметка}"
+    f"{F_BAG} <b>Садок</b>\n<blockquote>{{садок}}</blockquote>\n\n"
+    '<blockquote><tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji> Улов стоит: <b>{стоимость}</b>\n'
+    f"{PE_TROPHY} Поймано всего: <b>{{поймано}}</b>\n"
+    f"{PE_LEVELUP} Навык рыбака: {{навык}}\n"
+    "      заброс раз в {заброс} с · цены +{бонус}% · редкая рыба чаще\n"
+    f"{POTION_PREMIUM_EMOJIS.get('luck_potion', '🍀')} Удача помогает ловить редкую рыбу</blockquote>"
+), {"статус": "клюёт / через сколько заброс", "заметка": "результат действия (лучше оставить)", "садок": "рыба в садке",
+    "стоимость": "цена улова", "поймано": "поймано всего", "навык": "уровень навыка с полоской",
+    "заброс": "секунд между забросами", "бонус": "бонус к ценам, %"})
 
 
 async def show_fish_info(user_id: int, answer_func):
@@ -25502,17 +27809,28 @@ async def show_farm(user_id: int, answer_func, note: str = ""):
     rows.append([InlineKeyboardButton(text="Чайная лавка", callback_data="tea|ref", icon_custom_emoji_id="5454360160975722988")])
     stock = get_crops(user)
     stock_line = " · ".join(f"{CROPS[cid][1]} {n}" for cid, n in stock.items() if cid in CROPS and int(n) > 0)
-    await answer_func(
-        f'<tg-emoji emoji-id="5197555094161234652">🌿</tg-emoji> <b>Огород</b>\n\n'
-        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
-        + "<blockquote>" + "\n\n".join(blocks) + "</blockquote>\n\n"
-        f"<blockquote>{PE_TROPHY} Собрано урожаев: <b>{format_num(int(user.get('harvests', 0)))}</b>\n"
-        + (f"{PE_BOX} Урожай на складе: {stock_line}\n" if stock_line else "")
-        + f"{PE_LEVELUP} Навык огородника: {hobby_progress_line(user, 'farm')}\n"
-        f"      грядок {farm_beds_count(user)} · рост −{int(100 * min(0.5, 0.02 * hobby_level(user, 'farm')))}% · урожай +{4 * hobby_level(user, 'farm')}%\n"
-        f'<tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji> Цены растут с уровнем: ×{m:.2f}</blockquote>',
-        InlineKeyboardMarkup(inline_keyboard=rows),
-    )
+    await answer_func(render_screen("огород", {
+        "заметка": f"<blockquote>{note}</blockquote>\n\n" if note else "",
+        "грядки": "\n\n".join(blocks), "собрано": format_num(int(user.get('harvests', 0))),
+        "склад": f"{PE_BOX} Урожай на складе: {stock_line}\n" if stock_line else "",
+        "навык": hobby_progress_line(user, 'farm'), "грядок": farm_beds_count(user),
+        "рост": int(100 * min(0.5, 0.02 * hobby_level(user, 'farm'))), "урожай": 4 * hobby_level(user, 'farm'),
+        "цены": f"{m:.2f}",
+    }), InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("огород", "Огород", (
+    '<tg-emoji emoji-id="5197555094161234652">🌿</tg-emoji> <b>Огород</b>\n\n'
+    "{заметка}"
+    "<blockquote>{грядки}</blockquote>\n\n"
+    f"<blockquote>{PE_TROPHY} Собрано урожаев: <b>{{собрано}}</b>\n"
+    "{склад}"
+    f"{PE_LEVELUP} Навык огородника: {{навык}}\n"
+    "      грядок {грядок} · рост −{рост}% · урожай +{урожай}%\n"
+    '<tg-emoji emoji-id="5433594926107481306">⚪️</tg-emoji> Цены растут с уровнем: ×{цены}</blockquote>'
+), {"заметка": "результат действия (лучше оставить)", "грядки": "грядки с таймерами", "собрано": "собрано урожаев",
+    "склад": "строка урожая на складе (если есть)", "навык": "уровень навыка", "грядок": "число грядок",
+    "рост": "ускорение роста, %", "урожай": "бонус урожая, %", "цены": "множитель цен"})
 
 
 async def show_farm_info(user_id: int, answer_func):
@@ -25905,6 +28223,7 @@ def _notify_entries() -> List[tuple]:
         entries.append((boss["id"], boss["name"], emoji, icon, "loc"))
     entries.append((NOTIFY_WORLD_BOSS, WORLD_BOSS_NAME, WORLD_BOSS_EMOJI, "5474447727314094004", "special"))
     entries.append((NOTIFY_CLAN_BOSS, CLAN_BOSS_NAME, CLAN_BOSS_NOTIFY_EMOJI, BTN_DRAGON, "special"))
+    entries.append((NOTIFY_KRATOS, KRATOS_NAME, kratos_emoji(), kratos_icon(), "special"))
     return entries
 
 
@@ -25927,6 +28246,7 @@ async def show_notify_settings(user_id: int, answer_func, note: str = ""):
         f"<b>Особые боссы</b>\n<blockquote>" + "\n".join(special_lines) + "</blockquote>\n\n"
         f"{PE_SPARK} Включено: <b>{on_count}</b> из {len(entries)}\n"
         f"{PE_OK if stickers_on else PE_CROSS} Стикеры к командам: <b>{'включены' if stickers_on else 'выключены'}</b>"
+        + f"\n{PE_CROSS if user.get('kb_off') else PE_OK} Клавиатура снизу: <b>{'скрыта' if user.get('kb_off') else 'включена'}</b>"
     )
     rows = []
     for key, name, _emoji, icon, _group in entries:
@@ -25936,7 +28256,9 @@ async def show_notify_settings(user_id: int, answer_func, note: str = ""):
         InlineKeyboardButton(text="Включить все", callback_data="ntf|all|on", icon_custom_emoji_id="5325762861539016690"),
         InlineKeyboardButton(text="Выключить все", callback_data="ntf|all|off", icon_custom_emoji_id="5352669272575321097"),
     ])
-    rows.append([InlineKeyboardButton(text=f"Стикеры: {'вкл' if stickers_on else 'выкл'}", callback_data="ntf|stk", icon_custom_emoji_id="5370831521039017384")])
+    rows.append([InlineKeyboardButton(text=f"Стикеры: {'вкл' if stickers_on else 'выкл'}", callback_data="ntf|stk", icon_custom_emoji_id="5370831521039017384"),
+                 InlineKeyboardButton(text=f"Клавиатура: {'выкл' if user.get('kb_off') else 'вкл'}", callback_data="ntf|kb",
+                                      icon_custom_emoji_id="5352669272575321097" if user.get("kb_off") else "5325762861539016690")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -25967,6 +28289,21 @@ async def cb_notify_settings(call: CallbackQuery):
         else:
             off.update({k: True for k in keys})
             note = f"{PE_CROSS} Все уведомления о боссах выключены."
+    elif action == "kb":
+        off = not user.get("kb_off")
+        set_reply_keyboard_off(uid, off)
+        await save_runtime_state(uid, user)
+        await call.answer("Клавиатура скрыта" if off else "Клавиатура включена")
+        try:
+            if off:
+                await call.message.answer(f"{PE_OK} Нижняя клавиатура скрыта. Вернуть — <code>меню</code>.",
+                                          reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
+            elif call.message.chat.type == "private":
+                await send_main_keyboard(call.message)
+        except Exception as e:
+            print(f"[kb toggle] {e}")
+        await show_notify_settings(uid, lambda t, kb: edit_for_user(call, t, kb))
+        return
     elif action == "stk":
         user["no_stickers"] = not user.get("no_stickers")
         note = f"{PE_OK if not user['no_stickers'] else PE_CROSS} Стикеры к командам: <b>{'включены' if not user['no_stickers'] else 'выключены'}</b>."
@@ -26082,26 +28419,33 @@ async def show_casino_home(user_id: int, answer_func, note: str = ""):
     user = await db.get_user(user_id)
     st = casino_stats(user)
     net = int(st["won"]) - int(st["wagered"])
-    trend = f"📈 <b>+{format_num(net)}</b>" if net >= 0 else f"📉 <b>−{format_num(-net)}</b>"
-    text = (
-        f"{CAS_SLOTS} <b>КАЗИНО</b> {CAS_SLOTS}\n<code>{CAS_LINE}</code>\n\n"
-        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
-        + f"<blockquote>{_casino_card(user)}</blockquote>\n\n"
-        f"<b>Игры</b>\n<blockquote>"
-        f"{CAS_SLOTS} <b>Слоты</b> — три в ряд, до <b>×150</b>\n"
-        f"{CAS_COINFLIP} <b>Монетка</b> — орёл или решка, <b>×{COIN_PAYOUT}</b>\n"
-        f"{CAS_DICE} <b>Кубик</b> — угадай число, <b>×{DICE_PAYOUT}</b></blockquote>\n\n"
-        f"<b>Твоя статистика</b>\n<blockquote>"
-        f"Игр сыграно: <b>{format_num(st['games'])}</b>\n"
-        f"Поставлено: <b>{format_num(st['wagered'])}</b> · выиграно: <b>{format_num(st['won'])}</b>\n"
-        f"Итог: {trend}\n"
-        f"{PE_TROPHY} Лучший выигрыш: <b>{format_num(st['biggest'])}</b></blockquote>\n\n"
-        f"<i>Ставка от {format_num(CASINO_MIN_BET)} до {format_num(CASINO_MAX_BET)}. Казино всегда немного в плюсе — играй с умом.</i>"
-    )
+    trend = f"<tg-emoji emoji-id=\"6084922627736996647\">📈</tg-emoji> <b>+{format_num(net)}</b>" if net >= 0 else f"<tg-emoji emoji-id=\"5431816358675366190\">📉</tg-emoji> <b>−{format_num(-net)}</b>"
+    text = render_screen("казино", {
+        "заметка": f"<blockquote>{note}</blockquote>\n\n" if note else "", "карточка": _casino_card(user), "игр": format_num(st['games']), "поставлено": format_num(st['wagered']),
+        "выиграно": format_num(st['won']), "итог": trend, "лучший": format_num(st['biggest']),
+    })
     rows = [[InlineKeyboardButton(text=name, callback_data=f"cas|game|{gid}", icon_custom_emoji_id=icon)]
             for gid, (_emoji, name, icon) in CASINO_GAMES.items()]
     rows.append([InlineKeyboardButton(text="Топ казино", callback_data="cas|top|profit", icon_custom_emoji_id="5947236241199074198")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("казино", "Казино (главный экран)", (
+    f"{CAS_SLOTS} <b>КАЗИНО</b> {CAS_SLOTS}\n<code>{CAS_LINE}</code>\n\n"
+    "{заметка}"
+    "<blockquote>{карточка}</blockquote>\n\n"
+    "<b>Игры</b>\n<blockquote>"
+    f"{CAS_SLOTS} <b>Слоты</b> — три в ряд, до <b>×150</b>\n"
+    f"{CAS_COINFLIP} <b>Монетка</b> — орёл или решка, <b>×{COIN_PAYOUT}</b>\n"
+    f"{CAS_DICE} <b>Кубик</b> — угадай число, <b>×{DICE_PAYOUT}</b></blockquote>\n\n"
+    "<b>Твоя статистика</b>\n<blockquote>"
+    "Игр сыграно: <b>{игр}</b>\n"
+    "Поставлено: <b>{поставлено}</b> · выиграно: <b>{выиграно}</b>\n"
+    "Итог: {итог}\n"
+    f"{PE_TROPHY} Лучший выигрыш: <b>{{лучший}}</b></blockquote>\n\n"
+    f"<i>Ставка от {format_num(CASINO_MIN_BET)} до {format_num(CASINO_MAX_BET)}. Казино всегда немного в плюсе — играй с умом.</i>"
+), {"заметка": "результат", "карточка": "баланс и ставка", "игр": "игр сыграно", "поставлено": "поставлено",
+    "выиграно": "выиграно", "итог": "плюс/минус", "лучший": "лучший выигрыш"})
 
 
 def _casino_rules(game: str) -> str:
@@ -26963,7 +29307,7 @@ def cr_pay(c: dict, cost: dict):
 
 
 def cr_bar(done: float, total: float) -> str:
-    return _progress_bar(done, total, 10)
+    return _progress_bar(done, total, 10, "cyan")
 
 
 def cr_kb(rows: list) -> InlineKeyboardMarkup:
@@ -27065,18 +29409,15 @@ async def show_crystal(user_id: int, answer_func, note: str = ""):
     lvl_line = ("<b>максимум</b>" if lvl >= CR_MAX_LEVEL
                 else f"{cr_bar(c['xp'], need)} {format_num(int(c['xp']))}/{format_num(need)}")
     alerts = cr_alerts(c)
-    text = (
-        f"{cre('crystal')} <b>Кристалл · {lvl} ур.</b>\n"
-        f"<i>Обелиски питают его лучами каждые 10 минут</i>\n\n"
-        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
-        + f"<blockquote>{PE_LEVELUP} Бонус к урону и HP: <b>+{get_crystal_bonus(user):g}%</b>\n"
-        f"{cre('crystal')} Уровень: {lvl_line}</blockquote>\n\n"
-        f"<blockquote>{cre('energy')} Энергия\n{cr_bar(energy, cap)} <b>{format_num(int(energy))}/{format_num(cap)}</b> · +{per_tick:.1f}/ход\n\n"
-        f"{cre('stab')} Стабильность\n{cr_bar(stab, 100)} <b>{stab:.0f}%</b>\n\n"
-        f"{cre('obelisk')} Обелиски: работают <b>{n_run}/{len(gens)}</b></blockquote>\n\n"
-        + (f"<b>Требует внимания</b>{PE_ALARM}\n<blockquote>" + "\n".join(alerts) + "</blockquote>\n\n" if alerts else "")
-        + f"<blockquote>{cr_res_line(c)}</blockquote>"
-    )
+    text = render_screen("кристалл", {
+        "уровень": lvl, "заметка": f"<blockquote>{note}</blockquote>\n\n" if note else "",
+        "бонус": f"{get_crystal_bonus(user):g}", "прогресс": lvl_line,
+        "энергия полоска": cr_bar(energy, cap), "энергия": format_num(int(energy)), "макс": format_num(cap),
+        "за ход": f"{per_tick:.1f}", "стабильность полоска": cr_bar(stab, 100), "стабильность": f"{stab:.0f}",
+        "работают": n_run, "обелисков": len(gens),
+        "внимание": (f"<b>Требует внимания</b>{PE_ALARM}\n<blockquote>" + "\n".join(alerts) + "</blockquote>\n\n" if alerts else ""),
+        "ресурсы": cr_res_line(c),
+    })
     rows = []
     if energy >= 1 and lvl < CR_MAX_LEVEL:
         rows.append([cr_btn(f"Зарядить кристалл · {format_num(int(energy))}", "cr|charge", "energy")])
@@ -27092,6 +29433,24 @@ async def show_crystal(user_id: int, answer_func, note: str = ""):
     rows.append([cr_btn("Уведомления", "cr|ntf", "5440660757194744323"), cr_btn("Как играть", "cr|help", "bp")])
     rows.append([cr_btn("Обновить", "cr|main", "pump")])
     await answer_func(text, cr_kb(rows))
+
+
+register_screen("кристалл", "Кристалл (главный экран)", (
+    f"{cre('crystal')} <b>Кристалл · {{уровень}} ур.</b>\n"
+    "<i>Обелиски питают его лучами каждые 10 минут</i>\n\n"
+    "{заметка}"
+    f"<blockquote>{PE_LEVELUP} Бонус к урону и HP: <b>+{{бонус}}%</b>\n"
+    f"{cre('crystal')} Уровень: {{прогресс}}</blockquote>\n\n"
+    f"<blockquote>{cre('energy')} Энергия\n{{энергия полоска}} <b>{{энергия}}/{{макс}}</b> · +{{за ход}}/ход\n\n"
+    f"{cre('stab')} Стабильность\n{{стабильность полоска}} <b>{{стабильность}}%</b>\n\n"
+    f"{cre('obelisk')} Обелиски: работают <b>{{работают}}/{{обелисков}}</b></blockquote>\n\n"
+    "{внимание}"
+    "<blockquote>{ресурсы}</blockquote>"
+), {"уровень": "уровень кристалла", "заметка": "результат действия", "бонус": "бонус к урону и HP, %",
+    "прогресс": "полоска опыта", "энергия полоска": "полоска энергии", "энергия": "энергия", "макс": "максимум энергии",
+    "за ход": "прирост за ход", "стабильность полоска": "полоска стабильности", "стабильность": "стабильность, %",
+    "работают": "работающих обелисков", "обелисков": "всего обелисков", "внимание": "блок «Требует внимания» (если есть)",
+    "ресурсы": "строка ресурсов"})
 
 
 async def show_crystal_gens(user_id: int, answer_func, note: str = ""):
@@ -28163,7 +30522,7 @@ def autofarm_grant_victory(user: dict, boss: dict, hard_mode: bool) -> tuple:
         kills[loc] = kills.get(loc, 0) + 1
     defeats = user.setdefault("boss_defeats", {})
     defeats[boss["id"]] = defeats.get(boss["id"], 0) + 1
-    drops = roll_boss_loot(user, boss, event_points=False)  # автофарм админа очков ивента не даёт
+    drops = roll_boss_loot(user, boss)  # очки Кровавой луны тоже начисляются
     levels = add_xp(user, xp)
     user.setdefault("boss_cooldowns", {})[boss["id"]] = time.time() + get_boss_cooldown(boss, user, hard_mode)
     # босса бьёт автофарм — уведомление «босс готов» не нужно
@@ -28192,6 +30551,47 @@ def autofarm_reset_stats(user: dict) -> None:
     af["fails"] = {}
 
 
+def user_total_xp(user: dict) -> int:
+    """Весь опыт игрока с 1 уровня — чтобы считать полученный опыт даже при повышении уровня."""
+    level = int(user.get("level", 1) or 1)
+    return sum(get_level_xp_required(L) for L in range(1, level)) + int(user.get("xp", 0) or 0)
+
+
+async def autofarm_fight(uid: int, boss: dict, hard: bool) -> tuple:
+    """Настоящий рейд без вывода в чат: те же волны, ходы раз в AUTO_BATTLE_TURN, скиллы пути.
+    → (победа, ходов, монет получено, уровней получено)."""
+    user = await db.get_user(uid)
+    defeats_before = int((user.get("boss_defeats") or {}).get(boss["id"], 0))
+    coins_before = int(user.get("coins", 0))
+    level_before = int(user.get("level", 1) or 1)
+    xp_before = user_total_xp(user)
+    battle = create_boss_battle(int(user.get("level", 1) or 1), boss,
+                                user.get("equipped_armor") or {slot: None for slot in ARMOR_SLOTS}, user, hard)
+    battle["autofarm"] = True
+    active_battles[uid] = battle
+    fake = _AutoBattleCall(_HeadlessMessage(uid), _AutoBattleUser(uid))
+    turns = 0
+    try:
+        while active_battles.get(uid) is battle and turns < AUTOFARM_MAX_TURNS:
+            await asyncio.sleep(AUTO_BATTLE_TURN)
+            if not get_autofarm(await db.get_user(uid)).get("on"):
+                break
+            lock = battle_locks.setdefault(uid, asyncio.Lock())
+            async with lock:
+                if active_battles.get(uid) is not battle or battle.get("busy"):
+                    continue
+                battle["last_action_at"] = time.time()
+                await auto_battle_step(fake, uid, battle)
+                turns += 1
+    finally:
+        if active_battles.get(uid) is battle:   # не успели / выключили — бой снимаем
+            active_battles.pop(uid, None)
+    user = await db.get_user(uid)
+    win = int((user.get("boss_defeats") or {}).get(boss["id"], 0)) > defeats_before
+    battle["xp_gained"] = max(0, user_total_xp(user) - xp_before)
+    return win, turns, int(user.get("coins", 0)) - coins_before, int(user.get("level", 1) or 1) - level_before, battle["xp_gained"]
+
+
 async def admin_autofarm_loop(uid: int):
     set_log_context("автофарм боссов")
     try:
@@ -28208,37 +30608,37 @@ async def admin_autofarm_loop(uid: int):
                 stats, fails = af["stats"], af["fails"]
                 hard = is_boss_hard_mode_enabled(user)
                 level = int(user.get("level", 1) or 1)
-                changed = False
-                for boss in BOSSES.values():
+                target = None
+                for boss in BOSSES.values():   # по одному боссу за раз — бой идёт в реальном времени
                     if level < LOCATIONS.get(boss.get("location"), {}).get("min_level", 1):
                         continue
-                    if get_boss_cd_remaining(user, boss["id"]) > 0:
+                    if get_boss_cd_remaining(user, boss["id"]) > 0 or float(fails.get(boss["id"], 0)) > time.time():
                         continue
-                    if float(fails.get(boss["id"], 0)) > time.time():
-                        continue
-                    win, turns, dealt, hits = simulate_boss_raid(user, boss, hard)
-                    user["total_damage"] = int(user.get("total_damage", 0)) + dealt
-                    if get_user_path(user):
-                        add_path_xp(user, hits * get_path_level(user))
-                    changed = True
-                    if win:
-                        coins, xp, drops, levels = autofarm_grant_victory(user, boss, hard)
-                        fails.pop(boss["id"], None)
-                        stats["wins"] = int(stats.get("wins", 0)) + 1
-                        stats["coins"] = int(stats.get("coins", 0)) + coins
-                        stats["xp"] = int(stats.get("xp", 0)) + xp
-                        stats["levels"] = int(stats.get("levels", 0)) + levels
-                        by = stats.setdefault("by_boss", {})
-                        by[boss["id"]] = int(by.get(boss["id"], 0)) + 1
-                        await log_boss_victory(uid, user, boss, hard, coins, xp, drops)
-                    else:
-                        fails[boss["id"]] = time.time() + AUTOFARM_FAIL_RETRY
-                        stats["losses"] = int(stats.get("losses", 0)) + 1
-                        await write_activity_log(f"AUTOFARM {_log_user_name(uid, user)} | {boss['name']}: поражение за {turns} ход.")
-                    await asyncio.sleep(0)
-                    level = int(user.get("level", 1) or 1)  # новый уровень может открыть локацию
-                if changed:
-                    await save_runtime_state(uid, user)
+                    target = boss
+                    break
+                if target is None:
+                    await asyncio.sleep(AUTOFARM_INTERVAL)
+                    continue
+                win, turns, coins, levels, xp_gained = await autofarm_fight(uid, target, hard)
+                user = await db.get_user(uid)
+                af = get_autofarm(user)
+                stats, fails = af["stats"], af["fails"]
+                if win:
+                    fails.pop(target["id"], None)
+                    stats["wins"] = int(stats.get("wins", 0)) + 1
+                    stats["coins"] = int(stats.get("coins", 0)) + max(0, coins)
+                    stats["xp"] = int(stats.get("xp", 0)) + xp_gained
+                    stats["levels"] = int(stats.get("levels", 0)) + max(0, levels)
+                    by = stats.setdefault("by_boss", {})
+                    by[target["id"]] = int(by.get(target["id"], 0)) + 1
+                    user.setdefault("boss_cd_notified", {})[target["id"]] = True
+                elif get_autofarm(user).get("on"):
+                    fails[target["id"]] = time.time() + AUTOFARM_FAIL_RETRY
+                    stats["losses"] = int(stats.get("losses", 0)) + 1
+                    await write_activity_log(f"AUTOFARM {_log_user_name(uid, user)} | {target['name']}: поражение за {turns} ход.")
+                await save_runtime_state(uid, user)
+                await asyncio.sleep(1)
+                continue
             except Exception as e:
                 print(f"[admin_autofarm] {uid}: {e}")
             await asyncio.sleep(AUTOFARM_INTERVAL)
@@ -28290,7 +30690,7 @@ def autofarm_status_text(user: dict) -> str:
                   for b, t in (af.get("fails") or {}).items() if b in BOSSES and float(t) > now]
     text = (
         f'<tg-emoji emoji-id="5947121436723252849">👑</tg-emoji> <b>Автофарм боссов</b>\n\n'
-        f"<blockquote>{head}\nБоссы — каждые {AUTOFARM_INTERVAL} сек., Лутиафан и мировой босс — удар каждые {AUTO_HIT_INTERVAL:g} сек. · режим: <b>{'хард' if is_boss_hard_mode_enabled(user) else 'обычный'}</b></blockquote>\n\n"
+        f"<blockquote>{head}\nБоссы — каждые {AUTOFARM_INTERVAL} сек., Лутиафан, мировой босс и Кратос — удар каждые {AUTO_HIT_INTERVAL:g} сек. · режим: <b>{'хард' if is_boss_hard_mode_enabled(user) else 'обычный'}</b></blockquote>\n\n"
         "<blockquote>" + "\n".join(lines) + "</blockquote>"
     )
     if boss_lines:
@@ -28299,14 +30699,18 @@ def autofarm_status_text(user: dict) -> str:
         text += "\n\n<b>Лут</b>\n<blockquote expandable>" + "\n".join(loot_lines) + "</blockquote>"
     if fail_lines:
         text += "\n\n<b>Не осилил</b>\n<blockquote expandable>" + "\n".join(fail_lines) + "</blockquote>"
-    text += ("\n\n<i>Бой считается автоматически, без скиллов пути. Чтобы не занимать топы — <code>топ скрыть</code>.</i>")
+    skills = "выключены — только обычные удары" if user.get("auto_battle_no_skills") else "включены — бьёт скиллами пути"
+    text += (f"\n\n<blockquote>Скиллы в бою: <b>{skills}</b></blockquote>"
+             "\n\n<i>Настройка общая с автобоем в рейдах. Чтобы не занимать топы — <code>топ скрыть</code>.</i>")
     return text
 
 
-def autofarm_keyboard(on: bool) -> InlineKeyboardMarkup:
+def autofarm_keyboard(on: bool, skills_on: bool = True) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Выключить" if on else "Включить", callback_data=f"afarm|{'off' if on else 'on'}",
                               icon_custom_emoji_id="5352669272575321097" if on else "5325762861539016690")],
+        [InlineKeyboardButton(text=f"Скиллы: {'вкл' if skills_on else 'выкл'}", callback_data="afarm|skills",
+                              icon_custom_emoji_id="5325762861539016690" if skills_on else "5352669272575321097")],
         [InlineKeyboardButton(text="Обновить", callback_data="afarm|ref", icon_custom_emoji_id="5346321684574003384")],
     ])
 
@@ -28345,7 +30749,7 @@ async def text_admin_autofarm(message: Message):
         user = await admin_autofarm_set(uid, False)
     else:
         user = await db.get_user(uid)
-    await reply_to_user(message, autofarm_status_text(user), autofarm_keyboard(get_autofarm(user).get("on")))
+    await reply_to_user(message, autofarm_status_text(user), autofarm_keyboard(get_autofarm(user).get("on"), not user.get("auto_battle_no_skills")))
 
 
 @dp.callback_query(F.data.startswith("afarm|"))
@@ -28358,10 +30762,15 @@ async def cb_admin_autofarm(call: CallbackQuery):
     if action in ("on", "off"):
         user = await admin_autofarm_set(uid, action == "on")
         await call.answer("Автофарм включён — спокойной ночи!" if action == "on" else "Автофарм выключен.")
+    elif action == "skills":
+        user = await db.get_user(uid)
+        user["auto_battle_no_skills"] = not user.get("auto_battle_no_skills")
+        await save_runtime_state(uid, user)
+        await call.answer("Автобосс бьёт без скиллов" if user["auto_battle_no_skills"] else "Автобосс снова использует скиллы")
     else:
         user = await db.get_user(uid)
         await call.answer("Обновлено")
-    await edit_for_user(call, autofarm_status_text(user), autofarm_keyboard(get_autofarm(user).get("on")))
+    await edit_for_user(call, autofarm_status_text(user), autofarm_keyboard(get_autofarm(user).get("on"), not user.get("auto_battle_no_skills")))
 
 
 
@@ -28370,7 +30779,7 @@ async def cb_admin_autofarm(call: CallbackQuery):
 # «автоатака» — меню: включить автоудары по Лутиафану и мировому боссу.
 # Удар каждые AUTO_HIT_INTERVAL сек.; при нокауте ждёт восстановления и продолжает.
 # В рейдах на обычных боссов — кнопка «Автобой»: бот сам бьёт, пока бой не закончится.
-# У админа включённый «автобосс» тоже бьёт Лутиафана и мирового босса.
+# У админа включённый «автобосс» тоже бьёт Лутиафана, мирового босса и Кратоса.
 # ============================================================
 
 AUTO_HIT_INTERVAL = 1.1
@@ -28387,14 +30796,14 @@ def get_auto_attack(user: dict) -> dict:
 
 
 def auto_attack_targets(uid_str: str, user: dict) -> tuple:
-    """(бить Лутиафана, бить мирового босса)."""
+    """(бить Лутиафана, бить мирового босса, бить Кратоса)."""
     aa = user.get("auto_attack") or {}
     admin_on = False
     try:
         admin_on = int(uid_str) in ADMIN_IDS and bool((user.get("autofarm") or {}).get("on"))
     except ValueError:
         pass
-    return bool(aa.get("cboss") or admin_on), bool(aa.get("wb") or admin_on)
+    return bool(aa.get("cboss") or admin_on), bool(aa.get("wb") or admin_on), bool(aa.get("kratos") or admin_on)
 
 
 AUTO_ATTACK_RESCAN = 15.0
@@ -28427,12 +30836,13 @@ async def boss_auto_attack_loop():
         try:
             set_log_context("автоатака (фон)")
             wb_on = world_boss_active()
+            kr_on = kratos_active()
             for uid_str in _auto_attack_candidates():
                 user = db.data.get(uid_str)
                 if not isinstance(user, dict) or is_user_banned_sync(uid_str):
                     continue
-                hit_cboss, hit_wb = auto_attack_targets(uid_str, user)
-                if not hit_cboss and not hit_wb:
+                hit_cboss, hit_wb, hit_kr = auto_attack_targets(uid_str, user)
+                if not hit_cboss and not hit_wb and not hit_kr:
                     continue
                 uid = int(uid_str)
                 try:
@@ -28441,6 +30851,9 @@ async def boss_auto_attack_loop():
                     if hit_wb and wb_on and int(user.get("level", 1) or 1) >= WORLD_BOSS_MIN_LEVEL:
                         await world_boss_hit(uid)
                         wb_on = world_boss_active()
+                    if hit_kr and kr_on and int(user.get("level", 1) or 1) >= KRATOS_MIN_LEVEL:
+                        await kratos_hit(uid)
+                        kr_on = kratos_active()
                 except Exception as e:
                     print(f"[auto attack] {uid}: {e}")
         except Exception as e:
@@ -28486,14 +30899,27 @@ def auto_attack_menu_text(user: dict, uid: int) -> str:
             extra = "\n      сейчас босса нет — начнёт бить, когда появится"
         wb = f"{WORLD_BOSS_EMOJI} <b>{WORLD_BOSS_NAME}</b> — {state}{extra}"
     lines.append(wb)
-    admin_note = f"\n\n<blockquote>{PE_OK} Включён «автобосс» — Лутиафан и мировой босс бьются и без этих переключателей.</blockquote>" if is_admin_farm else ""
+    # Кратос
+    if int(user.get("level", 1) or 1) < KRATOS_MIN_LEVEL:
+        kr = f"{kratos_emoji()} <b>{KRATOS_NAME}</b> — с {KRATOS_MIN_LEVEL} уровня"
+    else:
+        state = f"{PE_OK} включена" if aa.get("kratos") else f"{PE_CROSS} выключена"
+        if kratos_active():
+            kb_ = _kratos
+            extra = f"\n      HP босса: <b>{100 * int(kb_.get('hp', 0)) / max(1, int(kb_.get('max_hp', 1))):.1f}%</b>"
+            p = (kb_.get("players") or {}).get(str(uid))
+            if p:
+                extra += f" · твой урон: <b>{format_num(int(p.get('damage', 0)))}</b>"
+        else:
+            extra = f"\n      сейчас его нет — начнёт бить в {KRATOS_SPAWN_HOUR_MSK}:00 МСК"
+        kr = f"{kratos_emoji()} <b>{KRATOS_NAME}</b> — {state}{extra}"
+    lines.append(kr)
+    admin_note = f"\n\n<blockquote>{PE_OK} Включён «автобосс» — Лутиафан, мировой босс и Кратос бьются и без этих переключателей.</blockquote>" if is_admin_farm else ""
     return (
         f'<tg-emoji emoji-id="5346321684574003384">🔄</tg-emoji> <b>Автоатака</b>\n\n'
         "<blockquote>" + "\n\n".join(lines) + "</blockquote>\n\n"
         f"<blockquote>{DAMAGE_EMOJI} Удар каждые <b>{AUTO_HIT_INTERVAL:g} сек.</b> — даже когда ты не в сети. "
-        "При нокауте автоатака ждёт восстановления и продолжает. Награды — как за ручные удары.</blockquote>\n\n"
-        f"<blockquote>{BOSS_BATTLE_EMOJI} В рейде на обычного босса нажми <b>«Автобой»</b> под боем — "
-        "бот будет бить сам, пока бой не закончится.</blockquote>"
+        "При нокауте автоатака ждёт восстановления и продолжает. Награды — как за ручные удары.</blockquote>"
         + admin_note
     )
 
@@ -28509,11 +30935,16 @@ def auto_attack_menu_kb(user: dict) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             text=f"Мировой босс: {'выключить' if aa.get('wb') else 'включить'}",
             callback_data="aatk|wb", icon_custom_emoji_id="5352669272575321097" if aa.get("wb") else "5325762861539016690")])
+    if int(user.get("level", 1) or 1) >= KRATOS_MIN_LEVEL:
+        rows.append([InlineKeyboardButton(
+            text=f"{KRATOS_NAME}: {'выключить' if aa.get('kratos') else 'включить'}",
+            callback_data="aatk|kratos", icon_custom_emoji_id=KRATOS_EMOJI_ID or ("5352669272575321097" if aa.get("kratos") else "5325762861539016690"))])
     rows.append([InlineKeyboardButton(text="Обновить", callback_data="aatk|ref", icon_custom_emoji_id="5346321684574003384")])
     nav = []
     if user.get("clan_id"):
         nav.append(InlineKeyboardButton(text=CLAN_BOSS_NAME, callback_data="cboss|ref", icon_custom_emoji_id=BTN_DRAGON))
     nav.append(InlineKeyboardButton(text="Мировой босс", callback_data="wb|ref", icon_custom_emoji_id="5474447727314094004"))
+    nav.append(InlineKeyboardButton(text=KRATOS_NAME, callback_data="kr|ref", icon_custom_emoji_id=kratos_icon()))
     rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -28538,22 +30969,32 @@ async def cb_auto_attack(call: CallbackQuery):
         await call.answer()
         return
     aa = get_auto_attack(user)
-    if action in ("cboss", "wb"):
+    if action in ("cboss", "wb", "kratos"):
         if action == "cboss" and not user.get("clan_id"):
             await call.answer("Сначала вступи в клан.", show_alert=True)
             return
         if action == "wb" and int(user.get("level", 1) or 1) < WORLD_BOSS_MIN_LEVEL:
             await call.answer(f"Мировой босс доступен с {WORLD_BOSS_MIN_LEVEL} уровня.", show_alert=True)
             return
+        if action == "kratos" and int(user.get("level", 1) or 1) < KRATOS_MIN_LEVEL:
+            await call.answer(f"Кратос доступен с {KRATOS_MIN_LEVEL} уровня.", show_alert=True)
+            return
         aa[action] = not aa.get(action)
         invalidate_auto_attack_cache()
         await save_runtime_state(uid, user)
-        name = CLAN_BOSS_NAME if action == "cboss" else WORLD_BOSS_NAME
+        name = {"cboss": CLAN_BOSS_NAME, "wb": WORLD_BOSS_NAME, "kratos": KRATOS_NAME}[action]
         await write_activity_log(f"AUTOATTACK {_log_user_name(uid, user)} | {name}: {'вкл' if aa[action] else 'выкл'}")
         await call.answer(f"Автоатака: {name} — {'включена' if aa[action] else 'выключена'}")
     else:
         await call.answer()
     await edit_for_user(call, auto_attack_menu_text(user, uid), auto_attack_menu_kb(user))
+
+
+class _AutoBattleUser:
+    """Минимальный «from_user» для автобоя, запущенного без нажатия кнопки."""
+    def __init__(self, uid: int):
+        self.id = uid
+        self.is_bot = False
 
 
 class _AutoBattleCall:
@@ -28565,6 +31006,70 @@ class _AutoBattleCall:
 
     async def answer(self, *args, **kwargs):
         return None
+
+
+# Порядок, в котором автобой пробует скиллы пути (сначала усиления, потом сильные удары)
+AUTO_SKILL_PRIORITY = ["berserk", "blood_rage", "war_cry", "fortify", "eagle_eye", "aim", "arcane_shield", "magic_shield",
+                       "great_power", "pierce_shot", "polar_star", "blast_wave", "rune_barrage", "multi_shot", "sniper_shot"]
+
+
+async def auto_battle_step(fake, uid: int, battle: dict):
+    """Один ход автобоя: включает массовый скилл при нескольких врагах, использует готовые скиллы пути,
+    иначе — обычная атака. Ход идёт через тот же код, что и нажатия кнопок."""
+    user = await db.get_user(uid)
+    alive = [(i, e) for i, e in enumerate(battle.get("enemies", [])) if e.get("hp", 0) > 0]
+    unlocked = get_unlocked_path_skills(user) if user else []
+    if user and user.get("auto_battle_no_skills"):
+        if battle.pop("auto_toggle", None):            # массовый скилл включал автобой — выключаем
+            battle.pop(ACTIVE_BATTLE_SKILL_KEY, None)
+        unlocked = []                                   # скиллы в автобое отключены — только обычные удары
+    if unlocked and not path_weapon_mismatch(user):
+        hp_ok = battle.get("player_hp", 0) > battle.get("player_max_hp", 1) * 0.5
+        toggles = [sk for sk in unlocked if sk in TOGGLE_BATTLE_SKILLS]
+        toggle_ok = bool(toggles) and not get_battle_skill_block_reason(user, battle, toggles[0]) and \
+            (hp_ok or get_skill_resource_cost(user, toggles[0])[0] != "hp_percent")
+        if toggle_ok and len(alive) > 1:
+            battle[ACTIVE_BATTLE_SKILL_KEY] = toggles[0]      # массовый удар по волне
+            battle["auto_toggle"] = True
+        elif battle.get(ACTIVE_BATTLE_SKILL_KEY) in TOGGLE_BATTLE_SKILLS and (len(alive) <= 1 or not toggle_ok):
+            battle.pop(ACTIVE_BATTLE_SKILL_KEY, None)          # один враг или мало HP — выключаем массовый скилл
+            battle.pop("auto_toggle", None)
+        order = [sk for sk in AUTO_SKILL_PRIORITY if sk in unlocked] + \
+                [sk for sk in unlocked if sk not in AUTO_SKILL_PRIORITY and sk not in TOGGLE_BATTLE_SKILLS]
+        for sk in order:
+            if get_battle_skill_block_reason(user, battle, sk):
+                continue
+            if get_skill_resource_cost(user, sk)[0] == "hp_percent" and not hp_ok:
+                continue
+            target = max(alive, key=lambda ie: ie[1].get("hp", 0))[0] if alive else None
+            await apply_battle_skill(fake, sk, target_idx=target)
+            return
+    await process_battle_attack(fake, None)
+
+
+class _HeadlessMessage:
+    """Сообщение-заглушка для автобосса: бой идёт без вывода в чат, любые правки — пустышки."""
+    _next_id = 10 ** 9
+
+    def __init__(self, uid: int):
+        _HeadlessMessage._next_id += 1
+        self.message_id = _HeadlessMessage._next_id
+        self.chat = types_ns(id=uid, type="private")
+        self.from_user = None
+
+    def __getattr__(self, name):
+        async def _noop(*args, **kwargs):
+            return None
+        return _noop
+
+
+def types_ns(**kw):
+    class _NS:
+        pass
+    o = _NS()
+    for k, v in kw.items():
+        setattr(o, k, v)
+    return o
 
 
 async def auto_battle_loop(uid: int, message, from_user, battle: dict):
@@ -28581,37 +31086,50 @@ async def auto_battle_loop(uid: int, message, from_user, battle: dict):
                 if battle.get("busy") or active_battles.get(uid) is not battle:
                     continue
                 try:
-                    await process_battle_attack(fake, None)
+                    await auto_battle_step(fake, uid, battle)
                 except Exception as e:
                     print(f"[auto battle] {uid}: {e}")
                     break
     finally:
         battle.pop("auto", None)
+        if battle.pop("auto_toggle", None):
+            battle.pop(ACTIVE_BATTLE_SKILL_KEY, None)  # массовый скилл включал автобой — вернуть как было
         if auto_battle_tasks.get(uid) is asyncio.current_task():
             auto_battle_tasks.pop(uid, None)
+
+
+@dp.callback_query(F.data.in_({"auto_battle_always", "auto_battle_skills"}))
+async def cb_auto_battle_always(call: CallbackQuery):
+    """Старые кнопки настроек автобоя: автобой игроков отключён."""
+    await call.answer("Автобой отключён — бей кнопкой «Атаковать».", show_alert=True)
+    await show_boss_settings(call.from_user.id, lambda t, kb: edit_for_user(call, t, kb))
+
+
+@dp.message(lambda msg: msg.text and message_command(msg) in ("автобой",))
+async def text_auto_battle_always(message: Message):
+    uid = message.from_user.id
+    if not await db.has_user(uid):
+        return
+    if uid in ADMIN_IDS:
+        await reply_to_user(message, f"{PE_CROSS} Автобой игроков отключён.\n\n"
+                                     "<blockquote>Для себя — <code>автобосс</code>: бьёт боссов без чата, "
+                                     "там же переключатель скиллов.</blockquote>")
+        return
+    await reply_to_user(message, f"{PE_CROSS} Автобой отключён — бей кнопкой «Атаковать».")
 
 
 @dp.callback_query(F.data == "battle_auto")
 async def cb_battle_auto(call: CallbackQuery):
     uid = call.from_user.id
     battle = active_battles.get(uid)
-    if not battle or battle.get("mode") != "bosses":
-        await call.answer("Автобой работает только в рейде на босса.", show_alert=True)
-        return
-    if battle.get("auto"):
-        battle["auto"] = False
-        task = auto_battle_tasks.pop(uid, None)
-        if task and not task.done():
-            task.cancel()
-        await call.answer("Автобой остановлен.")
-    else:
-        battle["auto"] = True
-        old = auto_battle_tasks.get(uid)
-        if old and not old.done():
-            old.cancel()
-        auto_battle_tasks[uid] = asyncio.create_task(auto_battle_loop(uid, call.message, call.from_user, battle))
-        await call.answer("Автобой включён — бот бьёт сам.")
-    await edit_battle_markup(call, battle_keyboard(battle))
+    task = auto_battle_tasks.pop(uid, None)
+    if task and not task.done():
+        task.cancel()
+    if battle:
+        battle.pop("auto", None)
+    await call.answer("Автобой отключён — бей кнопкой «Атаковать».", show_alert=True)
+    if battle and battle.get("mode") == "bosses":
+        await edit_battle_markup(call, battle_keyboard(battle))
 
 
 
@@ -28721,20 +31239,26 @@ async def show_daily_bonus(user_id: int, answer_func, note: str = ""):
     left = int(((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0) - now).total_seconds())
     status = (f"{PE_GIFT} <b>Награда дня {day} ждёт тебя!</b>" if can
               else f"{PE_OK} Сегодня уже забрано · следующая через <b>{format_clan_boss_time(left)}</b>")
-    text = (
-        f"{PE_CALENDAR} <b>Ежедневный бонус</b>\n\n"
-        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
-        + f"<blockquote>{status}\n"
-        f"{PE_SPARK} Серия: <b>{streak}</b> дн. подряд · всего забрано: <b>{int(d.get('total', 0))}</b></blockquote>\n\n"
-        "<blockquote expandable>" + "\n".join(track) + "</blockquote>\n\n"
-        "<i>Заходи каждый день: награда растёт, на 7-й день — сундук. Пропустишь день — серия начнётся заново. "
-        "Монеты растут вместе с тобой.</i>"
-    )
+    text = render_screen("бонус", {
+        "заметка": f"<blockquote>{note}</blockquote>\n\n" if note else "", "статус": status, "серия": streak, "всего": int(d.get('total', 0)), "дни": "\n".join(track),
+    })
     rows = []
     if can:
         rows.append([InlineKeyboardButton(text=f"Забрать награду дня {day}", callback_data="dbonus|claim", icon_custom_emoji_id="5303214794336125778")])
     rows.append([InlineKeyboardButton(text="Обновить", callback_data="dbonus|ref", icon_custom_emoji_id="5346321684574003384")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("бонус", "Ежедневный бонус", (
+    f"{PE_CALENDAR} <b>Ежедневный бонус</b>\n\n"
+    "{заметка}"
+    "<blockquote>{статус}\n"
+    f"{PE_SPARK} Серия: <b>{{серия}}</b> дн. подряд · всего забрано: <b>{{всего}}</b></blockquote>\n\n"
+    "<blockquote expandable>{дни}</blockquote>\n\n"
+    "<i>Заходи каждый день: награда растёт, на 7-й день — сундук. Пропустишь день — серия начнётся заново. "
+    "Монеты растут вместе с тобой.</i>"
+), {"заметка": "что получил", "статус": "ждёт награда / через сколько", "серия": "дней подряд",
+    "всего": "всего забрано", "дни": "награды 7 дней"})
 
 
 _daily_bonus_locks: Dict[int, asyncio.Lock] = {}
@@ -28788,7 +31312,7 @@ async def text_daily_bonus(message: Message):
 # {метки} в фигурных скобках бот подставляет сам (ресурсы, цены и т.д.).
 # Хранится в PostgreSQL (kv_state, ключ screen_templates).
 # ============================================================
-SCREEN_DEFAULTS: Dict[str, dict] = {
+SCREEN_DEFAULTS.update({
     "реликварий": {
         "title": "Реликварий (главный экран Хранителя)",
         "text": (
@@ -28830,19 +31354,7 @@ SCREEN_DEFAULTS: Dict[str, dict] = {
         "marks": {"эмодзи": "эмодзи редкости", "предмет": "название", "иконка": "иконка предмета", "редкость": "редкость",
                   "тип": "тип/слот", "статы": "урон или HP", "цена": "цена с отметками"},
     },
-}
-_screen_templates: Dict[str, str] = {}
-
-
-def register_screen(key: str, title: str, text: str, marks: Optional[dict] = None):
-    SCREEN_DEFAULTS[key] = {"title": title, "text": text, "marks": marks or {}}
-
-
-def render_screen(key: str, values: Optional[dict] = None) -> str:
-    template = _screen_templates.get(key) or SCREEN_DEFAULTS.get(key, {}).get("text", "")
-    for name, value in (values or {}).items():
-        template = template.replace("{" + name + "}", str(value))
-    return template
+})
 
 
 async def load_screen_templates():
@@ -28881,13 +31393,23 @@ def screens_list_text(note: str = "") -> str:
     return (
         "🖼 <b>Оформление экранов</b>\n\n"
         + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
-        + "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
-        "<blockquote><b>Как оформить:</b>\n"
-        "1. <code>экран реликварий шаблон</code> — пришлю текущий текст экрана\n"
-        "2. Скопируй его, укрась цитатами, жирным, премиум-эмодзи и отправь мне\n"
-        "3. Ответь на своё сообщение: <code>экран реликварий</code> — готово\n"
-        "<code>экран реликварий сброс</code> — вернуть стандартный\n\n"
-        "Слова в {фигурных скобках} не трогай — туда бот подставляет цифры. ✏️ — уже изменён.</blockquote>"
+        + "<b>Способ 1 — любой экран бота (блоками)</b>\n"
+        "<blockquote>1. Открой экран и ответь на сообщение бота: <code>экран</code>\n"
+        "2. Я покажу его блоки {1}, {2}… и пришлю заготовку\n"
+        "3. Укрась заготовку (цитаты, жирный, премиум-эмодзи, свой текст, другой порядок), отправь мне "
+        "и ответь на неё <code>экран</code>\n"
+        "Цифры внутри блоков живые. <code>экран сброс</code> — убрать.</blockquote>\n\n"
+        "<b>Способ 2 — полный текст главных экранов</b>\n"
+        "<blockquote>1. <code>экран профиль шаблон</code> — пришлю текст экрана с метками\n"
+        "2. Скопируй, меняй любые слова и оформление, отправь мне\n"
+        "3. Ответь на своё сообщение: <code>экран профиль</code>\n"
+        "<code>экран профиль сброс</code> — вернуть стандартный\n"
+        "Слова в {фигурных скобках} не трогай — туда бот подставляет данные.</blockquote>\n\n"
+        "<b>Экраны с полным шаблоном</b> (✏️ — уже изменён)\n"
+        "<blockquote expandable>" + "\n".join(lines) + "</blockquote>"
+        + (("\n\n<b>Оформлены блоками</b>\n<blockquote expandable>"
+            + "\n".join(f"• {html.escape(screen_title(s))} <code>{html.escape(s)}</code> — {', '.join(sorted(v, key=int))} бл."
+                         for s, v in _screen_blocks.items() if v) + "</blockquote>") if any(_screen_blocks.values()) else "")
     )
 
 
@@ -28899,6 +31421,8 @@ async def text_screen_admin(message: Message):
 
 
 async def screen_admin_apply(message: Message):
+    if await screen_blocks_admin(message):
+        return
     parts = (message.text or "").split(maxsplit=1)
     arg = parts[1] if len(parts) > 1 else ""
     if not arg.strip():
@@ -28944,6 +31468,282 @@ async def screen_admin_apply(message: Message):
 
 
 register_screen("хелп", "Хелп — список команд (верхний блок)", HELP_COMMANDS_TEXT)
+
+
+# ============================================================
+# === Оформление ЛЮБОГО экрана блоками ===
+# Каждый экран (функции show_*) помечается своим именем. Текст экрана делится на блоки
+# (куски между пустыми строками): {1}, {2}, {3}… Админ отвечает «экран» на сообщение бота —
+# бот показывает блоки; потом админ присылает своё оформленное сообщение с {1}, {2}…
+# (цитаты, премиум-эмодзи, свой текст, другой порядок) и отвечает на него «экран».
+# Цифры в блоках живые — бот подставляет актуальные. {-N} — скрыть блок,
+# {остальные} — куда поставить блоки, которых нет в шаблоне (без метки — в конец).
+# Шаблон хранится для конкретного числа блоков: если у экрана сейчас другое число блоков
+# (например, появилась заметка), он показывается без изменений — ничего не ломается.
+# Хранится в PostgreSQL (kv_state, ключ screen_blocks).
+# ============================================================
+import functools
+
+_cur_screen: "contextvars.ContextVar[str]" = contextvars.ContextVar("lootify_screen", default="")
+_screen_blocks: Dict[str, Dict[str, str]] = {}           # экран → {число блоков: шаблон}
+_screen_last: Dict[str, str] = {}                         # экран → последний «сырой» текст
+_screen_msg_map: "collections.OrderedDict[tuple, str]" = collections.OrderedDict()
+_screen_pick: Dict[int, str] = {}                         # админ → выбранный экран
+SCREEN_MSG_MAP_MAX = 20000
+_BLOCK_MARK_RE = re.compile(r"\{(-?\d{1,2})\}")
+
+SCREEN_TITLES: Dict[str, str] = {
+    "profile": "Профиль", "inv": "Инвентарь", "stats": "Статистика", "level": "Уровень", "rebirth": "Перерождение",
+    "clan": "Клан", "clan_members": "Участники клана", "clan_top": "Топ кланов", "clan_boss": "Лутиафан",
+    "clan_boss_ranking": "Рейтинг Лутиафана", "clan_buffs": "Баффы клана", "clan_list": "Список кланов",
+    "shop": "Магазин", "star_shop": "Донат-магазин", "top": "Топ", "boss_cooldowns": "КД боссов",
+    "boss_details": "Карточка босса", "boss_settings": "Настройки боссов", "quick_bosses": "Быстрые боссы",
+    "loot_inventory": "Склад лута", "blacksmith": "Кузнец", "skills": "Скиллы", "paths": "Пути",
+    "pets": "Питомцы", "pet_shop": "Зоомагазин", "alchemist": "Алхимик", "help": "Помощь", "guide": "Гайд",
+    "quests": "Задания", "belt": "Пояс", "trash": "Мусор", "tower": "Башня", "battle_pass": "Боевой пропуск",
+    "bestiary": "Бестиарий", "fishing": "Рыбалка", "farm": "Ферма", "tea_shop": "Чайная", "notify_settings": "Уведомления",
+    "casino_home": "Казино", "achievements": "Достижения", "titles": "Титулы", "crystal": "Кристалл",
+    "daily_bonus": "Ежедневный бонус", "relic_shop": "Реликварий", "relic_guardians": "Стражи",
+    "compass": "Лунный грааль", "sf_crystal": "Кровавый кристалл", "starfall": "Кровавая луна",
+    "auto_roll_menu": "Авторолл", "enchanter": "Зачарователь", "witch": "Ведьма", "buffs": "Баффы",
+    "rules": "Правила", "banners": "Баннеры", "armor_sets": "Сеты брони", "characteristics": "Характеристики",
+    "mannequin": "Манекены", "event": "Ивент", "online_stats": "Онлайн", "boss_revive_list": "Воскрешение боссов",
+}
+
+
+def screen_title(screen: str) -> str:
+    return SCREEN_TITLES.get(screen, screen)
+
+
+def split_screen_blocks(text: str) -> List[str]:
+    """Делит текст по пустым строкам, но только вне тегов (цитата с пустой строкой внутри — один блок)."""
+    blocks, depth, last, i = [], 0, 0, 0
+    tags = [(m.start(), m.end(), m.group(1) == "/", m.group(0).endswith("/>")) for m in _DECOR_TAG_RE.finditer(text)]
+    ti = 0
+    n = len(text)
+    while i < n:
+        if ti < len(tags) and tags[ti][0] == i:
+            s, e, closing, selfclosing = tags[ti]
+            if not selfclosing:
+                depth += -1 if closing else 1
+            i = e
+            ti += 1
+            continue
+        if depth <= 0 and text.startswith("\n\n", i):
+            j = i
+            while j < n and text[j] == "\n":
+                j += 1
+            chunk = text[last:i].strip("\n")
+            if chunk.strip():
+                blocks.append(chunk)
+            last = i = j
+            continue
+        i += 1
+    chunk = text[last:].strip("\n")
+    if chunk.strip():
+        blocks.append(chunk)
+    return blocks
+
+
+def apply_block_template(screen: str, text: str) -> str:
+    variants = _screen_blocks.get(screen)
+    if not variants or not text:
+        return text
+    blocks = split_screen_blocks(text)
+    tpl = variants.get(str(len(blocks)))
+    if not tpl:
+        return text
+    used = set()
+
+    def sub(m):
+        k = int(m.group(1))
+        used.add(abs(k))
+        if k <= 0 or k > len(blocks):
+            return ""
+        return blocks[k - 1]
+
+    def sub_quoted(m):
+        # {N} внутри своей цитаты, а блок и так цитата — берём его содержимое, чтобы не было «цитаты в цитате»
+        k = int(m.group(2))
+        used.add(k)
+        block = blocks[k - 1] if 1 <= k <= len(blocks) else ""
+        inner = re.fullmatch(r"<blockquote[^>]*>(.*)</blockquote>", block, re.S)
+        if inner and "<blockquote" not in inner.group(1):
+            block = inner.group(1)
+        return m.group(1) + block + m.group(3)
+
+    out = re.sub(r"(<blockquote[^>]*>)\s*\{(\d{1,2})\}\s*(</blockquote>)", sub_quoted, tpl)
+    out = _BLOCK_MARK_RE.sub(sub, out)
+    rest = "\n\n".join(b for i, b in enumerate(blocks, 1) if i not in used)
+    if "{остальные}" in out:
+        out = out.replace("{остальные}", rest)
+    elif rest:
+        out = out.rstrip("\n") + "\n\n" + rest
+    out = re.sub(r"\n{3,}", "\n\n", out).strip("\n")
+    if not out.strip() or not _decor_balanced(out) or len(re.sub(r"<[^>]+>", "", out)) > 4096:
+        return text  # шаблон не подошёл — показываем экран как есть
+    return out
+
+
+def screen_remember_message(screen: str, method, result):
+    try:
+        chat = getattr(getattr(result, "chat", None), "id", None) or getattr(method, "chat_id", None)
+        mid = getattr(result, "message_id", None) or getattr(method, "message_id", None)
+        if chat is None or mid is None:
+            return
+        key = (int(chat), int(mid))
+        _screen_msg_map[key] = screen
+        _screen_msg_map.move_to_end(key)
+        while len(_screen_msg_map) > SCREEN_MSG_MAP_MAX:
+            _screen_msg_map.popitem(last=False)
+    except Exception:
+        pass
+
+
+def _screen_wrap(name: str, fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        token = _cur_screen.set(name)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _cur_screen.reset(token)
+    wrapper._screen_wrapped = True
+    return wrapper
+
+
+def install_screen_tracking():
+    """Помечает все экраны show_* — после этого любой экран можно оформить блоками."""
+    g = globals()
+    count = 0
+    for name, fn in list(g.items()):
+        if name.startswith("show_") and asyncio.iscoroutinefunction(fn) and not getattr(fn, "_screen_wrapped", False):
+            g[name] = _screen_wrap(name[5:], fn)
+            count += 1
+    return count
+
+
+async def load_screen_blocks():
+    global _screen_blocks
+    try:
+        data = await load_kv("screen_blocks") or {}
+        raw = data.get("screens") or {}
+        _screen_blocks = {str(s): {str(n): str(t) for n, t in (v or {}).items() if t}
+                          for s, v in raw.items() if isinstance(v, dict)}
+    except Exception as e:
+        print(f"[screen blocks] load: {e}")
+        _screen_blocks = {}
+
+
+async def save_screen_blocks():
+    try:
+        await save_kv("screen_blocks", {"screens": _screen_blocks})
+    except Exception as e:
+        print(f"[screen blocks] save: {e}")
+
+
+def _block_preview(block: str, limit: int = 70) -> str:
+    plain = re.sub(r"<[^>]+>", "", block).replace("\n", " · ")
+    plain = html.unescape(plain).strip()
+    if len(plain) > limit:
+        plain = plain[:limit - 1] + "…"
+    return html.escape(plain)
+
+
+def screen_blocks_text(screen: str, note: str = "") -> str:
+    raw = _screen_last.get(screen, "")
+    blocks = split_screen_blocks(raw) if raw else []
+    variants = _screen_blocks.get(screen) or {}
+    lines = [f"<code>{{{i}}}</code> {_block_preview(b)}" for i, b in enumerate(blocks, 1)] or ["<i>Открой этот экран ещё раз — я запомню его блоки.</i>"]
+    have = ", ".join(f"{n} бл." for n in sorted(variants, key=int)) or "нет"
+    return (
+        f"🖼 <b>Экран «{html.escape(screen_title(screen))}»</b> · <code>{html.escape(screen)}</code>\n\n"
+        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
+        + f"<b>Блоки сейчас ({len(blocks)})</b>\n<blockquote expandable>" + "\n".join(lines) + "</blockquote>\n\n"
+        f"<blockquote>Свои шаблоны: <b>{have}</b>{' · сейчас ' + str(len(blocks)) + ' бл. — ' + ('✅ есть' if str(len(blocks)) in variants else 'нет') if blocks else ''}</blockquote>\n\n"
+        "<blockquote><b>Как оформить:</b>\n"
+        "1. Ниже пришлю заготовку — скопируй её\n"
+        "2. Укрась: цитаты, жирный, премиум-эмодзи, свой текст, другой порядок блоков\n"
+        "3. Отправь мне и ответь на своё сообщение: <code>экран</code>\n\n"
+        "<code>{2}</code> — вставить блок 2 (цифры в нём живые) · <code>{-3}</code> — скрыть блок 3\n"
+        "<code>{остальные}</code> — куда поставить блоки, которых нет в шаблоне (иначе — в конец)\n"
+        "<code>экран сброс</code> — убрать оформление этого экрана\n\n"
+        "<i>Шаблон действует, пока у экрана столько же блоков. Если блоков станет больше или меньше "
+        "(например, появилась заметка), экран покажется обычным — оформи и этот вариант.</i></blockquote>"
+    )
+
+
+async def screen_blocks_admin(message: Message) -> bool:
+    """«экран» без имени. True — обработано здесь."""
+    uid = message.from_user.id
+    parts = (message.text or "").split(maxsplit=1)
+    arg = (parts[1] if len(parts) > 1 else "").strip().casefold()
+    src = message.reply_to_message
+    bot_id = getattr(NOTIFY_BOT, "id", None)
+    from_bot = bool(src and src.from_user and (src.from_user.is_bot or src.from_user.id == bot_id))
+    if src and from_bot and not arg:
+        screen = _screen_msg_map.get((src.chat.id, src.message_id))
+        if not screen:
+            await reply_to_user(message, f"{PE_CROSS} Не знаю, что это за экран. Открой его заново (кнопкой или командой) и ответь <code>экран</code> на новое сообщение.")
+            return True
+        _screen_pick[uid] = screen
+        await reply_to_user(message, screen_blocks_text(screen))
+        raw = _screen_last.get(screen, "")
+        blocks = split_screen_blocks(raw) if raw else []
+        current = (_screen_blocks.get(screen) or {}).get(str(len(blocks)))
+        draft = current or "\n\n".join(f"{{{i}}}" for i in range(1, len(blocks) + 1))
+        if draft:
+            try:
+                await message.answer(draft, parse_mode="HTML")
+            except Exception:
+                await message.answer(html.escape(draft), parse_mode="HTML")
+        return True
+    screen = _screen_pick.get(uid)
+    if arg in ("сброс", "reset", "убрать"):
+        if not screen:
+            await reply_to_user(message, f"{PE_CROSS} Сначала ответь <code>экран</code> на нужный экран бота.")
+            return True
+        _screen_blocks.pop(screen, None)
+        await save_screen_blocks()
+        await reply_to_user(message, screen_blocks_text(screen, f"{PE_OK} Оформление экрана убрано."))
+        return True
+    if src and not from_bot and not arg:
+        if not screen:
+            await reply_to_user(message, f"{PE_CROSS} Сначала ответь <code>экран</code> на нужный экран бота — так я пойму, что оформляем.")
+            return True
+        tpl = src.html_text if src.text else (src.caption or "")
+        if not tpl or not _BLOCK_MARK_RE.search(tpl):
+            await reply_to_user(message, f"{PE_CROSS} В шаблоне нет ни одного блока вида <code>{{1}}</code>.")
+            return True
+        if not _decor_balanced(tpl):
+            await reply_to_user(message, f"{PE_CROSS} Не получилось разобрать оформление.")
+            return True
+        raw = _screen_last.get(screen, "")
+        n = len(split_screen_blocks(raw)) if raw else 0
+        if n <= 0:
+            await reply_to_user(message, f"{PE_CROSS} Открой экран «{html.escape(screen_title(screen))}» ещё раз — я не помню его блоки.")
+            return True
+        old = dict(_screen_blocks.get(screen) or {})
+        _screen_blocks.setdefault(screen, {})[str(n)] = tpl
+        preview = apply_block_template(screen, raw)
+        try:
+            token = _cur_screen.set("")
+            try:
+                await message.answer(apply_decor_text(preview), parse_mode="HTML")  # превью и проверка разметки
+            finally:
+                _cur_screen.reset(token)
+        except Exception as e:
+            if old:
+                _screen_blocks[screen] = old
+            else:
+                _screen_blocks.pop(screen, None)
+            await reply_to_user(message, f"{PE_CROSS} Telegram не принял оформление: {html.escape(str(e))}")
+            return True
+        await save_screen_blocks()
+        await reply_to_user(message, f"{PE_OK} Экран «{html.escape(screen_title(screen))}» оформлен (вариант на {n} бл.) — выше превью с текущими данными.")
+        return True
+    return False
+
 
 
 async def show_relic_guardians(user_id: int, answer_func):
@@ -29006,20 +31806,20 @@ RELIC_NPC_EMOJI = '<tg-emoji emoji-id="5287734091523829559">🔮</tg-emoji>'
 RELIC_SHOP = {
     "ancient": {
         "level": 60,
-        "weapon": {"coins": 300_000_000, "res": {"ancient_relic": 2_000}},
-        "armor": {"coins": 150_000_000, "res": {"ancient_relic": 1_200}},
+        "weapon": {"coins": 150_000_000, "res": {"ancient_relic": 1_000}},
+        "armor": {"coins": 75_000_000, "res": {"ancient_relic": 600}},
         "hint": "Реликвии — со Стража праотцов (стражи) и Лутиафана",
     },
     "divine": {
         "level": 110,
-        "weapon": {"coins": 3_000_000_000, "res": {"divine_spark": 1_400, "ancient_relic": 2_000}},
-        "armor": {"coins": 1_500_000_000, "res": {"divine_spark": 840, "ancient_relic": 1_200}},
+        "weapon": {"coins": 1_500_000_000, "res": {"divine_spark": 700, "ancient_relic": 1_000}},
+        "armor": {"coins": 750_000_000, "res": {"divine_spark": 420, "ancient_relic": 600}},
         "hint": "Искры — с Серафима-хранителя (стражи), Лутиафана и мирового босса",
     },
     "primordial": {
         "level": 160,
-        "weapon": {"coins": 20_000_000_000, "res": {"primordial_core": 400, "divine_spark": 2_000}},
-        "armor": {"coins": 10_000_000_000, "res": {"primordial_core": 240, "divine_spark": 1_200}},
+        "weapon": {"coins": 10_000_000_000, "res": {"primordial_core": 200, "divine_spark": 1_000}},
+        "armor": {"coins": 5_000_000_000, "res": {"primordial_core": 120, "divine_spark": 600}},
         "hint": "Ядра — с Первородного Колосса (стражи) и мирового босса",
     },
 }
@@ -29094,7 +31894,7 @@ def relic_cost_lines(user: dict, cost: dict) -> List[str]:
 def relic_bar(have: int, need: int, width: int = 10) -> str:
     filled = width if need <= 0 else max(0, min(width, int(width * have / need)))
     pct = 100 if need <= 0 else min(100, int(100 * have / need))
-    return "▰" * filled + "▱" * (width - filled) + f" {pct}%"
+    return pe_bar("gold", filled, width, "▰" * filled + "▱" * (width - filled)) + f" {pct}%"
 
 
 def relic_preview_stats(user: dict, rarity: str, kind: str, d: dict, slot: Optional[str] = None) -> str:
@@ -29613,12 +32413,15 @@ def apply_decor_markup(markup):
     for row in markup.inline_keyboard:
         new_row = []
         for btn in row:
-            if not getattr(btn, "icon_custom_emoji_id", None) and isinstance(btn.text, str):
+            # правило админа важнее встроенной иконки — поэтому меняем и кнопки, у которых иконка уже есть
+            if isinstance(btn.text, str):
                 bare = _strip_leading_emoji(btn.text)
-                low = bare.casefold()
+                low = bare.casefold().replace("ё", "е")
                 for rule in _decor_buttons:
-                    t = rule["text"].casefold()
+                    t = rule["text"].casefold().replace("ё", "е")
                     if low == t or low.startswith(t + " "):
+                        if getattr(btn, "icon_custom_emoji_id", None) == rule["icon"] and bare == btn.text:
+                            break
                         btn = btn.model_copy(update={"text": bare or btn.text, "icon_custom_emoji_id": rule["icon"]})
                         changed = True
                         break
@@ -29648,19 +32451,226 @@ class SafeCallbackAnswerMiddleware(BaseRequestMiddleware):
             raise
 
 
+DECOR_MAX_PREMIUM = 100
+
+# === Общий лимит запросов к Telegram + журнал флуда (команда «флуд») ===
+# Все отправки и правки (бои, уведомления, ответы) идут через одну «воронку» — не больше
+# BOT_SEND_PER_SEC в секунду, чтобы Telegram не включал флуд-лимит на весь бот.
+BOT_SEND_PER_SEC = 25
+_bot_send_times: "collections.deque" = collections.deque()
+_bot_send_lock: Optional[asyncio.Lock] = None   # создаётся внутри работающего цикла (важно для старых Python)
+_bot_flood_until = 0.0                      # (совместимость) короткая общая пауза отправок
+# Долгий бан Telegram («подожди N часов») почти всегда касается ОДНОГО чата (игрок, группа, канал):
+# этому чату бот не пишет/не правит до конца бана (попытки бан продлевают), остальные работают как обычно.
+# Бан на весь бот включается, только если долгие баны пришли сразу в нескольких разных чатах.
+# Баны сохраняются в базе — перезапуск их не сбрасывает. «флуд сброс» — снять вручную.
+FLOOD_BAN_MIN = 60
+FLOOD_GLOBAL_CHATS = 3                      # столько разных чатов с долгим баном за FLOOD_GLOBAL_WINDOW → бан на весь бот
+FLOOD_GLOBAL_WINDOW = 120
+_flood_ban: Dict[str, float] = {}           # семейство → окончание бана на весь бот
+_chat_ban: Dict[str, float] = {}            # "семейство:чат" → окончание бана чата
+_long_ban_events: "collections.deque" = collections.deque(maxlen=50)   # (время, семейство, чат)
+
+
+class FloodPaused(Exception):
+    pass
+
+
+def _flood_family(mname: str) -> Optional[str]:
+    if mname.startswith(("Send", "Copy", "Forward")):
+        return "send"
+    if mname.startswith("Edit"):
+        return "edit"
+    return None
+
+
+def flood_ban_left(family: str) -> int:
+    return max(0, int(_flood_ban.get(family, 0) - time.time()))
+
+
+def chat_ban_left(family: str, chat) -> int:
+    return max(0, int(_chat_ban.get(f"{family}:{chat}", 0) - time.time()))
+
+
+async def _save_flood_ban():
+    try:
+        now = time.time()
+        await save_kv("flood_ban2", {"global": {k: v for k, v in _flood_ban.items() if v > now},
+                                     "chats": {k: v for k, v in _chat_ban.items() if v > now}})
+    except Exception as e:
+        print(f"[flood ban] save: {e}")
+
+
+async def load_flood_ban():
+    # старый формат («flood_ban») не читаем: там бан одного чата ошибочно считался баном всего бота
+    try:
+        data = await load_kv("flood_ban2") or {}
+        now = time.time()
+        _flood_ban.update({k: float(v) for k, v in (data.get("global") or {}).items() if float(v) > now})
+        _chat_ban.update({k: float(v) for k, v in (data.get("chats") or {}).items() if float(v) > now})
+        for fam, until in _flood_ban.items():
+            print(f"[flood ban] весь бот ({fam}): ещё {int(until - now)} с")
+        if _chat_ban:
+            print(f"[flood ban] чатов с баном: {len(_chat_ban)}")
+    except Exception as e:
+        print(f"[flood ban] load: {e}")
+
+
+def _register_long_ban(family: str, chat, retry: float):
+    now = time.time()
+    _chat_ban[f"{family}:{chat}"] = max(_chat_ban.get(f"{family}:{chat}", 0), now + retry + 5)
+    _long_ban_events.append((now, family, str(chat)))
+    chats = {c for t, f, c in _long_ban_events if f == family and now - t <= FLOOD_GLOBAL_WINDOW}
+    if len(chats) >= FLOOD_GLOBAL_CHATS:
+        until = min(retry, 3600)   # на весь бот — не дольше часа, дальше проверим снова
+        _flood_ban[family] = max(_flood_ban.get(family, 0), now + until + 5)
+        print(f"[flood ban] долгие баны в {len(chats)} чатах — пауза всего бота ({family}) на {int(until)} с")
+    else:
+        print(f"[flood ban] чат {chat} ({family}): Telegram запретил на {int(retry)} с — остальные чаты работают")
+    try:
+        asyncio.get_running_loop().create_task(_save_flood_ban())
+    except RuntimeError:
+        pass
+_flood_log: "collections.deque" = collections.deque(maxlen=40)        # (время, метод, чат, секунд)
+_req_log: "collections.deque" = collections.deque(maxlen=50000)       # (время, метод)
+_req_fail_log: "collections.deque" = collections.deque(maxlen=40)     # (время, метод, ошибка)
+
+
+def _is_send_method(name: str) -> bool:
+    return name.startswith(("Send", "Edit", "Copy", "Forward", "Delete"))
+
+
+async def _bot_send_slot():
+    global _bot_send_lock
+    if _bot_send_lock is None:
+        _bot_send_lock = asyncio.Lock()
+    while True:
+        async with _bot_send_lock:
+            now = time.monotonic()
+            while _bot_send_times and now - _bot_send_times[0] > 1.0:
+                _bot_send_times.popleft()
+            wait = _bot_flood_until - now
+            if len(_bot_send_times) >= BOT_SEND_PER_SEC:
+                wait = max(wait, 1.0 - (now - _bot_send_times[0]))
+            if wait <= 0:
+                _bot_send_times.append(now)
+                return
+        await asyncio.sleep(min(wait, 5.0) + 0.01)
+
+
+def flood_report_text() -> str:
+    now = time.time()
+    recent = [(t, m) for t, m in _req_log if now - t <= 300]
+    by = collections.Counter(m for _t, m in recent)
+    per_min = len([1 for t, _m in recent if now - t <= 60])
+    top = "\n".join(f"<code>{html.escape(m)}</code> — {n}" for m, n in by.most_common(8)) or "—"
+    floods = "\n".join(
+        f"{datetime.fromtimestamp(t + 3 * 3600, timezone.utc).replace(tzinfo=None).strftime('%H:%M:%S')} · <code>{html.escape(m)}</code> · чат {c} · {r} с"
+        for t, m, c, r in list(_flood_log)[-10:][::-1]) or "не было"
+    fails = "\n".join(
+        f"{datetime.fromtimestamp(t + 3 * 3600, timezone.utc).replace(tzinfo=None).strftime('%H:%M:%S')} · <code>{html.escape(m)}</code> · {html.escape(e[:80])}"
+        for t, m, e in list(_req_fail_log)[-8:][::-1]) or "не было"
+    pause = max(0, int(_bot_flood_until - time.monotonic()))
+    bans = [f"весь бот, {'новые сообщения' if f == 'send' else 'правки'}: ещё <b>{format_clan_boss_time(flood_ban_left(f))}</b>"
+            for f in ("send", "edit") if flood_ban_left(f) > 0]
+    bans += [f"чат {html.escape(k.split(':', 1)[1])}, {'сообщения' if k.startswith('send') else 'правки'}: ещё "
+             f"<b>{format_clan_boss_time(int(v - now))}</b>" for k, v in sorted(_chat_ban.items(), key=lambda kv: -kv[1])[:6] if v > now]
+    return (
+        f"{PE_ALARM} <b>Запросы к Telegram</b>\n\n"
+        f"<blockquote>За минуту: <b>{per_min}</b> · за 5 минут: <b>{len(recent)}</b>\n"
+        f"Лимит воронки: <b>{BOT_SEND_PER_SEC}</b>/с" + (f"\n{PE_HOURGLASS} Пауза всего бота: <b>{pause} с</b>" if pause else "")
+        + "".join(f"\n{PE_CROSS} Бан — {b}" for b in bans) + "</blockquote>\n\n"
+        f"<b>Чаще всего (5 мин)</b>\n<blockquote expandable>{top}</blockquote>\n\n"
+        f"<b>Флуд-лимиты (МСК)</b>\n<blockquote expandable>{floods}</blockquote>\n\n"
+        f"<b>Другие ошибки</b>\n<blockquote expandable>{fails}</blockquote>\n\n"
+        "<i><code>флуд сброс</code> — снять все баны (бот снова попробует писать в эти чаты)</i>"
+    )
+
+
+@dp.message(lambda msg: msg.text and message_command(msg) in ("флуд", "лимиты"))
+async def text_flood_report(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    words = (message.text or "").casefold().split()
+    if len(words) > 1 and words[1] in ("сброс", "снять", "reset"):
+        _flood_ban.clear()
+        _chat_ban.clear()
+        _long_ban_events.clear()
+        await _save_flood_ban()
+        await reply_to_user(message, f"{PE_OK} Все баны сняты.\n\n" + flood_report_text())
+        return
+    await reply_to_user(message, flood_report_text())
+
+
 class DecorRequestMiddleware(BaseRequestMiddleware):
     async def __call__(self, make_request, bot, method):
+        global _bot_flood_until
+        mname = type(method).__name__
+        family = _flood_family(mname)
+        if family and _flood_ban.get(family, 0) > time.time():
+            raise FloodPaused(f"флуд-бан Telegram ({family}), осталось {flood_ban_left(family)} с")
+        if family and _chat_ban:
+            left = chat_ban_left(family, getattr(method, "chat_id", ""))
+            if left > 0:
+                raise FloodPaused(f"флуд-бан чата {getattr(method, 'chat_id', '')} ({family}), осталось {left} с")
+        if _is_send_method(mname) and mname != "DeleteWebhook":
+            try:
+                await _bot_send_slot()
+            except Exception as e:
+                print(f"[send funnel] {e}")   # воронка никогда не должна мешать отправке
+        _req_log.append((time.time(), mname))
+        originals = {attr: getattr(method, attr, None) for attr in ("text", "caption")}
         try:
-            if _decor_compiled and str(getattr(method, "parse_mode", "") or "").upper() == "HTML":
+            screen = _cur_screen.get()
+            is_html = str(getattr(method, "parse_mode", "") or "").upper() == "HTML"
+            if screen and is_html:
+                for attr in ("text", "caption"):
+                    value = getattr(method, attr, None)
+                    if isinstance(value, str) and value:
+                        _screen_last[screen] = value
+                        if screen in _screen_blocks:
+                            _decor_set(method, attr, apply_block_template(screen, value))
+            if _decor_compiled and is_html:
                 for attr in ("text", "caption"):
                     value = getattr(method, attr, None)
                     if isinstance(value, str):
-                        _decor_set(method, attr, apply_decor_text(value))
+                        new_value = apply_decor_text(value)
+                        # Telegram показывает максимум 100 премиум-эмодзи — если замены перебьют лимит, шлём как было
+                        if new_value.count("<tg-emoji") > DECOR_MAX_PREMIUM >= value.count("<tg-emoji"):
+                            new_value = value
+                        _decor_set(method, attr, new_value)
             if _decor_buttons and getattr(method, "reply_markup", None) is not None:
                 _decor_set(method, "reply_markup", apply_decor_markup(method.reply_markup))
         except Exception as e:
             print(f"[decor] {e}")
-        return await make_request(bot, method)
+        try:
+            result = await make_request(bot, method)
+        except Exception as e:
+            retry = getattr(e, "retry_after", None)
+            if retry:
+                _flood_log.append((time.time(), mname, getattr(method, "chat_id", None), retry))
+                chat = getattr(method, "chat_id", None)
+                if family and float(retry) >= FLOOD_BAN_MIN:
+                    _register_long_ban(family, chat, float(retry))   # не стучимся в этот чат до конца бана
+                raise
+            err = str(e).lower()
+            if "not modified" not in err and "query is too old" not in err:
+                _req_fail_log.append((time.time(), mname, str(e)))
+            changed = [a for a, v in originals.items() if isinstance(v, str) and getattr(method, a, None) != v]
+            if not changed or "entit" not in err:
+                raise
+            # оформление сломало разметку (например, цитата в цитате) — отправляем экран как был
+            print(f"[decor] откат оформления: {e}")
+            for attr in changed:
+                _decor_set(method, attr, originals[attr])
+            result = await make_request(bot, method)
+        try:
+            screen = _cur_screen.get()
+            if screen and (getattr(method, "text", None) or getattr(method, "caption", None)):
+                screen_remember_message(screen, method, result)
+        except Exception:
+            pass
+        return result
 
 
 async def load_decor_rules():
@@ -29712,7 +32722,7 @@ def decor_buttons_text(note: str = "") -> str:
         + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
         + "<blockquote expandable>" + "\n".join(lines) + "</blockquote>\n\n"
         "<blockquote><code>кнопка Назад</code> + премиум-эмодзи в том же сообщении (или ответом на сообщение с ним) — "
-        "у всех кнопок «Назад» появится эта иконка (обычный эмодзи в начале кнопки уберётся).\n"
+        "у всех кнопок «Назад» появится эта иконка (обычный эмодзи в начале кнопки уберётся, старая иконка заменится).\n"
         "Подходят и кнопки с хвостом: правило «Склад» сработает на «Склад (5)».\n"
         "<code>кнопка удалить 2</code> — убрать</blockquote>"
     )
@@ -29810,7 +32820,15 @@ SF_POINTS_CRYSTAL_LEVEL = 15   # за каждый уровень кристал
 SF_FEED_COOLDOWN = 3600          # подпитка Кровавого кристалла — раз в час, только во время ивента
 SF_FEED_POINTS = 8               # очков ивента за подпитку
 SF_CRYSTAL_NAME = "Кровавый кристалл"
-SF_CRYSTAL_STAGES = [50, 140, 280, 480, 750, 1100, 1550, 2100, 2700, 3400]   # под ~30 игроков и неделю ивента
+SF_CRYSTAL_STAGES = [30, 80, 150, 240, 350, 480, 600, 720, 850, 1000]   # под небольшой онлайн (~10 вкладчиков)
+SF_FEED_CHARGE = 3               # заряда за одну подпитку
+SF_FINAL_DAY_MULT = 4            # в последние сутки ивента подпитка даёт ×4 заряда (рывок к финалу)
+
+
+def sf_feed_charge() -> int:
+    """Сколько заряда даёт подпитка прямо сейчас (в последние 24 ч ивента — больше)."""
+    left = float(_sf_state.get("until", 0) or 0) - time.time()
+    return SF_FEED_CHARGE * (SF_FINAL_DAY_MULT if 0 < left <= 24 * 3600 else 1)
 SF_POINTS_RUIN_WIN = 5         # за победу над стражем руин кристалла
 SF_POINTS_BOSS = {"swamp": 3, "desert": 6, "forest": 12, "rift": 25, "volcano": 40,
                   "glacier": 60, "citadel": 90, "sanctuary": 150}
@@ -30059,7 +33077,7 @@ def sf_fmt_left(seconds: int) -> str:
 
 def sf_bar(frac: float, width: int = 10) -> str:
     filled = max(0, min(width, int(round(width * frac))))
-    return "▰" * filled + "▱" * (width - filled)
+    return pe_bar("indigo", filled, width, "▰" * filled + "▱" * (width - filled))
 
 
 def compass_chest_perks(level: int) -> str:
@@ -30093,7 +33111,7 @@ async def show_compass(user_id: int, answer_func, note: str = ""):
             f"{SF_COMPASS_EMOJI} <b>Л У Н Н Ы Й   Г Р А А Л Ь</b> {SF_COMPASS_EMOJI}\n"
             f"<i>Чаша, которую луна дарит лишь самым упорным.</i>\n\n"
             f"<blockquote>{PE_SKULL} У тебя его пока нет.\n"
-            f"Грааль получают <b>топ-{SF_WINNERS}</b> ивента {SF_EMOJI} «{SF_NAME}».</blockquote>\n\n"
+            f"Грааль достался победителям ивента {SF_EMOJI} «{SF_NAME}». Сейчас получить его нельзя.</blockquote>\n\n"
             f"{PE_SPARK} <b>Что умеет грааль</b>\n"
             f"<blockquote>{SF_GAME_ICONS['chest']} Мини-игры, в которых добывается {SF_PARTICLE} лунная пыль\n"
             f"{SF_PE_FIND} Дополнительная добыча с боссов — до <b>{compass_extra_find_chance(COMPASS_MAX_LEVEL)}%</b>\n"
@@ -30103,8 +33121,7 @@ async def show_compass(user_id: int, answer_func, note: str = ""):
             f"{SF_PARTICLE} Алтарь луны: эссенция → лунная пыль\n"
             f"{PE_LEVELUP} Растёт до <b>{COMPASS_MAX_LEVEL}</b> уровня за лунную пыль</blockquote>"
         )
-        await answer_func(text, InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=f"Ивент «{SF_NAME}»", callback_data="sf|event", icon_custom_emoji_id=SF_EMOJI_ID)]]))
+        await answer_func(text, None)
         return
     particles = int(c["particles"])
     if level < COMPASS_MAX_LEVEL:
@@ -30131,13 +33148,10 @@ async def show_compass(user_id: int, answer_func, note: str = ""):
     games_left = sum(sf_plays_left(user, g) for g in SF_GAME_LIMITS)
     games_line = (f"{SF_PE_DICE} Мини-игры — {ru_plural(games_left, 'осталась', 'осталось', 'осталось')} <b>{games_left}</b> {ru_plural(games_left, 'попытка', 'попытки', 'попыток')}"
                   + (f" · ритуал {PE_OK}" if plays.get("ritual") else ""))
-    text = (
-        f"{SF_COMPASS_EMOJI} <b>Л У Н Н Ы Й   Г Р А А Л Ь</b> {SF_COMPASS_EMOJI}\n"
-        f"<i>Уровень {level} из {COMPASS_MAX_LEVEL}</i>\n\n"
-        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
-        + f"<blockquote>{up_block}</blockquote>\n\n"
-        f"{SF_PE_CRYSTAL} <b>Сейчас</b>\n<blockquote>{gift_line}\n{bless_line}\n{games_line}</blockquote>"
-    )
+    text = render_screen("грааль", {
+        "уровень": level, "заметка": f"<blockquote>{note}</blockquote>\n\n" if note else "",
+        "пыль": up_block, "дар": gift_line, "благословение": bless_line, "игры": games_line,
+    })
     ready = lambda left: "5325762861539016690" if left <= 0 else None
     rows = [
         [InlineKeyboardButton(text="Дар луны" if chest_left <= 0 else f"Дар · {sf_fmt_left(chest_left)}",
@@ -30152,12 +33166,21 @@ async def show_compass(user_id: int, answer_func, note: str = ""):
         rows.append([InlineKeyboardButton(text=f"Пробудить · {format_num(cost)} {SF_PARTICLE_PLAIN}", callback_data="sf|up",
                                           icon_custom_emoji_id="5325762861539016690" if particles >= cost else "5296369303661067030")])
     ntf_on = c.get("notify", True)
-    rows.append([InlineKeyboardButton(text="Сила грааля", callback_data="sf|power", icon_custom_emoji_id="5287734091523829559"),
-                 InlineKeyboardButton(text=f"«{SF_NAME}»", callback_data="sf|event", icon_custom_emoji_id=SF_EMOJI_ID)])
+    rows.append([InlineKeyboardButton(text="Сила грааля", callback_data="sf|power", icon_custom_emoji_id="5287734091523829559")])
     rows.append([InlineKeyboardButton(text="Уведомления: вкл" if ntf_on else "Уведомления: выкл", callback_data="sf|ntf",
                                       icon_custom_emoji_id="5325762861539016690" if ntf_on else "5352669272575321097"),
                  InlineKeyboardButton(text="Обновить", callback_data="sf|main", icon_custom_emoji_id="5346321684574003384")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("грааль", "Лунный грааль (у владельца)", (
+    f"{SF_COMPASS_EMOJI} <b>Л У Н Н Ы Й   Г Р А А Л Ь</b> {SF_COMPASS_EMOJI}\n"
+    f"<i>Уровень {{уровень}} из {COMPASS_MAX_LEVEL}</i>\n\n"
+    "{заметка}"
+    "<blockquote>{пыль}</blockquote>\n\n"
+    f"{SF_PE_CRYSTAL} <b>Сейчас</b>\n<blockquote>{{дар}}\n{{благословение}}\n{{игры}}</blockquote>"
+), {"уровень": "уровень грааля", "заметка": "результат действия", "пыль": "лунная пыль и прогресс",
+    "дар": "строка «Дар луны»", "благословение": "строка благословения", "игры": "строка мини-игр"})
 
 
 async def show_grail_games(user_id: int, answer_func, note: str = "", replay: Optional[str] = None):
@@ -30265,7 +33288,7 @@ def sf_crystal_progress() -> tuple:
     return stage, charge, need, (charge - prev) / max(1, need - prev)
 
 
-def sf_crystal_stage_reward(user: dict, stage: int) -> List[str]:
+def sf_crystal_stage_reward(user: dict, stage: int, user_id: int = 0) -> List[str]:
     got = []
     # осколки гравировки: чем выше ступень, тем старше осколки
     shard_id, shard_n = (("engraving_shard_2", 2 + stage) if stage <= 3 else
@@ -30282,9 +33305,9 @@ def sf_crystal_stage_reward(user: dict, stage: int) -> List[str]:
         finfo = BOSS_RESOURCE_DEFS.get(frag_id, {})
         got.append(f"{finfo.get('emoji', '🧩')} {finfo.get('name', frag_id)}: +{frag_n}")
     if stage >= len(SF_CRYSTAL_STAGES):
-        normalize_pet_eggs(user)
-        user["pet_eggs"]["abyss_egg"] = int(user["pet_eggs"].get("abyss_egg", 0)) + 1
-        got.append(f"{PET_EGGS['abyss_egg'].get('shop_emoji', '🥚')} <b>{PET_EGGS['abyss_egg']['name']}</b> — открой в «яйца»")
+        pet = hatch_pet_now(user_id, user, "abyss_egg")   # яйцо открывается сразу
+        if pet:
+            got.append(pet_hatch_line(pet, "abyss_egg"))
     line = give_star_boss_res(user, 1 + stage // 3)
     if line:
         got.append(line)
@@ -30313,7 +33336,7 @@ async def sf_crystal_stage_up(stage: int):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=SF_CRYSTAL_NAME, callback_data="sf|crys", icon_custom_emoji_id="5287734091523829559")]])
     for uid_str, u in contributors:
-        got = sf_crystal_stage_reward(u, stage)
+        got = sf_crystal_stage_reward(u, stage, int(uid_str))
         try:
             await db.save_user(int(uid_str), u)
             await send_user_notification(
@@ -30334,23 +33357,25 @@ _sf_crystal_lock = asyncio.Lock()
 
 
 async def sf_feed(user: dict) -> List[str]:
-    """Подпитка общего кристалла: +1 заряд, очки ивента; при новой ступени — награда всем вкладчикам."""
+    """Подпитка общего кристалла: +SF_FEED_CHARGE заряда, очки ивента; при новой ступени — награда всем вкладчикам."""
     async with _sf_crystal_lock:
         cr = sf_crystal()
-        cr["charge"] = int(cr["charge"]) + 1
+        gain = sf_feed_charge()
+        cr["charge"] = int(cr["charge"]) + gain
         d = user.get("sf_feed")
         if not isinstance(d, dict) or d.get("id") != _sf_state.get("id"):
             d = {"id": _sf_state.get("id"), "n": 0}
             user["sf_feed"] = d
         d["n"] = int(d["n"]) + 1
         user["sf_feed_at"] = time.time()
+        user["sf_feed_notified"] = False   # через час придёт ЛС «можно подпитать»
         starfall_add_points(user, SF_FEED_POINTS)
         new_stages = []
         while int(cr["stage"]) < len(SF_CRYSTAL_STAGES) and int(cr["charge"]) >= SF_CRYSTAL_STAGES[int(cr["stage"])]:
             cr["stage"] = int(cr["stage"]) + 1
             new_stages.append(int(cr["stage"]))
         await save_starfall_state()
-    out = [f"{SF_PE_CRYSTAL} Заряд кристалла: +1 (всего {format_num(cr['charge'])})",
+    out = [f"{SF_PE_CRYSTAL} Заряд кристалла: +{gain} (всего {format_num(cr['charge'])})",
            f"{SF_PE_STAR} Очки ивента: +{SF_FEED_POINTS}"]
     for st in new_stages:
         out.append(f"{PE_TROPHY} Кристалл достиг <b>{st}-й ступени</b> — награда ушла всем вкладчикам!")
@@ -30370,7 +33395,7 @@ def sf_stage_reward_preview(stage: int) -> str:
     if stage >= 6:
         parts.append("зелье удачи")
     if stage >= len(SF_CRYSTAL_STAGES):
-        parts.append("Яйцо Бездны")
+        parts.append("питомец из Яйца Бездны")
     return ", ".join(parts)
 
 
@@ -30389,7 +33414,7 @@ async def show_sf_crystal(user_id: int, answer_func, note: str = ""):
                        f"<blockquote>{sf_stage_reward_preview(stage + 1)}"
                        + "\n<i>+ лунная пыль владельцам грааля</i></blockquote>\n\n")
     else:
-        prog = f"{PE_TROPHY} <b>Кристалл полностью заряжен!</b>\nВсе 10 ступеней пройдены, Яйцо Бездны роздано."
+        prog = f"{PE_TROPHY} <b>Кристалл полностью заряжен!</b>\nВсе 10 ступеней пройдены, питомцы из Яйца Бездны розданы."
         next_reward = ""
     # лестница ступеней
     ladder = []
@@ -30415,30 +33440,42 @@ async def show_sf_crystal(user_id: int, answer_func, note: str = ""):
     if not active:
         feed_line = f"{PE_SKULL} Кристалл спит до следующей Кровавой луны"
     elif left <= 0:
-        feed_line = f"{PE_OK} <b>Можно подпитать!</b> +1 заряд и +{SF_FEED_POINTS} очков ивента"
+        feed_line = f"{PE_OK} <b>Можно подпитать!</b> +{sf_feed_charge()} заряда" + (" (последние сутки — ×" + str(SF_FINAL_DAY_MULT) + ")" if sf_feed_charge() > SF_FEED_CHARGE else "") + f" и +{SF_FEED_POINTS} очков ивента"
     else:
         feed_line = f"{PE_HOURGLASS} Следующая подпитка через <b>{sf_fmt_left(left)}</b>"
     me_line = (f"{SF_PE_STAR} Твои подпитки: <b>{my}</b> · вкладчиков всего: <b>{len(feeders)}</b>"
                + ("" if my else f"\n<i>Подпитай хотя бы раз — и получишь награду каждой следующей ступени.</i>"))
-    text = (
-        f"{SF_PE_CRYSTAL} <b>К Р О В А В Ы Й   К Р И С Т А Л Л</b> {SF_PE_CRYSTAL}\n"
-        f"<i>Один на всех. Чем чаще его кормят, тем щедрее он ко всем.</i>\n\n"
-        + (f"<blockquote>{note}</blockquote>\n\n" if note else "")
-        + f"<blockquote>{prog}</blockquote>\n\n"
-        f"<blockquote>{feed_line}\n{me_line}</blockquote>\n\n"
-        + next_reward
-        + f"{PE_TROPHY} <b>Главные вкладчики</b>\n<blockquote>{top}</blockquote>\n\n"
-        f"{PE_LEVELUP} <b>Ступени</b>\n<blockquote expandable>{chr(10).join(ladder)}\n\n"
-        f"<i>Награду ступени получает каждый, кто хоть раз подпитал кристалл. На 10-й — {egg} Яйцо Бездны.</i></blockquote>"
-    )
+    text = render_screen("кровавый кристалл", {
+        "заметка": f"<blockquote>{note}</blockquote>\n\n" if note else "", "прогресс": prog,
+        "подпитка": feed_line, "я": me_line, "награда": next_reward, "вкладчики": top,
+        "ступени": chr(10).join(ladder), "яйцо": egg,
+    })
     rows = []
     if active:
         rows.append([InlineKeyboardButton(text="Подпитать кристалл" if left <= 0 else f"Подпитка · {sf_fmt_left(left)}",
                                           callback_data="sf|feed",
                                           icon_custom_emoji_id="5325762861539016690" if left <= 0 else "5287473790735890430")])
+        notify_on = not user.get("sf_feed_notify_off")
+        rows.append([InlineKeyboardButton(text=f"Напоминание в ЛС: {'вкл' if notify_on else 'выкл'}", callback_data="sf|fntf",
+                                          icon_custom_emoji_id="5325762861539016690" if notify_on else "5352669272575321097")])
     rows.append([InlineKeyboardButton(text=f"«{SF_NAME}»", callback_data="sf|event", icon_custom_emoji_id=SF_EMOJI_ID),
                  InlineKeyboardButton(text="Обновить", callback_data="sf|crys", icon_custom_emoji_id="5346321684574003384")])
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("кровавый кристалл", "Кровавый кристалл (ивент)", (
+    f"{SF_PE_CRYSTAL} <b>К Р О В А В Ы Й   К Р И С Т А Л Л</b> {SF_PE_CRYSTAL}\n"
+    "<i>Один на всех. Чем чаще его кормят, тем щедрее он ко всем.</i>\n\n"
+    "{заметка}"
+    "<blockquote>{прогресс}</blockquote>\n\n"
+    "<blockquote>{подпитка}\n{я}</blockquote>\n\n"
+    "{награда}"
+    f"{PE_TROPHY} <b>Главные вкладчики</b>\n<blockquote>{{вкладчики}}</blockquote>\n\n"
+    f"{PE_LEVELUP} <b>Ступени</b>\n<blockquote expandable>{{ступени}}\n\n"
+    "<i>Награду ступени получает каждый, кто хоть раз подпитал кристалл. На 10-й — питомец из {яйцо} Яйца Бездны (открывается сразу).</i></blockquote>"
+), {"заметка": "результат подпитки", "прогресс": "ступень и полоска", "подпитка": "можно ли подпитать",
+    "я": "твои подпитки", "награда": "блок следующей награды", "вкладчики": "топ вкладчиков",
+    "ступени": "лестница ступеней", "яйцо": "эмодзи яйца"})
 
 
 async def show_starfall(user_id: int, answer_func, note: str = ""):
@@ -30487,21 +33524,14 @@ async def show_starfall(user_id: int, answer_func, note: str = ""):
         f"{SF_PE_BOSS} Боссы: болото <b>3</b> · пустыня <b>6</b> · лес <b>12</b> · разлом <b>25</b> · вулкан <b>40</b> · "
         f"ледник <b>60</b> · цитадель <b>90</b> · стражи <b>150</b>\n<i>Финальный босс локации — очки ×2</i>"
     )
-    text = (
-        f"{SF_EMOJI} <b>К Р О В А В А Я   Л У Н А</b> {SF_EMOJI}\n"
-        f"<i>Небо окрасилось алым. Луна одарит самых упорных.</i>\n\n"
-        f"<blockquote>{status}</blockquote>\n\n"
-        f"{PE_TROPHY} <b>Топ ивента</b>\n{top}\n\n"
-        f"<blockquote>{me_line}</blockquote>\n\n"
-        + (f"<blockquote>{SF_PE_CRYSTAL} <b>{SF_CRYSTAL_NAME}</b> · ступень {sf_crystal_progress()[0]}/{len(SF_CRYSTAL_STAGES)}\n"
+    crystal_block = (
+        (f"<blockquote>{SF_PE_CRYSTAL} <b>{SF_CRYSTAL_NAME}</b> · ступень {sf_crystal_progress()[0]}/{len(SF_CRYSTAL_STAGES)}\n"
            + f"{sf_bar(sf_crystal_progress()[3])} <b>{int(sf_crystal_progress()[3] * 100)}%</b>\n"
            + (f"{PE_OK} Можно подпитать!" if sf_feed_left(user) <= 0 else f"{PE_HOURGLASS} Подпитка через {sf_fmt_left(sf_feed_left(user))}")
            + "</blockquote>\n\n" if active else "")
-        + 
-        f"{PE_SPARK} <b>Как копить очки</b>\n<blockquote expandable>{pts_table}</blockquote>\n\n"
-        f"<blockquote>{SF_COMPASS_EMOJI} <b>Награда топ-{SF_WINNERS}</b> — {SF_COMPASS_NAME}: мини-игры, "
-        f"доп. добыча с боссов и «Дар луны».</blockquote>"
     )
+    text = render_screen("кровавая луна", {"статус": status, "топ": top, "я": me_line, "кристалл": crystal_block,
+                                           "очки": pts_table})
     rows = []
     if active:
         feed_left = sf_feed_left(user)
@@ -30514,6 +33544,25 @@ async def show_starfall(user_id: int, answer_func, note: str = ""):
     if note:
         text = f"<blockquote>{note}</blockquote>\n\n" + text
     await answer_func(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+register_screen("кровавая луна", "Кровавая луна (ивент)", (
+    f"{SF_EMOJI} <b>К Р О В А В А Я   Л У Н А</b> {SF_EMOJI}\n"
+    "<i>Небо окрасилось алым. Луна одарит самых упорных.</i>\n\n"
+    "<blockquote>{статус}</blockquote>\n\n"
+    f"{PE_TROPHY} <b>Топ ивента</b>\n{{топ}}\n\n"
+    "<blockquote>{я}</blockquote>\n\n"
+    "{кристалл}"
+    f"{PE_SPARK} <b>Как копить очки</b>\n<blockquote expandable>{{очки}}</blockquote>\n\n"
+    f"<blockquote>{SF_COMPASS_EMOJI} <b>Награда топ-{SF_WINNERS}</b> — {SF_COMPASS_NAME}: мини-игры, "
+    "доп. добыча с боссов и «Дар луны».</blockquote>"
+), {"статус": "сколько до заката / победители", "топ": "топ ивента", "я": "твои очки и место",
+    "кристалл": "блок Кровавого кристалла (во время ивента)", "очки": "таблица очков"})
+
+
+# символы игры «Реакция»: эмодзи → id иконки (в тексте и на кнопке — один и тот же id, чтобы цель всегда находилась)
+SF_REACT_SYMBOLS = {"⭐": "6269538837723090339", "🔥": "5332336747072208845", "👑": "5217822164362739968",
+                    "🍀": "5395325195542078574", "⚡": "5866156028973813402"}
 
 
 def _sf_game_kb(rows: List[List[tuple]]) -> InlineKeyboardMarkup:
@@ -30547,8 +33596,12 @@ def _sf_render_game(uid: int) -> tuple:
         if not g.get("symbols"):
             return (f"{SF_GAME_ICONS['react']} <b>Реакция</b>\n\n<blockquote>Приготовься… Когда появится символ — жми такой же. Нажмёшь раньше — проиграешь.</blockquote>",
                     _sf_game_kb([[("▫️", f"sf|r|{i}") for i in range(5)], back]))
-        return (f"{SF_GAME_ICONS['react']} <b>Реакция</b>\n\n<blockquote>ЖМИ {g['target']} !</blockquote>",
-                _sf_game_kb([[(sym, f"sf|r|{i}") for i, sym in enumerate(g["symbols"])], back]))
+        tgt = f'<tg-emoji emoji-id="{SF_REACT_SYMBOLS[g["target"]]}">{g["target"]}</tg-emoji>'
+        kb_rows = [[InlineKeyboardButton(text="\u200e", callback_data=f"sf|r|{i}", icon_custom_emoji_id=SF_REACT_SYMBOLS[sym])
+                    for i, sym in enumerate(g["symbols"])],
+                   [InlineKeyboardButton(text="К играм", callback_data="sf|games")]]
+        return (f"{SF_GAME_ICONS['react']} <b>Реакция</b>\n\n<blockquote>ЖМИ {tgt} !</blockquote>",
+                InlineKeyboardMarkup(inline_keyboard=kb_rows))
     if kind == "mine":
         rows = []
         for r in range(4):
@@ -30569,7 +33622,7 @@ async def _sf_react_reveal(uid: int, message, token: float):
     g = _sf_games.get(uid)
     if not g or g.get("game") != "react" or g.get("token") != token or g.get("shown"):
         return
-    symbols = ["⭐", "🔥", "💎", "🍀", "⚡"]
+    symbols = list(SF_REACT_SYMBOLS)
     random.shuffle(symbols)
     g["symbols"] = symbols
     g["target"] = random.choice(symbols)
@@ -30611,9 +33664,10 @@ async def starfall_callback(call: CallbackQuery):
         await call.answer()
         return
     edit = lambda t, kb: edit_for_user(call, t, kb)
-    if action == "event":
+    if action in ("event", "crys", "fntf") or (action == "feed" and not starfall_active()):
+        # ивент «Кровавая луна» убран из игры — старые кнопки ведут в грааль
         await call.answer()
-        await show_starfall(uid, edit)
+        await show_compass(uid, edit)
         return
     if action == "feed":
         lock = _sf_locks.setdefault(uid, asyncio.Lock())
@@ -30633,6 +33687,14 @@ async def starfall_callback(call: CallbackQuery):
         return
     if action == "crys":
         await call.answer()
+        await show_sf_crystal(uid, edit)
+        return
+    if action == "fntf":
+        user = await db.get_user(uid)
+        user["sf_feed_notify_off"] = not user.get("sf_feed_notify_off")
+        await save_runtime_state(uid, user)
+        on = not user["sf_feed_notify_off"]
+        await call.answer("Напомню в ЛС, когда можно подпитать" if on else "Напоминания о подпитке выключены")
         await show_sf_crystal(uid, edit)
         return
     lock = _sf_locks.setdefault(uid, asyncio.Lock())
@@ -30851,7 +33913,7 @@ async def text_starfall(message: Message):
     if message.from_user.id in ADMIN_IDS and len(parts) >= 2:
         await starfall_admin(message, parts[1:])
         return
-    await show_starfall(message.from_user.id, lambda t, kb: reply_to_user(message, t, kb))
+    await show_compass(message.from_user.id, lambda t, kb: reply_to_user(message, t, kb))
 
 
 async def _sf_broadcast(text: str, user_ids: List[str]):
@@ -30987,15 +34049,2720 @@ async def grail_gift_notify_check():
         await asyncio.sleep(0.05)
 
 
+async def sf_feed_notify_check():
+    """ЛС участникам: «Кровавый кристалл снова можно подпитать». Тем, кто подпитывал в этом ивенте."""
+    if not starfall_active():
+        return
+    if float(_sf_state.get("until", 0) or 0) - time.time() < 60:
+        return  # луна вот-вот зайдёт — не зовём зря
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Подпитать кристалл", callback_data="sf|feed", icon_custom_emoji_id="5325762861539016690"),
+        InlineKeyboardButton(text="Кристалл", callback_data="sf|crys", icon_custom_emoji_id=SF_EMOJI_ID)]])
+    for uid_str, u in list(db.data.items()):
+        if not isinstance(u, dict) or u.get("sf_feed_notified") or u.get("sf_feed_notify_off"):
+            continue
+        d = u.get("sf_feed")
+        if not isinstance(d, dict) or d.get("id") != _sf_state.get("id"):
+            continue
+        if sf_feed_left(u) > 0:
+            continue
+        try:
+            uid = int(uid_str)
+        except ValueError:
+            continue
+        u["sf_feed_notified"] = True
+        try:
+            await send_user_notification(
+                uid,
+                f"{SF_PE_CRYSTAL} <b>Кровавый кристалл</b>\n\n"
+                f"<blockquote>{PE_OK} <b>Можно подпитать!</b>\n"
+                f"+{sf_feed_charge()} заряда кристалла и +{SF_FEED_POINTS} очков ивента.</blockquote>\n\n"
+                f"<i>Выключить напоминание — кнопкой на экране кристалла.</i>",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            print(f"[sf feed notify] {uid_str}: {e}")
+        try:
+            await save_runtime_state_lazy(uid, u)
+        except Exception as e:
+            print(f"[sf feed notify save] {uid_str}: {e}")
+        await asyncio.sleep(0.05)
+
+
 async def starfall_loop():
     while True:
         try:
             if _sf_state.get("active") and time.time() >= float(_sf_state.get("until", 0) or 0):
                 await starfall_finalize()
             await grail_gift_notify_check()
+            await sf_feed_notify_check()
         except Exception as e:
             print(f"[starfall loop] {e}")
         await asyncio.sleep(60)
+
+
+# === Только один запущенный бот ===
+# Две копии с одним токеном воруют друг у друга сообщения (Conflict), шлют каждое уведомление дважды
+# и быстро ловят флуд-бан Telegram. Копия отмечается в базе раз в INSTANCE_BEAT секунд;
+# новая копия (например, после деплоя) забирает отметку, а старая, увидев это, выключается сама.
+import uuid
+INSTANCE_ID = uuid.uuid4().hex[:12]
+INSTANCE_STARTED = time.time()
+INSTANCE_BEAT = 15
+
+
+def _instance_mark() -> dict:
+    return {"id": INSTANCE_ID, "ts": time.time(), "started": INSTANCE_STARTED}
+
+
+async def claim_instance():
+    try:
+        data = await load_kv("bot_instance") or {}
+    except Exception as e:
+        print(f"[instance] не смог прочитать отметку: {e}")
+        return
+    other_alive = data.get("id") and data.get("id") != INSTANCE_ID and time.time() - float(data.get("ts", 0) or 0) < INSTANCE_BEAT * 3
+    try:
+        await save_kv("bot_instance", _instance_mark())
+    except Exception as e:
+        print(f"[instance] не смог записать отметку: {e}")
+        return
+    if other_alive:
+        print(f"[instance] работает другая копия ({data.get('id')}) — забираю работу, жду пока она выключится")
+        await asyncio.sleep(INSTANCE_BEAT * 2 + 2)
+
+
+async def instance_heartbeat_loop():
+    while True:
+        await asyncio.sleep(INSTANCE_BEAT)
+        try:
+            data = await load_kv("bot_instance") or {}
+            # выключается только СТАРАЯ копия: если отметку случайно перезаписала старшая — просто пишем свою
+            if data.get("id") and data.get("id") != INSTANCE_ID and float(data.get("started", 0) or 0) > INSTANCE_STARTED:
+                print(f"[instance] запущена новая копия бота ({data.get('id')}) — эта ({INSTANCE_ID}) выключается")
+                try:
+                    await flush_lazy_saves(force=True)
+                    await _save_kratos_db()
+                except Exception as e:
+                    print(f"[instance] flush: {e}")
+                os._exit(0)
+            await save_kv("bot_instance", _instance_mark())
+        except Exception as e:
+            print(f"[instance] heartbeat: {e}")
+
+
+
+# ============================================================
+# === Выдача админки: «админ+» / «админ-» / «админы» (только владелец бота) ===
+# Реплаем на сообщение игрока или с ID: «админ+ 123456789». Список хранится в базе
+# (kv_state, ключ extra_admins) и переживает перезапуск. Владельца снять нельзя.
+# ============================================================
+BOT_OWNER_ID = 993958415
+_extra_admins: Set[int] = set()
+
+
+async def load_extra_admins():
+    try:
+        data = await load_kv("extra_admins") or {}
+        ids = {int(x) for x in data.get("ids", []) if str(x).lstrip("-").isdigit()}
+    except Exception as e:
+        print(f"[admins] load: {e}")
+        ids = set()
+    _extra_admins.clear()
+    _extra_admins.update(ids)
+    ADMIN_IDS.update(ids)
+    print(f"[admins] доп. админов: {len(ids)}")
+
+
+# ----- закрытый режим: бот отвечает только админам (для тестов) -----
+_bot_locked = False
+
+
+async def load_bot_lock():
+    global _bot_locked
+    try:
+        data = await load_kv("bot_lock") or {}
+        _bot_locked = bool(data.get("locked"))
+    except Exception as e:
+        print(f"[lock] load: {e}")
+        _bot_locked = False
+    print(f"[lock] закрытый режим: {'вкл' if _bot_locked else 'выкл'}")
+
+
+class BotLockMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if not _bot_locked:
+            return await handler(event, data)
+        user = getattr(event, "from_user", None)
+        if user is None or user.id in ADMIN_IDS:
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            try:
+                await event.answer()   # тихо гасим «часики» на кнопке
+            except Exception:
+                pass
+        return None
+
+
+dp.message.outer_middleware(BotLockMiddleware())
+dp.callback_query.outer_middleware(BotLockMiddleware())
+
+
+def _lock_cmd(msg: Message) -> Optional[str]:
+    t = " ".join((msg.text or "").strip().casefold().lstrip("/").split())
+    if t in ("закрыть бот", "бот закрыть", "бот стоп", "закрыть бота"):
+        return "on"
+    if t in ("открыть бот", "бот открыть", "бот старт", "открыть бота"):
+        return "off"
+    if t in ("бот статус", "статус бота"):
+        return "status"
+    return None
+
+
+@dp.message(lambda msg: msg.text and _lock_cmd(msg) is not None)
+async def text_bot_lock(message: Message):
+    global _bot_locked
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    kind = _lock_cmd(message)
+    if kind in ("on", "off"):
+        _bot_locked = (kind == "on")
+        await save_kv("bot_lock", {"locked": _bot_locked})
+    state = ("🔒 <b>Бот закрыт</b> — отвечает только админам.\nОткрыть: <code>открыть бот</code>"
+             if _bot_locked else
+             "🔓 <b>Бот открыт</b> для всех.\nЗакрыть для тестов: <code>закрыть бот</code>")
+    await message.answer(state, parse_mode="HTML")
+
+
+
+async def save_extra_admins():
+    try:
+        await save_kv("extra_admins", {"ids": sorted(_extra_admins)})
+    except Exception as e:
+        print(f"[admins] save: {e}")
+
+
+def _admin_cmd_kind(msg: Message) -> Optional[str]:
+    t = (msg.text or "").strip().casefold()
+    if not t:
+        return None
+    first = t.split()[0].lstrip("/")
+    if first in ("админ+", "+админ", "админ+.") or t.startswith("админ +") or t.startswith("/админ+"):
+        return "add"
+    if first in ("админ-", "-админ") or t.startswith("админ -"):
+        return "del"
+    if first in ("админы", "админлист"):
+        return "list"
+    return None
+
+
+async def _admin_target(message: Message) -> tuple:
+    """(id, подпись) цели: реплай или число в тексте."""
+    rep = message.reply_to_message
+    if rep and rep.from_user and not rep.from_user.is_bot:
+        uid = rep.from_user.id
+    else:
+        nums = re.findall(r"\d{5,}", message.text or "")
+        if not nums:
+            return None, ""
+        uid = int(nums[0])
+    u = db.data.get(str(uid)) if isinstance(getattr(db, "data", None), dict) else None
+    label = render_user_nickname(u) if u else f"<code>{uid}</code>"
+    return uid, label
+
+
+@dp.message(lambda msg: msg.text and _admin_cmd_kind(msg) is not None)
+async def text_admin_grant(message: Message):
+    kind = _admin_cmd_kind(message)
+    if kind == "list":
+        if message.from_user.id not in ADMIN_IDS:
+            return
+        lines = []
+        for uid in sorted(ADMIN_IDS):
+            u = db.data.get(str(uid)) if isinstance(getattr(db, "data", None), dict) else None
+            name = render_user_nickname(u) if u else "—"
+            mark = " · владелец" if uid == BOT_OWNER_ID else ("" if uid in _extra_admins else " · из кода")
+            lines.append(f"{PE_STAR} {name} · <code>{uid}</code>{mark}")
+        await reply_to_user(message, f"{PE_STAR} <b>Админы бота</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
+                            "<i>Выдать: <code>админ+</code> реплаем или <code>админ+ ID</code> · снять: <code>админ-</code></i>")
+        return
+    if message.from_user.id != BOT_OWNER_ID:
+        if message.from_user.id in ADMIN_IDS:
+            await reply_to_user(message, f"{PE_CROSS} Выдавать и снимать админку может только владелец бота.")
+        return
+    uid, label = await _admin_target(message)
+    if not uid:
+        await reply_to_user(message, "Ответь командой на сообщение игрока или укажи ID: <code>админ+ 123456789</code>")
+        return
+    if kind == "add":
+        if uid in ADMIN_IDS:
+            await reply_to_user(message, f"{PE_OK} {label} уже админ.")
+            return
+        _extra_admins.add(uid)
+        ADMIN_IDS.add(uid)
+        await save_extra_admins()
+        await write_activity_log(f"ADMIN+ {uid} (выдал {message.from_user.id})")
+        await reply_to_user(message, f"{PE_OK} {label} теперь <b>админ</b>.\n<i>Снять: <code>админ- {uid}</code></i>")
+        try:
+            await send_user_notification(uid, f"{PE_STAR} <b>Тебе выдали права админа</b> в Lootify RPG.\n<blockquote>Список команд — <code>хелп</code>.</blockquote>")
+        except Exception:
+            pass
+    else:
+        if uid == BOT_OWNER_ID:
+            await reply_to_user(message, f"{PE_CROSS} Владельца снять нельзя.")
+            return
+        if uid not in _extra_admins:
+            note = " Он прописан в коде (ADMIN_IDS) — убрать можно только там." if uid in ADMIN_IDS else ""
+            await reply_to_user(message, f"{PE_CROSS} {label} не в списке выданных админов.{note}")
+            return
+        _extra_admins.discard(uid)
+        ADMIN_IDS.discard(uid)
+        await save_extra_admins()
+        await write_activity_log(f"ADMIN- {uid} (снял {message.from_user.id})")
+        await reply_to_user(message, f"{PE_OK} У {label} больше нет прав админа.")
+
+
+# ============================================================
+# === Ручная выдача звёзд в топ доната: «донат+ ID сумма» / «донат- ID сумма» (админ) ===
+# Можно реплаем: «донат+ 150». Ручные звёзды хранятся отдельно (manual_donated_stars) и
+# складываются с теми, что бот засчитал сам при оплате, — в топе видна общая сумма.
+# ============================================================
+def _parse_donate_cmd(msg: Message):
+    t = (msg.text or "").strip().casefold()
+    m = re.match(r"^/?донат([+-])(?:\s+(\d{5,}))?(?:\s+(\S+))?\s*$", t)
+    if not m:
+        return None
+    amount = parse_short_number(m.group(3)) if m.group(3) else None
+    if m.group(3) and (amount is None or amount <= 0):
+        return None
+    return m.group(1), (int(m.group(2)) if m.group(2) else None), amount
+
+
+@dp.message(lambda msg: msg.text and _parse_donate_cmd(msg) is not None)
+async def text_admin_manual_donate(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    sign, uid, amount = _parse_donate_cmd(message)
+    rep = message.reply_to_message
+    if rep and rep.from_user and not rep.from_user.is_bot:
+        if uid is not None and amount is None:
+            uid, amount = None, uid   # «донат+ 50000» реплаем — это сумма, а не ID
+        if uid is None:
+            uid = rep.from_user.id
+    if uid is None or not amount:
+        await reply_to_user(message, "<blockquote><code>донат+ ID звёзды</code> — добавить в топ доната\n"
+                                     "<code>донат- ID звёзды</code> — убрать (только добавленное вручную)\n"
+                                     "Можно реплаем на игрока: <code>донат+ 150</code></blockquote>")
+        return
+    if not await db.has_user(uid):
+        await reply_to_user(message, f"{PE_CROSS} Игрока <code>{uid}</code> нет в боте.")
+        return
+    user = await db.get_user(uid)
+    manual = int(user.get("manual_donated_stars", 0) or 0)
+    if sign == "+":
+        manual += amount
+    else:
+        manual = max(0, manual - amount)
+    user["manual_donated_stars"] = manual
+    await db.save_user(uid, user)
+    _donor_cache["at"] = 0.0   # пересчитать места топа сразу
+    await write_activity_log(f"DONATE{sign} {uid} {amount}⭐ (админ {message.from_user.id}), вручную всего {manual}")
+    total = get_user_donated_stars(user)
+    auto = total - manual
+    place = get_donor_ranks(force=True).get(str(uid))
+    await reply_to_user(
+        message,
+        f"{PE_OK} {render_user_nickname(user)}: {'+' if sign == '+' else '−'}{amount} ⭐ в топ доната\n\n"
+        f"<blockquote>{PE_STAR} Всего в топе: <b>{format_num(total)}</b> ⭐\n"
+        f"Засчитано ботом: <b>{format_num(max(0, auto))}</b> · добавлено вручную: <b>{format_num(manual)}</b>"
+        + (f"\n{PE_TROPHY} Место в топе: <b>{place}</b>" if place else "") + "</blockquote>",
+    )
+
+
+# ============================================================
+# === Промокоды (админ создаёт, игроки активируют) ===
+#   промо+ КОД 10                — создать код на 10 активаций (или поменять лимит)
+#   промо+ КОД пет полярный волк  — положить награду (можно несколько, любых)
+#   промо- КОД                   — удалить код · промо- КОД 2 — убрать награду №2
+#   промо? КОД                   — подробности · промокоды — список всех
+#   Игрок: промо КОД  (один раз на аккаунт, пока есть активации)
+# Хранится в PostgreSQL (kv_state, ключ promocodes).
+# ============================================================
+_promos: Dict[str, dict] = {}
+_promo_lock = asyncio.Lock()
+
+PROMO_TYPES = {
+    "монеты": "coins", "монет": "coins", "coins": "coins",
+    "опыт": "xp", "xp": "xp",
+    "пет": "pet", "питомец": "pet", "pet": "pet",
+    "оруж": "weapon", "оружие": "weapon", "weapon": "weapon",
+    "броня": "armor", "armor": "armor",
+    "лут": "res", "ресурс": "res", "ресурсы": "res", "res": "res",
+    "зелье": "potion", "зелья": "potion", "potion": "potion",
+    "свитки": "scrolls", "свиток": "scrolls",
+    "зефир": "zefir", "зефирки": "zefir",
+    "очки": "sp", "таланты": "sp",
+    "эс": "essence", "эссенция": "essence",
+}
+PROMO_TYPE_HELP = ("монеты N · опыт N · пет название [N] · оруж название [N] · броня название [N] · "
+                   "лут ресурс N · зелье название [N] · свитки N · зефир N · очки N · эс редкость N")
+
+
+async def load_promos():
+    global _promos
+    try:
+        data = await load_kv("promocodes") or {}
+        _promos = {str(k).upper(): v for k, v in (data.get("codes") or {}).items() if isinstance(v, dict)}
+    except Exception as e:
+        print(f"[promo] load: {e}")
+        _promos = {}
+
+
+async def save_promos():
+    try:
+        await save_kv("promocodes", {"codes": _promos})
+    except Exception as e:
+        print(f"[promo] save: {e}")
+
+
+def promo_reward_text(r: dict) -> str:
+    t, n = r.get("t"), int(r.get("n", 1) or 1)
+    try:
+        if t == "coins":
+            return f"{PE_COIN} {format_num(n)} монет"
+        if t == "xp":
+            return f"{PE_XP} {format_num(n)} опыта"
+        if t == "pet":
+            d = PET_DEFS[r["id"]]
+            return f"{PET_PREMIUM_EMOJIS.get(r['id'], d['emoji'])} Питомец «{html.escape(d['name'])}»" + (f" ×{n}" if n > 1 else "")
+        if t == "weapon":
+            w = next(w for w in WEAPONS.get(r["rar"], []) if w["id"] == r["id"])
+            return f"{w['emoji']} {html.escape(w['name'])} ({RARITIES[r['rar']]['name']})" + (f" ×{n}" if n > 1 else "")
+        if t == "armor":
+            a = next(a for a in ARMOR.get(r["rar"], {}).get(r["slot"], []) if a["id"] == r["id"])
+            return f"{a['emoji']} {html.escape(a['name'])} ({RARITIES[r['rar']]['name']})" + (f" ×{n}" if n > 1 else "")
+        if t in ("res", "essence"):
+            info = BOSS_RESOURCE_DEFS.get(r["id"], {})
+            return f"{info.get('emoji', '💎')} {html.escape(str(info.get('name', r['id'])))} ×{format_num(n)}"
+        if t == "potion":
+            return f"{potion_icon(r['id'])} {html.escape(POTION_DEFS[r['id']]['name'])} ×{n}"
+        if t == "scrolls":
+            return f"{PE_REVIVE} Свитки воскрешения ×{format_num(n)}"
+        if t == "zefir":
+            return f'<tg-emoji emoji-id="5395625559784968299">🍰</tg-emoji> Зефирки ×{format_num(n)}'
+        if t == "sp":
+            return f'<tg-emoji emoji-id="6325752533629273447">🧠</tg-emoji> Очки талантов ×{n}'
+    except Exception:
+        pass
+    return f"{t} ×{n}"
+
+
+def promo_parse_reward(tokens: List[str]) -> tuple:
+    """(награда, ошибка)."""
+    if not tokens:
+        return None, "Укажи награду: " + PROMO_TYPE_HELP
+    t = PROMO_TYPES.get(tokens[0].casefold())
+    if not t:
+        return None, f"Не знаю награду «{html.escape(tokens[0])}». Можно: {PROMO_TYPE_HELP}"
+    rest = tokens[1:]
+    n = None
+    if rest and is_short_number(rest[-1]):
+        n = parse_short_number(rest[-1])
+        rest = rest[:-1]
+    query = " ".join(rest).strip()
+    if t in ("coins", "xp", "scrolls", "zefir", "sp"):
+        if not n or n <= 0:
+            return None, "Укажи количество, например <code>монеты 5к</code>."
+        return {"t": t, "n": n}, None
+    n = n or 1
+    if n <= 0:
+        return None, "Количество должно быть больше нуля."
+    if not query:
+        return None, "Укажи, что именно положить (id или часть названия)."
+    if t == "pet":
+        pid = find_pet_id(query)
+        return ({"t": t, "id": pid, "n": n}, None) if pid else (None, f"Не нашёл питомца «{html.escape(query)}» (см. <code>петлист</code>).")
+    if t == "weapon":
+        found = find_weapon_def(query)
+        return ({"t": t, "id": found[0]["id"], "rar": found[1], "n": n}, None) if found else (None, f"Не нашёл оружие «{html.escape(query)}» (см. <code>оружлист</code>).")
+    if t == "armor":
+        found = find_armor_def(query)
+        if not found:
+            return None, f"Не нашёл броню «{html.escape(query)}» (см. <code>бронлист</code>)."
+        piece, slot, rar = found
+        slot = "bracers" if slot in ("bracers", "bracers_left", "bracers_right") else slot
+        return {"t": t, "id": piece["id"], "rar": rar, "slot": slot, "n": n}, None
+    if t == "res":
+        rid = find_boss_resource_id(query)
+        return ({"t": t, "id": rid, "n": n}, None) if rid else (None, f"Не нашёл ресурс «{html.escape(query)}» (см. <code>лутлист</code>).")
+    if t == "potion":
+        pid = find_potion_id(query)
+        return ({"t": t, "id": pid, "n": n}, None) if pid else (None, f"Не нашёл зелье «{html.escape(query)}» (см. <code>зельелист</code>).")
+    if t == "essence":
+        rar = resolve_essence_rarity(query)
+        return ({"t": t, "id": get_essence_id_for_rarity(rar), "n": n}, None) if rar else (None, f"Не понял редкость «{html.escape(query)}».")
+    return None, "Неизвестная награда."
+
+
+def promo_give(user: dict, r: dict) -> Optional[str]:
+    """Выдаёт одну награду. Возвращает строку для сообщения (или None, если выдать нельзя)."""
+    t, n = r.get("t"), int(r.get("n", 1) or 1)
+    if t == "coins":
+        user["coins"] = int(user.get("coins", 0) or 0) + n
+    elif t == "xp":
+        add_xp(user, n)
+    elif t == "pet":
+        if r.get("id") not in PET_DEFS:
+            return None
+        user.setdefault("pets", []).extend(create_pet(r["id"]) for _ in range(n))
+    elif t == "weapon":
+        w = next((w for w in WEAPONS.get(r.get("rar"), []) if w["id"] == r.get("id")), None)
+        if not w:
+            return None
+        for _ in range(n):
+            add_item_to_inventory_or_trash(user, create_weapon_item(w, r["rar"], user.get("level", 1)))
+    elif t == "armor":
+        a = next((a for a in ARMOR.get(r.get("rar"), {}).get(r.get("slot"), []) if a["id"] == r.get("id")), None)
+        if not a:
+            return None
+        slots = ["bracers_left", "bracers_right"] if r.get("slot") == "bracers" else [r["slot"]]
+        for _ in range(n):
+            for sl in slots:
+                add_item_to_inventory_or_trash(user, create_armor_item(a, sl, r["rar"], user.get("level", 1)))
+    elif t in ("res", "essence"):
+        add_boss_resource(user, r["id"], n)
+    elif t == "potion":
+        if r.get("id") not in POTION_DEFS:
+            return None
+        for _ in range(n):
+            add_potion_to_user(user, r["id"])
+    elif t == "scrolls":
+        user["revive_scrolls"] = get_revive_scrolls(user) + n
+    elif t == "zefir":
+        user["marshmallows"] = int(user.get("marshmallows", 0) or 0) + n
+    elif t == "sp":
+        user["skill_points"] = get_skill_points(user) + n
+    else:
+        return None
+    return promo_reward_text(r)
+
+
+def promo_info_text(code: str, p: dict, full: bool = True) -> str:
+    used = p.get("used") or []
+    limit = int(p.get("limit", 1) or 1)
+    rewards = p.get("rewards") or []
+    lines = [f"{PE_GIFT} <b>Промокод</b> <code>{html.escape(code)}</code>",
+             f"<blockquote>Активаций: <b>{len(used)}/{limit}</b>" + (" · <b>закончился</b>" if len(used) >= limit else "") + "</blockquote>"]
+    if rewards:
+        lines.append("<blockquote>" + "\n".join(f"<b>{i}.</b> {promo_reward_text(r)}" for i, r in enumerate(rewards, 1)) + "</blockquote>")
+    else:
+        lines.append(f"<blockquote>{PE_WARN} Наград пока нет — добавь: <code>промо+ {html.escape(code)} монеты 5к</code></blockquote>")
+    if full and used:
+        names = []
+        for uid in used[-15:]:
+            u = db.data.get(str(uid)) if isinstance(getattr(db, "data", None), dict) else None
+            names.append(render_user_nickname(u) if u else f"<code>{uid}</code>")
+        lines.append("<blockquote expandable>Активировали: " + ", ".join(names) + (" …" if len(used) > 15 else "") + "</blockquote>")
+    return "\n".join(lines)
+
+
+def _promo_cmd(msg: Message) -> Optional[str]:
+    t = (msg.text or "").strip().casefold()
+    if not t:
+        return None
+    first = t.split()[0].lstrip("/")
+    if first in ("промо+", "промо-", "промо?", "промокоды"):
+        return first
+    if first in ("промо", "промокод", "promo"):
+        return "use"
+    return None
+
+
+@dp.message(lambda msg: msg.text and _promo_cmd(msg) is not None)
+async def text_promo(message: Message):
+    kind = _promo_cmd(message)
+    parts = (message.text or "").split()
+    uid = message.from_user.id
+    is_admin = uid in ADMIN_IDS
+    if kind != "use" and not is_admin:
+        return
+    if kind == "промокоды":
+        if not _promos:
+            await reply_to_user(message, f"{PE_GIFT} Промокодов нет. Создать: <code>промо+ КОД 10</code>")
+            return
+        lines = []
+        for code, p in sorted(_promos.items()):
+            used, limit = len(p.get("used") or []), int(p.get("limit", 1) or 1)
+            mark = PE_OK if used < limit and p.get("rewards") else PE_CROSS
+            lines.append(f"{mark} <code>{html.escape(code)}</code> — {used}/{limit} · наград: {len(p.get('rewards') or [])}")
+        await reply_to_user(message, f"{PE_GIFT} <b>Промокоды</b>\n<blockquote>" + "\n".join(lines) + "</blockquote>\n"
+                                     "<i>Подробно: <code>промо? КОД</code></i>")
+        return
+    if len(parts) < 2:
+        if kind == "use":
+            await reply_to_user(message, f"{PE_GIFT} Напиши <code>промо КОД</code>, чтобы активировать промокод.")
+        else:
+            await reply_to_user(message, f"{PE_GIFT} <b>Промокоды</b>\n<blockquote>"
+                                         "<code>промо+ КОД 10</code> — создать на 10 активаций (или сменить лимит)\n"
+                                         "<code>промо+ КОД пет полярный волк</code> — добавить награду\n"
+                                         f"Награды: {PROMO_TYPE_HELP}\n"
+                                         "<code>промо- КОД</code> — удалить · <code>промо- КОД 2</code> — убрать награду №2\n"
+                                         "<code>промо? КОД</code> — подробно · <code>промокоды</code> — список\n"
+                                         "Игрок вводит: <code>промо КОД</code></blockquote>")
+        return
+    code = parts[1].upper()
+    if kind == "промо+":
+        rest = parts[2:]
+        async with _promo_lock:
+            p = _promos.get(code)
+            if len(rest) == 1 and is_short_number(rest[0]) and PROMO_TYPES.get(rest[0].casefold()) is None:
+                limit = parse_short_number(rest[0])
+                if limit <= 0:
+                    await reply_to_user(message, "Количество активаций должно быть больше нуля.")
+                    return
+                if p is None:
+                    p = _promos[code] = {"limit": limit, "used": [], "rewards": [], "created": time.time(), "by": uid}
+                else:
+                    p["limit"] = limit
+                await save_promos()
+                await reply_to_user(message, promo_info_text(code, p) + f"\n\n<i>Добавь награды: <code>промо+ {html.escape(code)} монеты 5к</code></i>")
+                return
+            if not rest:
+                await reply_to_user(message, f"Напиши <code>промо+ {html.escape(code)} 10</code> (активации) или награду: {PROMO_TYPE_HELP}")
+                return
+            reward, err = promo_parse_reward(rest)
+            if err:
+                await reply_to_user(message, f"{PE_CROSS} {err}")
+                return
+            created = p is None
+            if created:
+                p = _promos[code] = {"limit": 1, "used": [], "rewards": [], "created": time.time(), "by": uid}
+            p.setdefault("rewards", []).append(reward)
+            await save_promos()
+        note = f"\n\n<i>Код создан на 1 активацию — поменять: <code>промо+ {html.escape(code)} 10</code></i>" if created else ""
+        await reply_to_user(message, f"{PE_OK} Добавил: {promo_reward_text(reward)}\n\n" + promo_info_text(code, p) + note)
+        return
+    if kind == "промо-":
+        async with _promo_lock:
+            p = _promos.get(code)
+            if not p:
+                await reply_to_user(message, f"{PE_CROSS} Промокода <code>{html.escape(code)}</code> нет.")
+                return
+            if len(parts) >= 3 and parts[2].isdigit():
+                i = int(parts[2]) - 1
+                rewards = p.get("rewards") or []
+                if not 0 <= i < len(rewards):
+                    await reply_to_user(message, f"{PE_CROSS} Награды №{i + 1} нет.")
+                    return
+                removed = rewards.pop(i)
+                await save_promos()
+                await reply_to_user(message, f"{PE_OK} Убрал: {promo_reward_text(removed)}\n\n" + promo_info_text(code, p))
+                return
+            _promos.pop(code, None)
+            await save_promos()
+        await reply_to_user(message, f"{PE_OK} Промокод <code>{html.escape(code)}</code> удалён.")
+        return
+    if kind == "промо?":
+        p = _promos.get(code)
+        await reply_to_user(message, promo_info_text(code, p) if p else f"{PE_CROSS} Промокода <code>{html.escape(code)}</code> нет.")
+        return
+    # --- активация игроком ---
+    if not await db.has_user(uid):
+        return
+    async with _promo_lock:
+        p = _promos.get(code)
+        if not p or not p.get("rewards"):
+            await reply_to_user(message, f"{PE_CROSS} Такого промокода нет.")
+            return
+        used = p.setdefault("used", [])
+        if uid in used:
+            await reply_to_user(message, f"{PE_CROSS} Ты уже активировал этот промокод.")
+            return
+        if len(used) >= int(p.get("limit", 1) or 1):
+            await reply_to_user(message, f"{PE_CROSS} Активации этого промокода закончились.")
+            return
+        user = await db.get_user(uid)
+        got = [line for line in (promo_give(user, r) for r in p["rewards"]) if line]
+        used.append(uid)
+        await save_runtime_state(uid, user)
+        await save_promos()
+        left = int(p.get("limit", 1)) - len(used)
+    await write_activity_log(f"PROMO {_log_user_name(uid, user)} | {code} | осталось {left}")
+    await reply_to_user(message, f"{PE_GIFT} <b>Промокод активирован!</b>\n\n<blockquote>" + "\n".join(got) + "</blockquote>")
+
+
+# === Бафф реликвийного снаряжения (древнее ×35→×55, божественное ×60→×90, первородное ×100→×150) ===
+# Уже выкованные вещи один раз усиливаются при запуске бота (метка relic_buff на предмете).
+RELIC_BUFF_FACTORS = {"ancient": 55 / 35, "divine": 90 / 60, "primordial": 150 / 100}
+
+
+def _relic_buff_item(item) -> bool:
+    if not isinstance(item, dict) or item.get("relic_buff") or item.get("rarity") not in RELIC_BUFF_FACTORS:
+        return False
+    _scale_item_base(item, RELIC_BUFF_FACTORS[item["rarity"]])
+    if item.get("item_type") != "armor":
+        item["dmg_mult"] = RARITIES[item["rarity"]]["mult"]
+    apply_item_fusion_stats(item)
+    item["relic_buff"] = 1
+    return True
+
+
+async def migrate_relic_buff():
+    try:
+        await db.load()
+    except Exception:
+        pass
+    changed_users = 0
+    for uid_str, u in list(getattr(db, "data", {}).items()):
+        if not isinstance(u, dict):
+            continue
+        changed = False
+        seen = set()
+        pools = [u.get("inventory") or [], [t.get("item") for t in (u.get("trash") or []) if isinstance(t, dict)]]
+        for pool in pools:
+            for it in pool:
+                if isinstance(it, dict):
+                    seen.add(id(it))
+                    changed |= _relic_buff_item(it)
+        for it in [u.get("equipped")] + list((u.get("equipped_armor") or {}).values()):
+            if isinstance(it, dict) and id(it) not in seen:
+                changed |= _relic_buff_item(it)
+        if changed:
+            try:
+                refresh_equipped_from_inventory(u)
+                eq = u.get("equipped_armor") or {}
+                u["max_hp"] = calculate_max_hp_with_armor(int(u.get("level", 1) or 1), eq, u)
+                await db.save_user(int(uid_str), u)
+                changed_users += 1
+            except Exception as e:
+                print(f"[relic buff] {uid_str}: {e}")
+    if changed_users:
+        print(f"[relic buff] усилено снаряжение у {changed_users} игроков")
+
+
+# ============================================================
+# === Справочник «Лучшее снаряжение» (команда «лучшее») ===
+# Отвечает игрокам на вечный вопрос «что лучше на такой-то редкости»:
+# по каждой редкости — оружие каждого типа по урону и броня каждого слота по HP.
+# Цифры — базовые (1-й уровень вещи, без заточки, гравировки и скрещивания).
+# ============================================================
+BEST_RARITY_ORDER = ["common", "uncommon", "rare", "epic", "legendary", "mythic", "nightmare", "ancient", "divine", "primordial"]
+BEST_SLOTS = [("helmet", "Шлем"), ("chestplate", "Нагрудник"), ("bracers", "Наручи"), ("leggings", "Поножи"), ("boots", "Сапоги")]
+BEST_TYPES = [("melee", "Ближний бой"), ("bow", "Луки"), ("magic", "Магия")]
+
+
+def _best_weapon_rows(rarity: str):
+    mult = RARITIES[rarity]["mult"]
+    rows = []
+    for w in WEAPONS.get(rarity, []):
+        lo, hi = w["dmg"]
+        rows.append((infer_weapon_type(w), int(lo * mult), int(hi * mult), w))
+    return rows
+
+
+def _best_armor_rows(rarity: str, slot: str):
+    mult = RARITIES[rarity]["mult"]
+    out = []
+    for a in ARMOR.get(rarity, {}).get(slot, []):
+        out.append((math.ceil(a["hp"] * mult), math.ceil(a.get("mana", 0) * mult), math.ceil(a.get("stamina", 0) * mult), a))
+    return out
+
+
+def best_gear_text(rarity: str) -> str:
+    r = RARITIES[rarity]
+    rar = rarity_html(rarity, r["emoji"])
+    lines = [f"{PE_TROPHY} <b>Лучшее снаряжение</b> · {rar} <b>{r['name']}</b>\n"]
+    # оружие
+    wl = []
+    rows = _best_weapon_rows(rarity)
+    for wtype, wname in BEST_TYPES:
+        cand = sorted((x for x in rows if x[0] == wtype), key=lambda x: (x[1] + x[2], x[2]), reverse=True)
+        if not cand:
+            continue
+        top = cand[0]
+        wl.append(f"{weapon_type_emoji(wtype)} <b>{wname}</b>: {top[3]['emoji']} <b>{html.escape(top[3]['name'])}</b> — "
+                  f"урон <b>{top[1]}–{top[2]}</b>")
+        for lo_, hi_, w in ((x[1], x[2], x[3]) for x in cand[1:]):
+            wl.append(f"      · {w['emoji']} {html.escape(w['name'])} — {lo_}–{hi_}")
+    if wl:
+        lines.append('<tg-emoji emoji-id="5373173798633752502">⚔️</tg-emoji> <b>Оружие</b>\n<blockquote>' + "\n".join(wl) + "</blockquote>")
+    # броня
+    al = []
+    for slot, sname in BEST_SLOTS:
+        cand = _best_armor_rows(rarity, slot)
+        if not cand:
+            continue
+        cand.sort(key=lambda x: (x[0], x[1] + x[2]), reverse=True)
+        hp, mana, stam, a = cand[0]
+        extra = (f" · мана +{mana}" if mana else "") + (f" · выносл. +{stam}" if stam else "")
+        al.append(f"{armor_slot_icon(slot)} <b>{sname}</b>: {a['emoji']} <b>{html.escape(a['name'])}</b> — <b>+{hp}</b> HP{extra}")
+        for hp_, mana_, stam_, a_ in cand[1:]:
+            ex = (f" · мана +{mana_}" if mana_ else "") + (f" · выносл. +{stam_}" if stam_ else "")
+            al.append(f"      · {a_['emoji']} {html.escape(a_['name'])} — +{hp_} HP{ex}")
+    if al:
+        lines.append('<tg-emoji emoji-id="5287786962571241490">🛡</tg-emoji> <b>Броня</b>\n<blockquote>' + "\n".join(al) + "</blockquote>")
+    set_info = ARMOR_SET_INFO.get(rarity)
+    tips = [
+        "Первой в списке стоит лучшая вещь, ниже — остальные по убыванию.",
+        "Оружие бери под свой путь: мечи — ближний бой, луки — луки, посохи и сферы — магия.",
+        "Магам полезна мана на броне, лучникам — выносливость: иногда вещь с ними лучше той, где больше HP.",
+        "Цифры — для 1-го уровня вещи. Уровень, улучшение, гравировка и скрещивание тоже сильно поднимают статы.",
+    ]
+    if set_info:
+        tips.append(f"Любые 2/4/6 вещей брони этой редкости собирают «{set_info['name']}» — бонус к HP и урону.")
+    lines.append("<blockquote expandable>" + "\n".join(f"• {t}" for t in tips) + "</blockquote>")
+    return "\n".join(lines)
+
+
+def best_gear_keyboard(current: str) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for rk in BEST_RARITY_ORDER:
+        if rk not in RARITIES or not (WEAPONS.get(rk) or ARMOR.get(rk)):
+            continue
+        name = RARITIES[rk]["name"]
+        row.append(InlineKeyboardButton(text=("• " + name + " •") if rk == current else name, callback_data=f"best|{rk}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(lambda msg: msg.text and (message_command(msg) in ("лучшее", "лучший", "бис", "шмот")
+                                      or (msg.text or "").strip().casefold() in ("лучшее оружие", "лучшая броня", "что лучше", "лучшее снаряжение")))
+async def text_best_gear(message: Message):
+    if not await db.has_user(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    rarity = "legendary"
+    if len(parts) > 1:
+        q = parts[1].strip().casefold()
+        alias = ESSENCE_RARITY_ALIASES.get(q) if "ESSENCE_RARITY_ALIASES" in globals() else None
+        for rk, info in RARITIES.items():
+            if q in (rk, info["name"].casefold()) or info["name"].casefold().startswith(q[:4]):
+                rarity = rk
+                break
+        else:
+            if alias in RARITIES:
+                rarity = alias
+    await reply_to_user(message, best_gear_text(rarity), best_gear_keyboard(rarity))
+
+
+@dp.callback_query(F.data.startswith("best|"))
+async def cb_best_gear(call: CallbackQuery):
+    rarity = call.data.split("|", 1)[1]
+    if rarity not in RARITIES:
+        await call.answer()
+        return
+    await call.answer()
+    await edit_for_user(call, best_gear_text(rarity), best_gear_keyboard(rarity))
+
+
+# ============================================================
+# === Свой пак прем-эмодзи Lootify (пиксель-арт, встроен в файл) ===
+# Админ-команда «эмодзипак загрузить» сама создаёт наборы кастом-эмодзи через этого бота
+# (по 200 штук в наборе), сохраняет их id в PostgreSQL (kv_state, ключ pe_pack) и сразу
+# подменяет иконки везде: старые прем-эмодзи в текстах и на кнопках, питомцы, боссы,
+# ресурсы, локации, зелья, яйца, рыба, урожай, а у оружия/брони/мобов — эмодзи перед названием.
+# «эмодзипак выкл» — вернуть старые иконки, «эмодзипак вкл» — включить снова.
+# ============================================================
+
+PE_PACK_VER = "2"
+PE_MAX_PER_MESSAGE = 95               # Telegram показывает не больше 100 прем-эмодзи в сообщении
+# картинки пака уже загружены в Telegram (id лежат в базе) — здесь только запасные эмодзи для каждого рисунка
+PE_EMO = {
+    "w:rusty_sword": "🗡",
+    "w:wooden_club": "🏏",
+    "w:stone_knife": "🔪",
+    "w:old_bow": "🏹",
+    "w:broken_axe": "🪓",
+    "w:iron_sword": "⚔",
+    "w:hunting_bow": "🏹",
+    "w:steel_dagger": "🗡",
+    "w:war_hammer": "🔨",
+    "w:battle_axe": "🪓",
+    "w:flame_sword": "🔥",
+    "w:frost_staff": "❄",
+    "w:shadow_blade": "🌑",
+    "w:thunder_bow": "⚡",
+    "w:crystal_spear": "🔮",
+    "w:dragon_slayer": "🐉",
+    "w:void_cleaver": "🌌",
+    "w:phoenix_bow": "🦅",
+    "w:titan_hammer": "💪",
+    "w:excalibur": "⚜",
+    "w:storm_bringer": "🌪",
+    "w:inferno_scythe": "💀",
+    "w:godslayer": "👑",
+    "w:eternity_blade": "✨",
+    "w:reality_ripper": "🖤",
+    "w:abyssal_reaper": "💀",
+    "w:training_saber": "🗡",
+    "w:ash_spear": "⚔",
+    "w:short_bow": "🏹",
+    "w:bone_crossbow": "🎯",
+    "w:spark_wand": "🪄",
+    "w:silver_rapier": "🗡",
+    "w:guardian_halberd": "⚔",
+    "w:ranger_bow": "🏹",
+    "w:hawk_crossbow": "🎯",
+    "w:rune_staff": "🔮",
+    "w:moon_katana": "🌙",
+    "w:obsidian_axe": "🪓",
+    "w:wind_bow": "🏹",
+    "w:storm_crossbow": "🎯",
+    "w:astral_orb": "🔮",
+    "w:blood_reaver": "🩸",
+    "w:star_pike": "✨",
+    "w:eclipse_bow": "🌑",
+    "w:seraph_crossbow": "🪽",
+    "w:chaos_tome": "📕",
+    "w:sun_blade": "☀",
+    "w:leviathan_spear": "🌊",
+    "w:valkyrie_bow": "🪽",
+    "w:dragon_crossbow": "🐉",
+    "w:archmage_staff": "🪄",
+    "w:world_cutter": "🌌",
+    "w:void_lance": "🖤",
+    "w:cosmos_bow": "🌠",
+    "w:fate_crossbow": "🎯",
+    "w:singularity_staff": "🔮",
+    "w:dread_cleaver": "🩸",
+    "w:void_maw": "🕳",
+    "w:nightmare_bow": "🏹",
+    "w:dread_crossbow": "🎯",
+    "w:chaos_grimoire": "📕",
+    "w:forefather_blade": "🗡",
+    "w:first_star_bow": "🏹",
+    "w:lost_era_scepter": "🪄",
+    "w:heaven_judgement": "⚔",
+    "w:sky_verdict_bow": "🏹",
+    "w:ascension_staff": "🔱",
+    "w:first_maker_blade": "🌌",
+    "w:dawn_of_time_bow": "🏹",
+    "w:primal_chaos_orb": "🔮",
+    "a:forefather_crown": "👑",
+    "a:forefather_armor": "🛡",
+    "a:forefather_bracers": "🧤",
+    "a:forefather_greaves": "🦵",
+    "a:forefather_boots": "👢",
+    "a:seraph_halo": "😇",
+    "a:seraph_aegis": "🛡",
+    "a:seraph_bracers": "🧤",
+    "a:seraph_greaves": "🦵",
+    "a:seraph_sandals": "🪽",
+    "a:genesis_crown": "🌌",
+    "a:genesis_shell": "🌌",
+    "a:genesis_bracers": "🌌",
+    "a:genesis_greaves": "🌌",
+    "a:genesis_steps": "🌌",
+    "r:ancient_relic": "🪨",
+    "r:divine_spark": "💫",
+    "r:primordial_core": "🫥",
+    "r:engraving_shard_1": "💎",
+    "r:engraving_shard_2": "💎",
+    "r:engraving_shard_3": "💎",
+    "r:engraving_shard_4": "💎",
+    "a:cloth_hood": "🧢",
+    "a:leather_cap": "🎩",
+    "a:cloth_vest": "👕",
+    "a:leather_jacket": "🧥",
+    "a:cloth_wraps": "🧤",
+    "a:leather_guards": "🫲",
+    "a:cloth_pants": "👖",
+    "a:leather_chaps": "🧦",
+    "a:old_sandals": "🩴",
+    "a:leather_boots": "👞",
+    "a:iron_helmet": "⛑",
+    "a:steel_cap": "🪖",
+    "a:iron_chest": "🛡",
+    "a:chainmail": "🔗",
+    "a:iron_bracers": "🦾",
+    "a:steel_guards": "🛡",
+    "a:iron_greaves": "🦵",
+    "a:steel_leggings": "👖",
+    "a:iron_boots": "👢",
+    "a:steel_sabatons": "🥾",
+    "a:war_helm": "⛑",
+    "a:knight_visor": "🪖",
+    "a:plate_armor": "🛡",
+    "a:dragonhide": "🐉",
+    "a:mithril_bracers": "✨",
+    "a:war_gauntlets": "🧤",
+    "a:plate_greaves": "🦵",
+    "a:knight_leggings": "👖",
+    "a:plate_boots": "👢",
+    "a:war_boots": "🥾",
+    "a:crown_of_power": "👑",
+    "a:helm_of_light": "✨",
+    "a:void_armor": "🌌",
+    "a:titan_plate": "💪",
+    "a:void_bracers": "🌑",
+    "a:titan_gauntlets": "🦾",
+    "a:void_greaves": "🌑",
+    "a:titan_leggings": "🦵",
+    "a:void_boots": "👢",
+    "a:titan_boots": "🥾",
+    "a:crown_of_eternity": "👑",
+    "a:helm_of_gods": "✨",
+    "a:divine_armor": "🛡",
+    "a:eternal_plate": "✨",
+    "a:divine_bracers": "🦾",
+    "a:eternal_gauntlets": "🧤",
+    "a:divine_greaves": "🦵",
+    "a:eternal_leggings": "👖",
+    "a:divine_boots": "👢",
+    "a:eternal_boots": "🥾",
+    "a:crown_of_death": "💀",
+    "a:helm_of_annihilation": "🔥",
+    "a:armor_of_death": "💀",
+    "a:apocalypse_plate": "🌋",
+    "a:bracers_of_death": "💀",
+    "a:apocalypse_gauntlets": "🔥",
+    "a:greaves_of_death": "💀",
+    "a:apocalypse_greaves": "🌋",
+    "a:boots_of_death": "💀",
+    "a:apocalypse_boots": "🔥",
+    "a:crown_of_nightmares": "👹",
+    "a:mask_of_dread": "😱",
+    "a:armor_of_nightmares": "👹",
+    "a:carapace_of_dread": "🕷",
+    "a:bracers_of_nightmares": "👹",
+    "a:claws_of_dread": "🩸",
+    "a:greaves_of_nightmares": "👹",
+    "a:legguards_of_dread": "🕸",
+    "a:boots_of_nightmares": "👹",
+    "a:steps_of_dread": "🖤",
+    "a:apprentice_mantle": "🧥",
+    "a:scout_vest": "🥋",
+    "a:rune_mantle": "🧥",
+    "a:hunter_vest": "🥋",
+    "a:moon_mantle": "🌙",
+    "a:wind_armor": "🍃",
+    "a:void_mantle": "🌌",
+    "a:phoenix_leather": "🦅",
+    "a:divine_mantle": "✨",
+    "a:valkyrie_armor": "🪽",
+    "a:cosmos_mantle": "🌠",
+    "a:fate_light_armor": "🖤",
+    "a:dread_mantle": "👹",
+    "a:nightmare_leather": "🖤",
+    "b:mire_tick": "🪲",
+    "b:bog_rat_king": "🐀",
+    "b:bog_lurker": "🐊",
+    "b:venomspitter": "🐍",
+    "b:mossbeast": "🌿",
+    "b:swamp_hydra": "🐲",
+    "b:corrupted_elder": "🧙",
+    "b:dust_scarab": "🪲",
+    "b:sun_jackal": "🐕",
+    "b:sand_scorpion": "🦂",
+    "b:tomb_guardian": "🗿",
+    "b:sand_djinn": "🌪",
+    "b:pharaoh_revenant": "👑",
+    "b:desert_colossus": "🏔",
+    "b:thorn_pixie": "🧚",
+    "b:night_owl": "🦉",
+    "b:shadow_stalker": "🐺",
+    "b:corrupted_treant": "🌳",
+    "b:night_horror": "🦇",
+    "b:ancient_dryad": "🧚",
+    "b:void_sovereign": "🌑",
+    "b:rift_mite": "🪲",
+    "b:void_imp": "😈",
+    "b:rift_guardian": "🧿",
+    "b:echo_devourer": "🔊",
+    "b:void_archon": "👁",
+    "b:oblivion_titan": "🪨",
+    "b:abyss_heart": "🖤",
+    "b:cinder_scorpion": "🦂",
+    "b:lava_pup": "🐶",
+    "b:magma_crawler": "🌋",
+    "b:ember_wyrm": "🐉",
+    "b:pyroclast": "🔥",
+    "b:forge_titan": "⚒",
+    "b:inferno_monarch": "👑",
+    "b:ice_mite": "🪲",
+    "b:snow_fox": "🦊",
+    "b:frost_stalker": "🐺",
+    "b:glacier_sentinel": "🛡",
+    "b:blizzard_witch": "🧙",
+    "b:aurora_wyrm": "🐉",
+    "b:eternal_frost": "🧊",
+    "b:fear_mite": "🪲",
+    "b:dread_pup": "🐶",
+    "b:nightmare_hound": "🐕",
+    "b:dread_warden": "🛡",
+    "b:horror_architect": "🏛",
+    "b:eclipse_reaper": "⚰",
+    "b:nightmare_throne": "🏰",
+    "b:relic_warden": "🗿",
+    "b:seraph_keeper": "😇",
+    "b:primordial_colossus": "🌌",
+    "m:tiny_leech": "🪱",
+    "m:mud_mite": "🪲",
+    "m:swamp_gnat": "🦟",
+    "m:swamp_rat": "🐀",
+    "m:wet_pup": "🐶",
+    "m:reed_snake": "🐍",
+    "m:mud_leech": "🪱",
+    "m:swamp_frog": "🐸",
+    "m:marsh_crab": "🦀",
+    "m:spore_bat": "🦇",
+    "m:bog_snake": "🐍",
+    "m:rot_sprite": "💀",
+    "m:vine_walker": "🌱",
+    "m:bog_golem": "🪨",
+    "m:mire_shade": "🌑",
+    "m:hydra_head": "🐲",
+    "m:foul_leech": "🪱",
+    "m:toxic_spore": "🍄",
+    "m:bog_specter": "👻",
+    "m:rotling": "🧟",
+    "m:mire_wraith": "💀",
+    "m:sand_flea": "🪲",
+    "m:dry_lizard": "🦎",
+    "m:dune_mite": "🕷",
+    "m:desert_pup": "🐕",
+    "m:heat_snake": "🐍",
+    "m:sand_crow": "🐦",
+    "m:dust_beetle": "🪲",
+    "m:desert_asp": "🐍",
+    "m:sand_sprite": "🌪",
+    "m:bone_archer": "🏹",
+    "m:mummy_warrior": "🧟",
+    "m:cursed_scarab": "🪲",
+    "m:fire_elemental": "🔥",
+    "m:mirage_wraith": "🌫",
+    "m:dust_devil": "🌪",
+    "m:golden_guard": "🗿",
+    "m:pyramid_shade": "🌑",
+    "m:sand_serpent": "🐍",
+    "m:stone_titan": "🪨",
+    "m:ruin_specter": "👻",
+    "m:crypt_beast": "💀",
+    "m:leaf_mite": "🪲",
+    "m:moss_bat": "🦇",
+    "m:root_crawler": "🐛",
+    "m:forest_crow": "🐦",
+    "m:shade_fox": "🦊",
+    "m:whisper_moth": "🦋",
+    "m:dark_wolf": "🐺",
+    "m:cursed_crow": "🐦",
+    "m:thorn_sprite": "🌑",
+    "m:bark_horror": "🌳",
+    "m:root_fiend": "🌱",
+    "m:sap_wraith": "💀",
+    "m:void_bat": "🦇",
+    "m:nightmare_hound": "🐕",
+    "m:shadow_elemental": "🌑",
+    "m:cursed_fae": "🧚",
+    "m:forest_specter": "👻",
+    "m:thorn_beast": "🐗",
+    "m:void_knight": "⚔",
+    "m:dark_herald": "👑",
+    "m:abyss_shade": "🌑",
+    "m:void_flea": "🪲",
+    "m:echo_bug": "🪳",
+    "m:crack_spider": "🕷",
+    "m:tiny_void": "🌑",
+    "m:rift_bat": "🦇",
+    "m:ash_wisp": "✨",
+    "m:shard_watcher": "🧿",
+    "m:rift_blade": "⚔",
+    "m:rift_shadow": "🌫",
+    "m:echo_shard": "🔊",
+    "m:faceless_devourer": "🫀",
+    "m:ash_cultist": "🕯",
+    "m:archon_eye": "👁",
+    "m:chained_phantom": "⛓",
+    "m:void_mage": "🧙",
+    "m:titan_fragment": "🪨",
+    "m:black_knight": "⚫",
+    "m:living_crack": "🩸",
+    "m:end_herald": "🌌",
+    "m:fallen_avatar": "👑",
+    "m:nameless_soul": "💀",
+    "m:ember_mite": "🪲",
+    "m:ash_lizard": "🦎",
+    "m:spark_rat": "🐀",
+    "m:magma_pup": "🐶",
+    "m:hot_snake": "🐍",
+    "m:soot_bat": "🦇",
+    "m:ash_imp": "🔥",
+    "m:lava_slug": "🌋",
+    "m:cinder_wolf": "🐺",
+    "m:flame_drake": "🐉",
+    "m:scorch_mage": "🧙",
+    "m:basalt_golem": "🪨",
+    "m:obsidian_guard": "🛡",
+    "m:eruption_spirit": "💨",
+    "m:molten_knight": "⚔",
+    "m:anvil_wraith": "👻",
+    "m:slag_beast": "🐗",
+    "m:flame_herald": "🔥",
+    "m:crown_of_ash": "👑",
+    "m:living_magma": "🌋",
+    "m:solar_scorch": "☀",
+    "m:frost_flea": "🪲",
+    "m:snow_bug": "🪳",
+    "m:rime_spider": "🕷",
+    "m:ice_pup": "🐶",
+    "m:hail_bat": "🦇",
+    "m:frost_snake": "🐍",
+    "m:ice_whelp": "🧊",
+    "m:snow_shade": "🌨",
+    "m:rime_wolf": "🐺",
+    "m:crystal_archer": "🏹",
+    "m:frozen_knight": "⚔",
+    "m:hail_spirit": "❄",
+    "m:frost_mage": "🧙",
+    "m:ice_golem": "🗿",
+    "m:whiteout": "🌫",
+    "m:aurora_spawn": "🐉",
+    "m:polar_guard": "🛡",
+    "m:cryo_wraith": "👻",
+    "m:world_ice": "🧊",
+    "m:frozen_sovereign": "👑",
+    "m:absolute_zero": "❄",
+    "m:dread_flea": "🪲",
+    "m:nightmare_bug": "🪳",
+    "m:shadow_spider": "🕷",
+    "m:horror_pup": "🐶",
+    "m:nightmare_bat": "🦇",
+    "m:fear_snake": "🐍",
+    "m:dream_leech": "🩸",
+    "m:fear_spawn": "😱",
+    "m:shadow_fang": "🐺",
+    "m:terror_knight": "⚔",
+    "m:mind_breaker": "🧠",
+    "m:chain_specter": "⛓",
+    "m:blueprint_horror": "📜",
+    "m:living_nightmare": "👹",
+    "m:void_sculptor": "🗿",
+    "m:scythe_shade": "💀",
+    "m:eclipse_knight": "🌑",
+    "m:soul_harvester": "⚰",
+    "m:throne_guard": "🛡",
+    "m:crown_horror": "👑",
+    "m:final_dream": "💤",
+    "m:relic_golem": "🗿",
+    "m:dust_priest": "🏺",
+    "m:ancestor_shade": "👤",
+    "m:light_warden": "🪽",
+    "m:choir_angel": "😇",
+    "m:halo_spirit": "✨",
+    "m:genesis_shard": "🌌",
+    "m:void_seed": "🕳",
+    "m:first_flame": "🔥",
+    "r:swamp_fragment": "🧩",
+    "r:swamp_crystal": "💚",
+    "r:curse_shard": "🔮",
+    "r:desert_fragment": "🧩",
+    "r:dried_eye": "🪬",
+    "r:eternity_stone": "🌑",
+    "r:forest_fragment": "🧩",
+    "r:night_shard": "🌕",
+    "r:void_blood": "🩸",
+    "r:rift_fragment": "🧩",
+    "r:rift_shard": "💎",
+    "r:abyss_core": "🖤",
+    "r:volcano_fragment": "🧩",
+    "r:ember_stone": "🌋",
+    "r:magma_core": "🌟",
+    "r:glacier_fragment": "🧩",
+    "r:frost_crystal": "💎",
+    "r:eternal_ice": "🧊",
+    "r:citadel_fragment": "🧩",
+    "r:nightmare_shard": "💎",
+    "r:throne_essence": "🌑",
+    "bk:hp:f": "🟥",
+    "bk:hp:e": "⬜",
+    "bk:xp:f": "🟪",
+    "bk:xp:e": "⬜",
+    "bk:gold:f": "🟨",
+    "bk:gold:e": "⬜",
+    "bk:green:f": "🟩",
+    "bk:green:e": "⬜",
+    "bk:blue:f": "🟦",
+    "bk:blue:e": "⬜",
+    "bk:cyan:f": "🟦",
+    "bk:cyan:e": "⬜",
+    "bk:indigo:f": "🟪",
+    "bk:indigo:e": "⬜",
+    "bk:orange:f": "🟧",
+    "bk:orange:e": "⬜",
+    "s:crit_damage": "🔥",
+    "s:evasion": "🌀",
+    "s:greed": "🪙",
+    "n:folder": "📂",
+    "n:medal_mil": "🎖",
+    "n:palette": "🎨",
+    "n:medal": "🏅",
+    "n:search": "🔎",
+    "n:mailbox": "📭",
+    "n:megaphone": "📢",
+    "n:picture": "🖼",
+    "p:damage_potion": "⚔",
+    "p:xp_potion": "✨",
+    "p:luck_potion": "🍀",
+    "p:speed_potion": "⏱",
+    "p:coins_potion": "🪙",
+    "p:crit_potion": "💥",
+    "p:armor_potion": "🛡",
+    "p:inferno_potion": "🌋",
+    "p:frost_potion": "🧊",
+    "p:nightmare_potion": "🏰",
+    "pet:rat": "🐁",
+    "pet:lava_goblin": "🤯",
+    "pet:storm_crow": "⚡",
+    "pet:cute_cat": "🥰",
+    "pet:wise_skull": "💀",
+    "pet:mushroom_spirit": "🤬",
+    "pet:smoldering_fox": "🤩",
+    "pet:crystal_demon": "🧊",
+    "pet:star_whale": "🐋",
+    "pet:cursed_yarn": "🧶",
+    "pet:bloody_plush": "❤",
+    "pet:pink_nightmare": "👻",
+    "pet:zombie_virus": "📍",
+    "pet:burning_angel": "🔥",
+    "pet:bloody_cherry": "😭",
+    "pet:loser_clown": "😡",
+    "pet:shadow_whisper": "🕷",
+    "pet:black_reaper": "💀",
+    "pet:echo_bat": "🦇",
+    "pet:rift_warden": "🛡",
+    "pet:void_firefly": "✨",
+    "pet:abyss_eye": "👀",
+    "pet:rift_heart": "🩸",
+    "pet:void_tempest": "🌪",
+    "pet:ash_pup": "🔥",
+    "pet:coal_beetle": "💢",
+    "pet:lava_drake": "🐲",
+    "pet:forge_golem": "🛠",
+    "pet:inferno_phoenix": "💥",
+    "pet:snow_kit": "❄",
+    "pet:frost_penguin": "🐧",
+    "pet:crystal_hedgehog": "🦔",
+    "pet:polar_wolf": "🐺",
+    "pet:eternal_leviathan": "🐍",
+    "pet:dread_shade": "👻",
+    "pet:night_kitten": "🐈",
+    "pet:throne_guard": "👑",
+    "pet:blood_moon": "🌕",
+    "pet:nightmare_king": "🔮",
+    "pet:dream_eater": "🧠",
+    "fish:crucian": "🐟",
+    "fish:perch": "🐟",
+    "fish:pike": "🐠",
+    "fish:catfish": "🐟",
+    "fish:sturgeon": "🦈",
+    "fish:goldfish": "🐠",
+    "fish:whale": "🐋",
+    "crop:wheat": "🌾",
+    "crop:carrot": "🥕",
+    "crop:pumpkin": "🎃",
+    "crop:mandrake": "🌿",
+    "crop:moonflower": "🌕",
+    "egg:swamp_egg": "🥚",
+    "egg:desert_egg": "🏜",
+    "egg:void_egg": "🖤",
+    "egg:abyss_egg": "🌪",
+    "egg:magma_egg": "🌋",
+    "egg:frost_egg": "❄",
+    "egg:nightmare_egg": "🔮",
+    "loc:swamp": "🌿",
+    "loc:desert": "🏜",
+    "loc:forest": "🌲",
+    "loc:rift": "🕳",
+    "loc:volcano": "🌋",
+    "loc:glacier": "🧊",
+    "loc:citadel": "🏰",
+    "loc:sanctuary": "🏛",
+    "ui:5433607098044786991": "🤍",
+    "ui:5263017207570377685": "🟢",
+    "ui:5262911336626532017": "🔵",
+    "ui:5262850554249358633": "🟣",
+    "ui:5330503032260018668": "🧡",
+    "ui:5260744435431387686": "🔴",
+    "ui:5380061444412816572": "🚀",
+    "ui:5415685406404399121": "📜",
+    "ui:5787496116719195306": "🎮",
+    "ui:5454057640659269884": "🌌",
+    "ui:5352669272575321097": "❌",
+    "ui:5467552960479255933": "▪",
+    "ui:5314779711040134513": "🏹",
+    "ui:5287734091523829559": "🔮",
+    "ui:5359778044745622115": "🏛",
+    "ui:5325762861539016690": "✅",
+    "ui:5433594926107481306": "⚪",
+    "ui:5431816358675366190": "🆙",
+    "ui:6084922627736996647": "🆙",
+    "ui:5226431245918942763": "🏆",
+    "ui:6327816922544997828": "💀",
+    "ui:5370831521039017384": "✨",
+    "ui:5431664183689093623": "📃",
+    "ui:5474265685125271190": "🩸",
+    "ui:5217572051237228647": "💨",
+    "ui:5854908544712707500": "📦",
+    "ui:5453957997418004470": "👥",
+    "ui:5373012449597335010": "👤",
+    "ui:5837012579926412863": "🪪",
+    "ui:5947121436723252849": "👑",
+    "ui:5287786962571241490": "🛡",
+    "ui:5197555094161234652": "🌿",
+    "ui:5463046637842608206": "🪙",
+    "ui:5237947646672385924": "🤬",
+    "ui:5217822164362739968": "👑",
+    "ui:5440660757194744323": "‼",
+    "ui:5237707472101198238": "💙",
+    "ui:6269538837723090339": "🌟",
+    "ui:5404728536810398694": "🧊",
+    "ui:5152140264592115014": "🌑",
+    "ui:5197646705813634076": "🐍",
+    "ui:5258112758645282249": "🐲",
+    "ui:6332347924063717264": "🌪",
+    "ui:5276289730256842699": "🐺",
+    "ui:5453960591578265840": "🦇",
+    "ui:5408854995359524419": "💎",
+    "ui:5109480514809497205": "💎",
+    "ui:5309892729747027885": "🌋",
+    "ui:5188375125552033525": "💎",
+    "ui:5332518162195816960": "❄",
+    "ui:5300780965218506304": "🖤",
+    "ui:6228978596803774375": "🧩",
+    "ui:5366300377786365557": "🌕",
+    "ui:5458384287634042890": "💎",
+    "ui:6325309396083543238": "💎",
+    "ui:5794158469988753026": "💎",
+    "ui:5411512278740640309": "🧪",
+    "ui:5373173798633752502": "🛡",
+    "ui:5431631782455819233": "🧪",
+    "ui:5395325195542078574": "🍀",
+    "ui:5287473790735890430": "⏳",
+    "ui:5895509368778001770": "😡",
+    "ui:5445217335243732887": "🧪",
+    "ui:5293998404404272267": "🎁",
+    "ui:5373268949339227455": "🔫",
+    "ui:5386367538735104399": "⌛",
+    "ui:5404843113652970870": "❤",
+    "ui:5332336747072208845": "🔥",
+    "ui:6267107250578395601": "😃",
+    "ui:5197269100878907942": "✍",
+    "ui:5215614521107820706": "🩶",
+    "ui:5870508673385630878": "🥇",
+    "ui:5283195573812340110": "🥈",
+    "ui:5870770249778859469": "🥉",
+    "ui:5947236241199074198": "🏆",
+    "ui:5102856631562011824": "🎰",
+    "ui:6131692360574178778": "😠",
+    "ui:5463413771647069835": "💪",
+    "ui:6278098265162387317": "🤩",
+    "ui:5382325570782641346": "🛡",
+    "ui:5366231924597604153": "⚙",
+    "ui:5080591035768242999": "📱",
+    "ui:5305573302612275570": "🤑",
+    "ui:5463277406435422003": "🗡",
+    "ui:5213214428958306222": "🛠",
+    "ui:5346321684574003384": "🔄",
+    "ui:5462921117423384478": "🛠",
+    "ui:6325752533629273447": "🧠",
+    "ui:5346196507752149522": "👀",
+    "ui:5188280649156420607": "🩸",
+    "ui:5276032951342088188": "💥",
+    "ui:5463274047771000031": "😵",
+    "ui:5819022417917383759": "🔊",
+    "ui:5197382973346831067": "🗞",
+    "ui:5436082025704485068": "🗺",
+    "ui:5278472131988957856": "🤔",
+    "ui:5325593644122524396": "✅",
+    "ui:5296369303661067030": "🔒",
+    "ui:5235516570628796933": "🤣",
+    "ui:5863945989127148135": "🛠",
+    "ui:5199507732322858635": "⏳",
+    "ui:5233312311808108588": "🐁",
+    "ui:6264760978664065671": "🐋",
+    "ui:5260635566600379633": "👺",
+    "ui:5276124975311370560": "👀",
+    "ui:5368451104134685900": "💥",
+    "ui:5998843468716184159": "❤",
+    "ui:5996724404866781885": "💚",
+    "ui:5999050546269393954": "💙",
+    "ui:5996878877660550510": "🩷",
+    "ui:5996631019392864971": "🧡",
+    "ui:5996898247963055513": "🖤",
+    "ui:5395625559784968299": "🍰",
+    "ui:5314365427084699313": "🦭",
+    "ui:5332550902731535734": "🥚",
+    "ui:5201715538786532024": "👑",
+    "ui:5292282260026852449": "🥚",
+    "ui:5326020190209597614": "🖤",
+    "ui:5258111319831227095": "🐾",
+    "ui:5445267414562389170": "🗑",
+    "ui:5787432469598835099": "⏳",
+    "ui:5440841102871517055": "🛒",
+    "ui:5354920801806066333": "👍",
+    "ui:5028418466000930064": "📅",
+    "ui:5474653499197237958": "💎",
+    "ui:5888553613407559045": "🗒",
+    "ui:5379604008920953837": "🌟",
+    "ui:5305580419373085129": "🤟",
+    "ui:5206445062283606707": "💜",
+    "ui:5429519916971599983": "💻",
+    "ui:5354961788678978979": "🤕",
+    "ui:5895695027329306229": "🔪",
+    "ui:5321348429727700857": "💪",
+    "ui:5323289935334096761": "🌐",
+    "ui:5253456953966881468": "🗓",
+    "ui:5310119641459206495": "🙂",
+    "ui:5226702984204797593": "🔄",
+    "ui:5832572966721818453": "🟢",
+    "ui:5215327492738392838": "🔩",
+    "ui:5465566014118838764": "🔠",
+    "ui:5465538869925531001": "🔠",
+    "ui:5465310841521852852": "🔠",
+    "ui:5465344685864142659": "🔠",
+    "ui:5465208324947460890": "🔠",
+    "ui:5465183590230804569": "🔠",
+    "ui:5328313337673439040": "🌟",
+    "ui:5442879640379076105": "👤",
+    "ui:5375590976163167999": "🥳",
+    "ui:5231200819986047254": "📊",
+    "ui:6251319294395680297": "🍉",
+    "ui:5370632904571380120": "⏏",
+    "ui:5278491193053822590": "🧹",
+    "ui:5422756842424001375": "👅",
+    "ui:5298740971717014204": "🧪",
+    "ui:5323473579545750037": "🧪",
+    "ui:5303214794336125778": "🎁",
+    "ui:5474447727314094004": "🌟",
+    "ui:5870557000357646193": "📖",
+    "ui:5382210409824525356": "🐟",
+    "ui:5397842858126353661": "🐠",
+    "ui:5343609421316521960": "🎣",
+    "ui:5289516580261091134": "🌾",
+    "ui:5454360160975722988": "🍵",
+    "ui:5337252697919733073": "🌒",
+    "ui:5310136198558132006": "❤",
+    "ui:5316705445526650267": "✨",
+    "ui:5215361191051798408": "⭐",
+    "ui:5355014719855944810": "⭐",
+    "ui:5258194951434417615": "⭐",
+    "ui:5213214459023076318": "⭐",
+    "ui:5776295774019129488": "⭐",
+    "ui:5785047676122829152": "⭐",
+    "ui:5355271322677047411": "⭐",
+    "ui:5359568849773536103": "⭐",
+    "ui:5812255572388482653": "⭐",
+    "ui:6023814584668786851": "⭐",
+    "ui:5226538800489979214": "⭐",
+    "ui:5380063944083775772": "⭐",
+    "ui:5429409553491960932": "⭐",
+    "ui:5273728035667855738": "⭐",
+    "ui:5330280024673101519": "⭐",
+    "ui:5226929552319594190": "⭐",
+    "ui:5866156028973813402": "⭐",
+    "ui:5886440704246288436": "⭐",
+    "ui:5780530293945405228": "⭐",
+}
+# старый id прем-эмодзи → ключ рисунка из пака
+# (буквы плашки «ВЛАДЕЛЕЦ» не подменяются — это оригинальные буквы-эмодзи)
+PE_ALIAS = {
+    "5433607098044786991": "ui:5433607098044786991",
+    "5263017207570377685": "ui:5263017207570377685",
+    "5262911336626532017": "ui:5262911336626532017",
+    "5262850554249358633": "ui:5262850554249358633",
+    "5330503032260018668": "ui:5330503032260018668",
+    "5260744435431387686": "ui:5260744435431387686",
+    "5380061444412816572": "ui:5380061444412816572",
+    "5415685406404399121": "ui:5415685406404399121",
+    "5787496116719195306": "ui:5787496116719195306",
+    "5454057640659269884": "ui:5454057640659269884",
+    "5352669272575321097": "ui:5352669272575321097",
+    "5467552960479255933": "ui:5467552960479255933",
+    "5314779711040134513": "ui:5314779711040134513",
+    "5287734091523829559": "ui:5287734091523829559",
+    "5359778044745622115": "ui:5359778044745622115",
+    "5325762861539016690": "ui:5325762861539016690",
+    "5433594926107481306": "ui:5433594926107481306",
+    "5431816358675366190": "ui:5431816358675366190",
+    "6084922627736996647": "ui:6084922627736996647",
+    "5226431245918942763": "ui:5226431245918942763",
+    "6327816922544997828": "ui:6327816922544997828",
+    "5370831521039017384": "ui:5370831521039017384",
+    "5431664183689093623": "ui:5431664183689093623",
+    "5474265685125271190": "ui:5474265685125271190",
+    "5217572051237228647": "ui:5217572051237228647",
+    "5854908544712707500": "ui:5854908544712707500",
+    "5453957997418004470": "ui:5453957997418004470",
+    "5373012449597335010": "ui:5373012449597335010",
+    "5837012579926412863": "ui:5837012579926412863",
+    "5947121436723252849": "ui:5947121436723252849",
+    "5219938896044909131": "pet:shadow_whisper",
+    "5287786962571241490": "ui:5287786962571241490",
+    "5197555094161234652": "ui:5197555094161234652",
+    "5463046637842608206": "ui:5463046637842608206",
+    "5237947646672385924": "ui:5237947646672385924",
+    "5217822164362739968": "ui:5217822164362739968",
+    "5440660757194744323": "ui:5440660757194744323",
+    "5837137271416950239": "loc:desert",
+    "5839431531277323597": "loc:forest",
+    "5237707472101198238": "ui:5237707472101198238",
+    "6269538837723090339": "ui:6269538837723090339",
+    "5404728536810398694": "ui:5404728536810398694",
+    "5152140264592115014": "ui:5152140264592115014",
+    "5111604109849396836": "b:mire_tick",
+    "6201647288947839133": "b:bog_rat_king",
+    "5371038405318682250": "b:bog_lurker",
+    "5197646705813634076": "ui:5197646705813634076",
+    "5276329458704348440": "b:mossbeast",
+    "5258112758645282249": "ui:5258112758645282249",
+    "5319133596697524570": "b:corrupted_elder",
+    "5109823807250498812": "b:dust_scarab",
+    "5111836351615993305": "b:sun_jackal",
+    "5380003148821712039": "b:sand_scorpion",
+    "5314654916470391126": "b:tomb_guardian",
+    "6332347924063717264": "ui:6332347924063717264",
+    "5807614228864962198": "b:pharaoh_revenant",
+    "5316812085269647504": "b:desert_colossus",
+    "5339250368813490945": "b:thorn_pixie",
+    "5850500039956239502": "b:night_owl",
+    "5276289730256842699": "ui:5276289730256842699",
+    "5787634749673573777": "b:corrupted_treant",
+    "5453960591578265840": "ui:5453960591578265840",
+    "5244781377726981908": "b:ancient_dryad",
+    "5327997240965350739": "b:void_sovereign",
+    "5994295021040309628": "b:rift_mite",
+    "6325618998801074473": "b:void_imp",
+    "6138471781767319985": "b:rift_guardian",
+    "5408854995359524419": "ui:5408854995359524419",
+    "5370780187589877038": "b:oblivion_titan",
+    "5206302688412723181": "b:abyss_heart",
+    "5411379624380753032": "b:cinder_scorpion",
+    "5371011991269821266": "b:lava_pup",
+    "5460657218686822628": "b:magma_crawler",
+    "5109480514809497205": "ui:5109480514809497205",
+    "5309892729747027885": "ui:5309892729747027885",
+    "5341588768052749580": "b:forge_titan",
+    "5411557058069687989": "b:ice_mite",
+    "6006025324049995914": "b:snow_fox",
+    "5188375125552033525": "ui:5188375125552033525",
+    "5397766996119013579": "b:glacier_sentinel",
+    "5332518162195816960": "ui:5332518162195816960",
+    "5384389684820471923": "b:aurora_wyrm",
+    "5111979661789758771": "b:fear_mite",
+    "5251329454801710673": "b:dread_pup",
+    "5300780965218506304": "ui:5300780965218506304",
+    "5404768823603650652": "b:dread_warden",
+    "5382165961207988403": "b:horror_architect",
+    "5282763272469101846": "b:eclipse_reaper",
+    "5213305508034783384": "b:relic_warden",
+    "5341427891462742378": "b:seraph_keeper",
+    "5343797957495908005": "b:primordial_colossus",
+    "6228978596803774375": "ui:6228978596803774375",
+    "5330522587246130983": "r:swamp_crystal",
+    "5857411922235755785": "r:dried_eye",
+    "5188497854242495901": "r:eternity_stone",
+    "5366300377786365557": "ui:5366300377786365557",
+    "5458384287634042890": "ui:5458384287634042890",
+    "5456555421839929629": "r:engraving_shard_2",
+    "6325309396083543238": "ui:6325309396083543238",
+    "5794158469988753026": "ui:5794158469988753026",
+    "5460851114985411058": "r:ancient_relic",
+    "5215454078309506628": "r:divine_spark",
+    "6001408848387116590": "r:primordial_core",
+    "5411512278740640309": "ui:5411512278740640309",
+    "5373173798633752502": "ui:5373173798633752502",
+    "5431631782455819233": "ui:5431631782455819233",
+    "5395325195542078574": "ui:5395325195542078574",
+    "5287473790735890430": "ui:5287473790735890430",
+    "5895509368778001770": "ui:5895509368778001770",
+    "5445217335243732887": "ui:5445217335243732887",
+    "5293998404404272267": "ui:5293998404404272267",
+    "5373268949339227455": "ui:5373268949339227455",
+    "5386367538735104399": "ui:5386367538735104399",
+    "5404843113652970870": "ui:5404843113652970870",
+    "5332336747072208845": "ui:5332336747072208845",
+    "6267107250578395601": "ui:6267107250578395601",
+    "5197269100878907942": "ui:5197269100878907942",
+    "5215614521107820706": "ui:5215614521107820706",
+    "5870508673385630878": "ui:5870508673385630878",
+    "5283195573812340110": "ui:5283195573812340110",
+    "5870770249778859469": "ui:5870770249778859469",
+    "5947236241199074198": "ui:5947236241199074198",
+    "5102856631562011824": "ui:5102856631562011824",
+    "6131692360574178778": "ui:6131692360574178778",
+    "5463413771647069835": "ui:5463413771647069835",
+    "6278098265162387317": "ui:6278098265162387317",
+    "5382325570782641346": "ui:5382325570782641346",
+    "5366231924597604153": "ui:5366231924597604153",
+    "5080591035768242999": "ui:5080591035768242999",
+    "5305573302612275570": "ui:5305573302612275570",
+    "5463277406435422003": "ui:5463277406435422003",
+    "5213214428958306222": "ui:5213214428958306222",
+    "5346321684574003384": "ui:5346321684574003384",
+    "5462921117423384478": "ui:5462921117423384478",
+    "6325752533629273447": "ui:6325752533629273447",
+    "5346196507752149522": "ui:5346196507752149522",
+    "5188280649156420607": "ui:5188280649156420607",
+    "5276032951342088188": "ui:5276032951342088188",
+    "5949477861940268473": "pet:coal_beetle",
+    "5463274047771000031": "ui:5463274047771000031",
+    "5819022417917383759": "ui:5819022417917383759",
+    "5197382973346831067": "ui:5197382973346831067",
+    "5436082025704485068": "ui:5436082025704485068",
+    "5278472131988957856": "ui:5278472131988957856",
+    "5325593644122524396": "ui:5325593644122524396",
+    "5296369303661067030": "ui:5296369303661067030",
+    "5235516570628796933": "ui:5235516570628796933",
+    "5863945989127148135": "ui:5863945989127148135",
+    "5199507732322858635": "ui:5199507732322858635",
+    "5233312311808108588": "ui:5233312311808108588",
+    "6136550299298436991": "pet:storm_crow",
+    "6264760978664065671": "ui:6264760978664065671",
+    "5321057982564278667": "pet:smoldering_fox",
+    "5291878919648058464": "pet:mushroom_spirit",
+    "5258210194273349779": "pet:cute_cat",
+    "5328197871772653438": "pet:wise_skull",
+    "5260635566600379633": "ui:5260635566600379633",
+    "4958558095627256768": "pet:cursed_yarn",
+    "5244588671134362147": "pet:bloody_plush",
+    "5836792510097133071": "pet:zombie_virus",
+    "5102628843676501227": "pet:burning_angel",
+    "5458887228304413686": "pet:bloody_cherry",
+    "5231047021502146105": "pet:loser_clown",
+    "5276124975311370560": "ui:5276124975311370560",
+    "5368451104134685900": "ui:5368451104134685900",
+    "5246793007264453238": "pet:frost_penguin",
+    "5370935695470763110": "pet:night_kitten",
+    "5095957483860526331": "pet:dread_shade",
+    "5386585400951186862": "pet:crystal_hedgehog",
+    "5998843468716184159": "ui:5998843468716184159",
+    "5996724404866781885": "ui:5996724404866781885",
+    "5999050546269393954": "ui:5999050546269393954",
+    "5996878877660550510": "ui:5996878877660550510",
+    "5996631019392864971": "ui:5996631019392864971",
+    "5996898247963055513": "ui:5996898247963055513",
+    "5395625559784968299": "ui:5395625559784968299",
+    "5314365427084699313": "ui:5314365427084699313",
+    "5332550902731535734": "ui:5332550902731535734",
+    "5201715538786532024": "ui:5201715538786532024",
+    "5292282260026852449": "ui:5292282260026852449",
+    "5326020190209597614": "ui:5326020190209597614",
+    "5258111319831227095": "ui:5258111319831227095",
+    "5445267414562389170": "ui:5445267414562389170",
+    "5787432469598835099": "ui:5787432469598835099",
+    "5440841102871517055": "ui:5440841102871517055",
+    "5354920801806066333": "ui:5354920801806066333",
+    "5028418466000930064": "ui:5028418466000930064",
+    "5474653499197237958": "ui:5474653499197237958",
+    "5888553613407559045": "ui:5888553613407559045",
+    "5379604008920953837": "ui:5379604008920953837",
+    "5305580419373085129": "ui:5305580419373085129",
+    "5206445062283606707": "ui:5206445062283606707",
+    "5429519916971599983": "ui:5429519916971599983",
+    "5354961788678978979": "ui:5354961788678978979",
+    "5895695027329306229": "ui:5895695027329306229",
+    "5321348429727700857": "ui:5321348429727700857",
+    "5323289935334096761": "ui:5323289935334096761",
+    "5253456953966881468": "ui:5253456953966881468",
+    "5310119641459206495": "ui:5310119641459206495",
+    "5226702984204797593": "ui:5226702984204797593",
+    "5832572966721818453": "ui:5832572966721818453",
+    "5215327492738392838": "ui:5215327492738392838",
+    "5328313337673439040": "ui:5328313337673439040",
+    "5442879640379076105": "ui:5442879640379076105",
+    "5375590976163167999": "ui:5375590976163167999",
+    "5231200819986047254": "ui:5231200819986047254",
+    "6251319294395680297": "ui:6251319294395680297",
+    "5370632904571380120": "ui:5370632904571380120",
+    "5278491193053822590": "ui:5278491193053822590",
+    "5422756842424001375": "ui:5422756842424001375",
+    "5298740971717014204": "ui:5298740971717014204",
+    "5323473579545750037": "ui:5323473579545750037",
+    "5303214794336125778": "ui:5303214794336125778",
+    "5474447727314094004": "ui:5474447727314094004",
+    "5870557000357646193": "ui:5870557000357646193",
+    "5382210409824525356": "ui:5382210409824525356",
+    "5397842858126353661": "ui:5397842858126353661",
+    "5208955071236156585": "fish:catfish",
+    "5204117997463030808": "fish:sturgeon",
+    "5343609421316521960": "ui:5343609421316521960",
+    "5289516580261091134": "ui:5289516580261091134",
+    "5429630722832877722": "crop:carrot",
+    "6037368668231307433": "crop:pumpkin",
+    "5454360160975722988": "ui:5454360160975722988",
+    "5337252697919733073": "ui:5337252697919733073",
+    "5310136198558132006": "ui:5310136198558132006",
+    "5316705445526650267": "ui:5316705445526650267",
+    "5215361191051798408": "ui:5215361191051798408",
+    "5355014719855944810": "ui:5355014719855944810",
+    "5258194951434417615": "ui:5258194951434417615",
+    "5213214459023076318": "ui:5213214459023076318",
+    "5776295774019129488": "ui:5776295774019129488",
+    "5785047676122829152": "ui:5785047676122829152",
+    "5355271322677047411": "ui:5355271322677047411",
+    "5359568849773536103": "ui:5359568849773536103",
+    "5812255572388482653": "ui:5812255572388482653",
+    "6023814584668786851": "ui:6023814584668786851",
+    "5226538800489979214": "ui:5226538800489979214",
+    "5380063944083775772": "ui:5380063944083775772",
+    "5429409553491960932": "ui:5429409553491960932",
+    "5273728035667855738": "ui:5273728035667855738",
+    "5330280024673101519": "ui:5330280024673101519",
+    "5226929552319594190": "ui:5226929552319594190",
+    "5866156028973813402": "ui:5866156028973813402",
+    "5886440704246288436": "ui:5886440704246288436",
+    "5780530293945405228": "ui:5780530293945405228",
+}
+# (ключ, обычный эмодзи, название) — для подмены «эмодзи + название» у предметов и мобов
+PE_NAMES = [
+    ["w:rusty_sword", "🗡️", "Ржавый меч"],
+    ["w:wooden_club", "🏏", "Деревянная дубина"],
+    ["w:stone_knife", "🔪", "Каменный нож"],
+    ["w:old_bow", "🏹", "Старый лук"],
+    ["w:broken_axe", "🪓", "Сломанный топор"],
+    ["w:iron_sword", "⚔️", "Железный меч"],
+    ["w:hunting_bow", "🏹", "Охотничий лук"],
+    ["w:steel_dagger", "🗡️", "Стальной кинжал"],
+    ["w:war_hammer", "🔨", "Боевой молот"],
+    ["w:battle_axe", "🪓", "Секира"],
+    ["w:flame_sword", "🔥", "Пылающий меч"],
+    ["w:frost_staff", "❄️", "Ледяной посох"],
+    ["w:shadow_blade", "🌑", "Клинок тени"],
+    ["w:thunder_bow", "⚡", "Громовой лук"],
+    ["w:crystal_spear", "🔮", "Кристальное копьё"],
+    ["w:dragon_slayer", "🐉", "Драконобой"],
+    ["w:void_cleaver", "🌌", "Рассекатель бездны"],
+    ["w:phoenix_bow", "🦅", "Лук феникса"],
+    ["w:titan_hammer", "💪", "Молот титана"],
+    ["w:excalibur", "⚜️", "Экскалибур"],
+    ["w:storm_bringer", "🌪️", "Штормовой вестник"],
+    ["w:inferno_scythe", "💀", "Коса инферно"],
+    ["w:godslayer", "👑", "Богоубийца"],
+    ["w:eternity_blade", "✨", "Клинок вечности"],
+    ["w:reality_ripper", "🖤", "Разрыватель реальности"],
+    ["w:abyssal_reaper", "💀", "Бездонная коса"],
+    ["w:training_saber", "🗡", "Учебная сабля"],
+    ["w:ash_spear", "⚔️", "Ясеневое копьё"],
+    ["w:short_bow", "🏹", "Короткий лук"],
+    ["w:bone_crossbow", "🎯", "Костяной арбалет"],
+    ["w:spark_wand", "🪄", "Искрящая палочка"],
+    ["w:silver_rapier", "🗡", "Серебряная рапира"],
+    ["w:guardian_halberd", "⚔️", "Алебарда стража"],
+    ["w:ranger_bow", "🏹", "Лук следопыта"],
+    ["w:hawk_crossbow", "🎯", "Ястребиный арбалет"],
+    ["w:rune_staff", "🔮", "Рунный посох"],
+    ["w:moon_katana", "🌙", "Лунная катана"],
+    ["w:obsidian_axe", "🪓", "Обсидиановый топор"],
+    ["w:wind_bow", "🏹", "Лук ветра"],
+    ["w:storm_crossbow", "🎯", "Грозовой арбалет"],
+    ["w:astral_orb", "🔮", "Астральная сфера"],
+    ["w:blood_reaver", "🩸", "Кровавый жнец"],
+    ["w:star_pike", "✨", "Звёздная пика"],
+    ["w:eclipse_bow", "🌑", "Лук затмения"],
+    ["w:seraph_crossbow", "🪽", "Арбалет серафима"],
+    ["w:chaos_tome", "📕", "Том хаоса"],
+    ["w:sun_blade", "☀️", "Солнечный клинок"],
+    ["w:leviathan_spear", "🌊", "Копьё левиафана"],
+    ["w:valkyrie_bow", "🪽", "Лук валькирии"],
+    ["w:dragon_crossbow", "🐉", "Драконий арбалет"],
+    ["w:archmage_staff", "🪄", "Посох архимага"],
+    ["w:world_cutter", "🌌", "Рассекатель миров"],
+    ["w:void_lance", "🖤", "Копьё пустоты"],
+    ["w:cosmos_bow", "🌠", "Лук космоса"],
+    ["w:fate_crossbow", "🎯", "Арбалет судьбы"],
+    ["w:singularity_staff", "🔮", "Посох сингулярности"],
+    ["w:dread_cleaver", "🩸", "Тесак ужаса"],
+    ["w:void_maw", "🕳️", "Пасть бездны"],
+    ["w:nightmare_bow", "🏹", "Лук кошмара"],
+    ["w:dread_crossbow", "🎯", "Арбалет ужаса"],
+    ["w:chaos_grimoire", "📕", "Гримуар хаоса"],
+    ["w:forefather_blade", "🗡", "Клинок праотцов"],
+    ["w:first_star_bow", "🏹", "Лук первых звёзд"],
+    ["w:lost_era_scepter", "🪄", "Скипетр забытых эпох"],
+    ["w:heaven_judgement", "⚔️", "Карающий меч небес"],
+    ["w:sky_verdict_bow", "🏹", "Лук небесного суда"],
+    ["w:ascension_staff", "🔱", "Посох вознесения"],
+    ["w:first_maker_blade", "🌌", "Клинок Первотворца"],
+    ["w:dawn_of_time_bow", "🏹", "Лук начала времён"],
+    ["w:primal_chaos_orb", "🔮", "Сфера первозданного хаоса"],
+    ["a:forefather_crown", "👑", "Венец праотцов"],
+    ["a:forefather_armor", "🛡", "Доспех праотцов"],
+    ["a:forefather_bracers", "🧤", "Наручи праотцов"],
+    ["a:forefather_greaves", "🦵", "Поножи праотцов"],
+    ["a:forefather_boots", "👢", "Сапоги праотцов"],
+    ["a:seraph_halo", "😇", "Нимб серафима"],
+    ["a:seraph_aegis", "🛡", "Эгида серафима"],
+    ["a:seraph_bracers", "🧤", "Наручи серафима"],
+    ["a:seraph_greaves", "🦵", "Поножи серафима"],
+    ["a:seraph_sandals", "🪽", "Сандалии серафима"],
+    ["a:genesis_crown", "🌌", "Корона Генезиса"],
+    ["a:genesis_shell", "🌌", "Панцирь Генезиса"],
+    ["a:genesis_bracers", "🌌", "Наручи Генезиса"],
+    ["a:genesis_greaves", "🌌", "Поножи Генезиса"],
+    ["a:genesis_steps", "🌌", "Поступь Генезиса"],
+    ["a:cloth_hood", "🧢", "Тканевый капюшон"],
+    ["a:leather_cap", "🎩", "Кожаная шапка"],
+    ["a:cloth_vest", "👕", "Тканевая безрукавка"],
+    ["a:leather_jacket", "🧥", "Кожаная куртка"],
+    ["a:cloth_wraps", "🧤", "Тканевые обмотки"],
+    ["a:leather_guards", "🫲", "Кожаные наручи"],
+    ["a:cloth_pants", "👖", "Тканевые штаны"],
+    ["a:leather_chaps", "🧦", "Кожаные наголенники"],
+    ["a:old_sandals", "🩴", "Старые сандалии"],
+    ["a:leather_boots", "👞", "Кожаные сапоги"],
+    ["a:iron_helmet", "⛑️", "Железный шлем"],
+    ["a:steel_cap", "🪖", "Стальной шлем"],
+    ["a:iron_chest", "🛡️", "Железный нагрудник"],
+    ["a:chainmail", "🔗", "Кольчуга"],
+    ["a:iron_bracers", "🦾", "Железные наручи"],
+    ["a:steel_guards", "🛡️", "Стальные наручи"],
+    ["a:iron_greaves", "🦵", "Железные поножи"],
+    ["a:steel_leggings", "👖", "Стальные поножи"],
+    ["a:iron_boots", "👢", "Железные ботинки"],
+    ["a:steel_sabatons", "🥾", "Стальные сабатоны"],
+    ["a:war_helm", "⛑️", "Боевой шлем"],
+    ["a:knight_visor", "🪖", "Рыцарский шлем"],
+    ["a:plate_armor", "🛡️", "Латный доспех"],
+    ["a:dragonhide", "🐉", "Драконья шкура"],
+    ["a:mithril_bracers", "✨", "Мифриловые наручи"],
+    ["a:war_gauntlets", "🧤", "Боевые рукавицы"],
+    ["a:plate_greaves", "🦵", "Латные поножи"],
+    ["a:knight_leggings", "👖", "Рыцарские поножи"],
+    ["a:plate_boots", "👢", "Латные ботинки"],
+    ["a:war_boots", "🥾", "Боевые сапоги"],
+    ["a:crown_of_power", "👑", "Корона силы"],
+    ["a:helm_of_light", "✨", "Шлем света"],
+    ["a:void_armor", "🌌", "Броня бездны"],
+    ["a:titan_plate", "💪", "Титановая броня"],
+    ["a:void_bracers", "🌑", "Наручи бездны"],
+    ["a:titan_gauntlets", "🦾", "Титановые рукавицы"],
+    ["a:void_greaves", "🌑", "Поножи бездны"],
+    ["a:titan_leggings", "🦵", "Титановые поножи"],
+    ["a:void_boots", "👢", "Сапоги бездны"],
+    ["a:titan_boots", "🥾", "Титановые сапоги"],
+    ["a:crown_of_eternity", "👑", "Корона вечности"],
+    ["a:helm_of_gods", "✨", "Шлем богов"],
+    ["a:divine_armor", "🛡️", "Божественная броня"],
+    ["a:eternal_plate", "✨", "Вечный доспех"],
+    ["a:divine_bracers", "🦾", "Божественные наручи"],
+    ["a:eternal_gauntlets", "🧤", "Нестареющие рукавицы"],
+    ["a:divine_greaves", "🦵", "Божественные поножи"],
+    ["a:eternal_leggings", "👖", "Вечные поножи"],
+    ["a:divine_boots", "👢", "Божественные сапоги"],
+    ["a:eternal_boots", "🥾", "Вечные сапоги"],
+    ["a:crown_of_death", "💀", "Корона смерти"],
+    ["a:helm_of_annihilation", "🔥", "Шлем аннигиляции"],
+    ["a:armor_of_death", "💀", "Доспех смерти"],
+    ["a:apocalypse_plate", "🌋", "Броня апокалипсиса"],
+    ["a:bracers_of_death", "💀", "Наручи смерти"],
+    ["a:apocalypse_gauntlets", "🔥", "Рукавицы апокалипсиса"],
+    ["a:greaves_of_death", "💀", "Поножи смерти"],
+    ["a:apocalypse_greaves", "🌋", "Поножи апокалипсиса"],
+    ["a:boots_of_death", "💀", "Сапоги смерти"],
+    ["a:apocalypse_boots", "🔥", "Сапоги апокалипсиса"],
+    ["a:crown_of_nightmares", "👹", "Корона кошмаров"],
+    ["a:mask_of_dread", "😱", "Маска ужаса"],
+    ["a:armor_of_nightmares", "👹", "Доспех кошмаров"],
+    ["a:carapace_of_dread", "🕷️", "Панцирь ужаса"],
+    ["a:bracers_of_nightmares", "👹", "Наручи кошмаров"],
+    ["a:claws_of_dread", "🩸", "Когти ужаса"],
+    ["a:greaves_of_nightmares", "👹", "Поножи кошмаров"],
+    ["a:legguards_of_dread", "🕸️", "Поножи ужаса"],
+    ["a:boots_of_nightmares", "👹", "Сапоги кошмаров"],
+    ["a:steps_of_dread", "🖤", "Поступь ужаса"],
+    ["a:apprentice_mantle", "🧥", "Ученическая мантия"],
+    ["a:scout_vest", "🥋", "Лёгкая жилетка"],
+    ["a:rune_mantle", "🧥", "Рунная мантия"],
+    ["a:hunter_vest", "🥋", "Жилет охотника"],
+    ["a:moon_mantle", "🌙", "Лунная мантия"],
+    ["a:wind_armor", "🍃", "Ветровая броня"],
+    ["a:void_mantle", "🌌", "Мантия бездны"],
+    ["a:phoenix_leather", "🦅", "Кожа феникса"],
+    ["a:divine_mantle", "✨", "Божественная мантия"],
+    ["a:valkyrie_armor", "🪽", "Доспех валькирии"],
+    ["a:cosmos_mantle", "🌠", "Мантия космоса"],
+    ["a:fate_light_armor", "🖤", "Лёгкая броня судьбы"],
+    ["a:dread_mantle", "👹", "Мантия ужаса"],
+    ["a:nightmare_leather", "🖤", "Кожа кошмара"],
+    ["b:mire_tick", "🪲", "Трясинный клещ"],
+    ["b:bog_rat_king", "🐀", "Король болотных крыс"],
+    ["b:bog_lurker", "🐊", "Болотный скиталец"],
+    ["b:venomspitter", "🐍", "Ядомёт"],
+    ["b:mossbeast", "🌿", "Моховой зверь"],
+    ["b:swamp_hydra", "🐲", "Болотная гидра"],
+    ["b:corrupted_elder", "🧙", "Старейшина тьмы"],
+    ["b:dust_scarab", "🪲", "Пыльный скарабей"],
+    ["b:sun_jackal", "🐕", "Солнечный шакал"],
+    ["b:sand_scorpion", "🦂", "Песчаный скорпион"],
+    ["b:tomb_guardian", "🗿", "Страж гробницы"],
+    ["b:sand_djinn", "🌪️", "Песчаный джинн"],
+    ["b:pharaoh_revenant", "👑", "Фараон-призрак"],
+    ["b:desert_colossus", "🏔️", "Колосс пустыни"],
+    ["b:thorn_pixie", "🧚", "Шипастая фея"],
+    ["b:night_owl", "🦉", "Ночная сова"],
+    ["b:shadow_stalker", "🐺", "Охотник теней"],
+    ["b:corrupted_treant", "🌳", "Проклятый древень"],
+    ["b:night_horror", "🦇", "Ночной ужас"],
+    ["b:ancient_dryad", "🧚", "Древняя дриада"],
+    ["b:void_sovereign", "🌑", "Владыка пустоты"],
+    ["b:rift_mite", "🪲", "Клещ Разлома"],
+    ["b:void_imp", "😈", "Бес пустоты"],
+    ["b:rift_guardian", "🧿", "Страж Разлома"],
+    ["b:echo_devourer", "🔊", "Пожиратель Эха"],
+    ["b:void_archon", "👁", "Архонт Пустоты"],
+    ["b:oblivion_titan", "🪨", "Титан Забвения"],
+    ["b:abyss_heart", "🖤", "Сердце Бездны"],
+    ["b:cinder_scorpion", "🦂", "Угольный скорпион"],
+    ["b:lava_pup", "🐶", "Лавовый щенок"],
+    ["b:magma_crawler", "🌋", "Магмовый ползун"],
+    ["b:ember_wyrm", "🐉", "Угольный змей"],
+    ["b:pyroclast", "🔥", "Пирокласт"],
+    ["b:forge_titan", "⚒", "Титан Кузни"],
+    ["b:inferno_monarch", "👑", "Монарх Инферно"],
+    ["b:ice_mite", "🪲", "Ледяной клещ"],
+    ["b:snow_fox", "🦊", "Снежная лиса"],
+    ["b:frost_stalker", "🐺", "Морозный охотник"],
+    ["b:glacier_sentinel", "🛡", "Страж ледника"],
+    ["b:blizzard_witch", "🧙‍♀", "Ведьма вьюги"],
+    ["b:aurora_wyrm", "🐉", "Змей сияния"],
+    ["b:eternal_frost", "🧊", "Вечный Мороз"],
+    ["b:fear_mite", "🪲", "Клещ страха"],
+    ["b:dread_pup", "🐶", "Щенок ужаса"],
+    ["b:nightmare_hound", "🐕", "Гончая кошмаров"],
+    ["b:dread_warden", "🛡", "Страж ужаса"],
+    ["b:horror_architect", "🏛", "Архитектор ужаса"],
+    ["b:eclipse_reaper", "⚰️", "Жнец затмения"],
+    ["b:nightmare_throne", "🏰", "Трон Кошмаров"],
+    ["b:relic_warden", "🗿", "Страж праотцов"],
+    ["b:seraph_keeper", "😇", "Серафим-хранитель"],
+    ["b:primordial_colossus", "🌌", "Первородный Колосс"],
+    ["m:tiny_leech", "🪱", "Крохотная пиявка"],
+    ["m:mud_mite", "🪲", "Трясинный клещ"],
+    ["m:swamp_gnat", "🦟", "Болотный гнус"],
+    ["m:swamp_rat", "🐀", "Болотная крыса"],
+    ["m:wet_pup", "🐶", "Мокрый щенок"],
+    ["m:reed_snake", "🐍", "Камышовая змея"],
+    ["m:mud_leech", "🪱", "Болотная пиявка"],
+    ["m:swamp_frog", "🐸", "Ядовитая лягушка"],
+    ["m:marsh_crab", "🦀", "Топяной краб"],
+    ["m:spore_bat", "🦇", "Споровая летучая мышь"],
+    ["m:bog_snake", "🐍", "Болотная гадюка"],
+    ["m:rot_sprite", "💀", "Дух гнили"],
+    ["m:vine_walker", "🌱", "Лозоход"],
+    ["m:bog_golem", "🪨", "Топяной голем"],
+    ["m:mire_shade", "🌑", "Трясинная тень"],
+    ["m:hydra_head", "🐲", "Голова гидры"],
+    ["m:foul_leech", "🪱", "Мерзкая пиявка"],
+    ["m:toxic_spore", "🍄", "Ядовитая спора"],
+    ["m:bog_specter", "👻", "Болотный призрак"],
+    ["m:rotling", "🧟", "Гнильщик"],
+    ["m:mire_wraith", "💀", "Трясинный призрак"],
+    ["m:sand_flea", "🪲", "Песчаная блоха"],
+    ["m:dry_lizard", "🦎", "Сухая ящерица"],
+    ["m:dune_mite", "🕷", "Дюнный клещ"],
+    ["m:desert_pup", "🐕", "Пустынный щенок"],
+    ["m:heat_snake", "🐍", "Знойная змея"],
+    ["m:sand_crow", "🐦‍⬛", "Песчаный ворон"],
+    ["m:dust_beetle", "🪲", "Пыльный жук"],
+    ["m:desert_asp", "🐍", "Пустынная аспида"],
+    ["m:sand_sprite", "🌪️", "Песчаный дух"],
+    ["m:bone_archer", "🏹", "Костяной лучник"],
+    ["m:mummy_warrior", "🧟", "Мумия-воин"],
+    ["m:cursed_scarab", "🪲", "Проклятый скарабей"],
+    ["m:fire_elemental", "🔥", "Огненный элементаль"],
+    ["m:mirage_wraith", "🌫️", "Призрак миража"],
+    ["m:dust_devil", "🌪️", "Пыльный дьявол"],
+    ["m:golden_guard", "🗿", "Золотой страж"],
+    ["m:pyramid_shade", "🌑", "Тень пирамиды"],
+    ["m:sand_serpent", "🐍", "Песчаная змея"],
+    ["m:stone_titan", "🪨", "Каменный титан"],
+    ["m:ruin_specter", "👻", "Призрак руин"],
+    ["m:crypt_beast", "💀", "Зверь склепа"],
+    ["m:leaf_mite", "🪲", "Листовой клещ"],
+    ["m:moss_bat", "🦇", "Моховая мышь"],
+    ["m:root_crawler", "🐛", "Корневой ползун"],
+    ["m:forest_crow", "🐦‍⬛", "Лесной ворон"],
+    ["m:shade_fox", "🦊", "Теневая лиса"],
+    ["m:whisper_moth", "🦋", "Шепчущая моль"],
+    ["m:dark_wolf", "🐺", "Тёмный волк"],
+    ["m:cursed_crow", "🐦‍⬛", "Проклятая ворона"],
+    ["m:thorn_sprite", "🌑", "Шипастый дух"],
+    ["m:bark_horror", "🌳", "Кора-ужас"],
+    ["m:root_fiend", "🌱", "Корневой демон"],
+    ["m:sap_wraith", "💀", "Смоляной призрак"],
+    ["m:void_bat", "🦇", "Пустотная летучая мышь"],
+    ["m:nightmare_hound", "🐕", "Пёс кошмаров"],
+    ["m:shadow_elemental", "🌑", "Элементаль тени"],
+    ["m:cursed_fae", "🧚", "Проклятая фея"],
+    ["m:forest_specter", "👻", "Лесной призрак"],
+    ["m:thorn_beast", "🐗", "Шипастый зверь"],
+    ["m:void_knight", "⚔️", "Рыцарь пустоты"],
+    ["m:dark_herald", "👑", "Тёмный вестник"],
+    ["m:abyss_shade", "🌑", "Тень бездны"],
+    ["m:void_flea", "🪲", "Пустотная блоха"],
+    ["m:echo_bug", "🪳", "Эхо-жук"],
+    ["m:crack_spider", "🕷", "Паук трещины"],
+    ["m:tiny_void", "🌑", "Кроха пустоты"],
+    ["m:rift_bat", "🦇", "Летучая мышь разлома"],
+    ["m:ash_wisp", "✨", "Пепельный огонёк"],
+    ["m:shard_watcher", "🧿", "Осколочный наблюдатель"],
+    ["m:rift_blade", "⚔️", "Провальный клинок"],
+    ["m:rift_shadow", "🌫", "Тень разлома"],
+    ["m:echo_shard", "🔊", "Эхо-осколок"],
+    ["m:faceless_devourer", "🫀", "Безликий пожиратель"],
+    ["m:ash_cultist", "🕯", "Пепельный культист"],
+    ["m:archon_eye", "👁", "Око Архонта"],
+    ["m:chained_phantom", "⛓", "Закованный фантом"],
+    ["m:void_mage", "🧙", "Пустотный маг"],
+    ["m:titan_fragment", "🪨", "Обломок титана"],
+    ["m:black_knight", "⚫", "Чёрный рыцарь"],
+    ["m:living_crack", "🩸", "Живая трещина"],
+    ["m:end_herald", "🌌", "Вестник конца"],
+    ["m:fallen_avatar", "👑", "Падший аватар"],
+    ["m:nameless_soul", "💀", "Душа без имени"],
+    ["m:ember_mite", "🪲", "Угольный клещ"],
+    ["m:ash_lizard", "🦎", "Пепельная ящерица"],
+    ["m:spark_rat", "🐀", "Искрящая крыса"],
+    ["m:magma_pup", "🐶", "Магмовый щенок"],
+    ["m:hot_snake", "🐍", "Горячая змея"],
+    ["m:soot_bat", "🦇", "Сажевая мышь"],
+    ["m:ash_imp", "🔥", "Пепельный бес"],
+    ["m:lava_slug", "🌋", "Лавовый слизень"],
+    ["m:cinder_wolf", "🐺", "Угольный волк"],
+    ["m:flame_drake", "🐉", "Огненный дрейк"],
+    ["m:scorch_mage", "🧙", "Маг ожогов"],
+    ["m:basalt_golem", "🪨", "Базальтовый голем"],
+    ["m:obsidian_guard", "🛡", "Обсидиановый страж"],
+    ["m:eruption_spirit", "💨", "Дух извержения"],
+    ["m:molten_knight", "⚔️", "Раскалённый рыцарь"],
+    ["m:anvil_wraith", "👻", "Призрак наковальни"],
+    ["m:slag_beast", "🐗", "Шлаковый зверь"],
+    ["m:flame_herald", "🔥", "Вестник пламени"],
+    ["m:crown_of_ash", "👑", "Корона пепла"],
+    ["m:living_magma", "🌋", "Живая магма"],
+    ["m:solar_scorch", "☀️", "Солнечный ожог"],
+    ["m:frost_flea", "🪲", "Морозная блоха"],
+    ["m:snow_bug", "🪳", "Снежный жук"],
+    ["m:rime_spider", "🕷", "Инеевый паук"],
+    ["m:ice_pup", "🐶", "Ледяной щенок"],
+    ["m:hail_bat", "🦇", "Градовая мышь"],
+    ["m:frost_snake", "🐍", "Морозная змея"],
+    ["m:ice_whelp", "🧊", "Ледяной детёныш"],
+    ["m:snow_shade", "🌨", "Снежная тень"],
+    ["m:rime_wolf", "🐺", "Инеевый волк"],
+    ["m:crystal_archer", "🏹", "Кристальный лучник"],
+    ["m:frozen_knight", "⚔️", "Морозный рыцарь"],
+    ["m:hail_spirit", "❄", "Дух града"],
+    ["m:frost_mage", "🧙", "Маг стужи"],
+    ["m:ice_golem", "🗿", "Ледяной голем"],
+    ["m:whiteout", "🌫", "Белая пелена"],
+    ["m:aurora_spawn", "🐉", "Отпрыск сияния"],
+    ["m:polar_guard", "🛡", "Полярный страж"],
+    ["m:cryo_wraith", "👻", "Крио-призрак"],
+    ["m:world_ice", "🧊", "Лёд мира"],
+    ["m:frozen_sovereign", "👑", "Ледяной владыка"],
+    ["m:absolute_zero", "❄", "Абсолютный ноль"],
+    ["m:dread_flea", "🪲", "Блоха ужаса"],
+    ["m:nightmare_bug", "🪳", "Кошмарный жук"],
+    ["m:shadow_spider", "🕷", "Теневой паук"],
+    ["m:horror_pup", "🐶", "Щенок ужаса"],
+    ["m:nightmare_bat", "🦇", "Кошмарная мышь"],
+    ["m:fear_snake", "🐍", "Змея страха"],
+    ["m:dream_leech", "🩸", "Пиявка снов"],
+    ["m:fear_spawn", "😱", "Отпрыск страха"],
+    ["m:shadow_fang", "🐺", "Теневой клык"],
+    ["m:terror_knight", "⚔️", "Рыцарь ужаса"],
+    ["m:mind_breaker", "🧠", "Ломатель разума"],
+    ["m:chain_specter", "⛓", "Цепной спектр"],
+    ["m:blueprint_horror", "📜", "Чертёж ужаса"],
+    ["m:living_nightmare", "👹", "Живой кошмар"],
+    ["m:void_sculptor", "🗿", "Скульптор пустоты"],
+    ["m:scythe_shade", "💀", "Тень косы"],
+    ["m:eclipse_knight", "🌑", "Рыцарь затмения"],
+    ["m:soul_harvester", "⚰️", "Жнец душ"],
+    ["m:throne_guard", "🛡", "Страж трона"],
+    ["m:crown_horror", "👑", "Коронный ужас"],
+    ["m:final_dream", "💤", "Последний сон"],
+    ["m:relic_golem", "🗿", "Голем-хранитель"],
+    ["m:dust_priest", "🏺", "Жрец праха"],
+    ["m:ancestor_shade", "👤", "Тень предка"],
+    ["m:light_warden", "🪽", "Страж света"],
+    ["m:choir_angel", "😇", "Ангел хора"],
+    ["m:halo_spirit", "✨", "Дух нимба"],
+    ["m:genesis_shard", "🌌", "Осколок Генезиса"],
+    ["m:void_seed", "🕳", "Семя пустоты"],
+    ["m:first_flame", "🔥", "Первое пламя"],
+    ["p:damage_potion", "⚔️🧪", "Зелье урона"],
+    ["p:xp_potion", "✨🧪", "Зелье опыта"],
+    ["p:luck_potion", "🍀🧪", "Зелье удачи"],
+    ["p:speed_potion", "⏱️🧪", "Зелье скорости"],
+    ["p:coins_potion", "🪙🧪", "Зелье монет"],
+    ["p:crit_potion", "💥🧪", "Зелье крита"],
+    ["p:armor_potion", "🛡🧪", "Зелье защиты"],
+    ["p:inferno_potion", "🌋🧪", "Зелье инферно"],
+    ["p:frost_potion", "🧊🧪", "Зелье вечной стужи"],
+    ["p:nightmare_potion", "🏰🧪", "Зелье кошмара"],
+    ["pet:rat", "🐁", "Крыса"],
+    ["pet:lava_goblin", "🤯", "Лавовый-Гоблин"],
+    ["pet:storm_crow", "⚡️", "Грозовой-Ворон"],
+    ["pet:cute_cat", "🥰", "Кошка-Милашка"],
+    ["pet:wise_skull", "💀", "Мудрый-Череп"],
+    ["pet:mushroom_spirit", "🤬", "Грибной-Дух"],
+    ["pet:smoldering_fox", "🤩", "Тлеющая-Лиса"],
+    ["pet:crystal_demon", "🧊", "Хрустальный-Демон"],
+    ["pet:star_whale", "🐋", "Звёздный-Кит"],
+    ["pet:cursed_yarn", "🧶", "Проклятый-Клубок"],
+    ["pet:bloody_plush", "❤️", "Кровавый-Плюшевый"],
+    ["pet:pink_nightmare", "👻", "Розовый-Кошмар"],
+    ["pet:zombie_virus", "📍", "Zombie-Virus"],
+    ["pet:burning_angel", "🔥", "Пылающий-Ангел"],
+    ["pet:bloody_cherry", "😭", "Кровавый-Вишнёвый"],
+    ["pet:loser_clown", "😡", "Клоун-Неудачник"],
+    ["pet:shadow_whisper", "🕷", "Шёпот-Теней"],
+    ["pet:black_reaper", "💀", "Чёрный-Жнец"],
+    ["pet:echo_bat", "🦇", "Эхо-Нетопырь"],
+    ["pet:rift_warden", "🛡", "Осколочный-Страж"],
+    ["pet:void_firefly", "✨", "Пустотный-Светлячок"],
+    ["pet:abyss_eye", "👀", "Око-Бездны"],
+    ["pet:rift_heart", "🩸", "Сердце-Разлома"],
+    ["pet:void_tempest", "🌪", "Буря-Пустоты"],
+    ["pet:ash_pup", "🔥", "Пепельный-Щенок"],
+    ["pet:coal_beetle", "💢", "Угольный-Жук"],
+    ["pet:lava_drake", "🐲", "Лавовый-Дракончик"],
+    ["pet:forge_golem", "🛠", "Кузнечный-Голем"],
+    ["pet:inferno_phoenix", "💥", "Феникс-Инферно"],
+    ["pet:snow_kit", "❄️", "Снежный-Лисёнок"],
+    ["pet:frost_penguin", "🐧", "Морозный-Пингвин"],
+    ["pet:crystal_hedgehog", "🦔", "Кристальный-Ёж"],
+    ["pet:polar_wolf", "🐺", "Полярный-Волк"],
+    ["pet:eternal_leviathan", "🐍", "Вечный-Левиафан"],
+    ["pet:dread_shade", "👻", "Тень-Ужаса"],
+    ["pet:night_kitten", "🐈‍⬛", "Кошмарный-Котёнок"],
+    ["pet:throne_guard", "👑", "Страж-Трона"],
+    ["pet:blood_moon", "🌕", "Кровавая-Луна"],
+    ["pet:nightmare_king", "🔮", "Король-Кошмаров"],
+    ["pet:dream_eater", "🧠", "Пожиратель-Снов"],
+    ["egg:swamp_egg", "🥚", "Болотное яйцо"],
+    ["egg:desert_egg", "🏜🥚", "Пустынное яйцо"],
+    ["egg:void_egg", "🖤🥚", "Тёмное яйцо"],
+    ["egg:abyss_egg", "🌪🥚", "Яйцо Бездны"],
+    ["egg:magma_egg", "🌋🥚", "Магмовое яйцо"],
+    ["egg:frost_egg", "❄️🥚", "Ледяное яйцо"],
+    ["egg:nightmare_egg", "🔮🥚", "Кошмарное яйцо"],
+    ["loc:swamp", "🌿", "Болото"],
+    ["loc:desert", "🏜️", "Пустыня"],
+    ["loc:forest", "🌲", "Тёмный лес"],
+    ["loc:rift", "🕳", "Разлом Бездны"],
+    ["loc:volcano", "🌋", "Вулканические пики"],
+    ["loc:glacier", "🧊", "Ледяной разлом"],
+    ["loc:citadel", "🏰", "Цитадель Кошмаров"],
+    ["loc:sanctuary", "🏛", "Святилище реликвий"],
+]
+
+_pe_ids: Dict[str, str] = {}          # ключ рисунка → custom_emoji_id
+_pe_remap: Dict[str, str] = {}        # старый id → новый id
+_pe_enabled = True
+_pe_orig: Dict[tuple, tuple] = {}
+_pe_name_re = None
+_pe_name_map: Dict[str, tuple] = {}
+_pe_btn_re = None
+_PE_ID_RE = re.compile(r'emoji-id="(\d+)"')
+_PE_MISSING = object()
+
+
+def pe_tag(key: str, fallback: str = "") -> Optional[str]:
+    """HTML прем-эмодзи из пака по ключу (None, если пак не загружен)."""
+    if not _pe_enabled:
+        return None
+    eid = _pe_ids.get(key)
+    if not eid:
+        return None
+    emo = fallback or _pe_emoji_of(key)
+    return f'<tg-emoji emoji-id="{eid}">{emo}</tg-emoji>'
+
+
+def pe_bar(theme: str, filled: int, total: int, plain: str) -> str:
+    """Полоска из прем-эмодзи пака (цветная + светлая часть). Нет пака или картинок — обычная ▰▱."""
+    if not _pe_enabled:
+        return plain
+    f = _pe_ids.get(f"bk:{theme}:f")
+    e = _pe_ids.get(f"bk:{theme}:e")
+    if not f or not e:
+        return plain
+    filled = max(0, min(total, filled))
+    return (f'<tg-emoji emoji-id="{f}">▰</tg-emoji>' * filled) + (f'<tg-emoji emoji-id="{e}">▱</tg-emoji>' * (total - filled))
+
+
+_PE_BAR_TILE_RE = re.compile(r'<tg-emoji emoji-id="\d+">([▰▱])</tg-emoji>')
+
+
+def pe_trim_bars(text: str, limit: int = 98) -> str:
+    """У Telegram лимит 100 прем-эмодзи в сообщении. Если с полосками их больше — полоски становятся обычными ▰▱."""
+    if text.count("<tg-emoji") <= limit:
+        return text
+    return _PE_BAR_TILE_RE.sub(lambda m: m.group(1), text)
+
+
+def _pe_emoji_of(key: str) -> str:
+    return PE_EMO.get(key, "⭐")
+
+
+def _pe_set(container, k, value):
+    sig = (id(container), k)
+    if sig not in _pe_orig:
+        try:
+            old = container[k]
+        except (KeyError, IndexError, TypeError):
+            old = _PE_MISSING
+        _pe_orig[sig] = [container, k, old, value]
+    else:
+        _pe_orig[sig][3] = value
+    container[k] = value
+
+
+def _pe_restore():
+    """Возвращает исходные иконки — только там, где значение всё ещё наше (ручные замены админа не трогаем)."""
+    for container, k, old, ours in list(_pe_orig.values()):
+        try:
+            try:
+                cur = container[k]
+            except (KeyError, IndexError, TypeError):
+                cur = _PE_MISSING
+            if cur is not ours and cur != ours:
+                continue
+            if old is _PE_MISSING:
+                container.pop(k, None)
+            else:
+                container[k] = old
+        except Exception:
+            pass
+    _pe_orig.clear()
+
+
+def pe_apply():
+    """Подменяет иконки в справочниках и готовит замены для сообщений/кнопок."""
+    global _pe_name_re, _pe_btn_re
+    _pe_restore()
+    _pe_remap.clear()
+    _pe_name_map.clear()
+    _pe_name_re = _pe_btn_re = None
+    if not _pe_enabled or not _pe_ids:
+        return
+    for old, key in PE_ALIAS.items():
+        nid = _pe_ids.get(key)
+        if nid:
+            _pe_remap[old] = nid
+    overrides = globals().get("_emoji_overrides") or {}
+    # одиночному символу вроде ⚔ нужен вариационный селектор, иначе Telegram может не принять запасной эмодзи
+    emo_of = {k: (v + "\ufe0f" if len(v) == 1 and ord(v) < 0x1F000 else v) for k, v in PE_EMO.items()}
+    for key, nid in _pe_ids.items():
+        kind, _, ident = key.partition(":")
+        tag = f'<tg-emoji emoji-id="{nid}">{emo_of.get(key, "⭐")}</tg-emoji>'
+        try:
+            if kind == "pet" and ident in PET_DEFS:
+                _pe_set(PET_PREMIUM_EMOJIS, ident, tag)
+            elif kind == "b" and ident in BOSSES and f"boss:{ident}" not in overrides:
+                _pe_set(BOSSES[ident], "premium_emoji", tag)
+            elif kind == "r" and ident in BOSS_RESOURCE_DEFS and f"res:{ident}" not in overrides:
+                _pe_set(BOSS_RESOURCE_DEFS[ident], "emoji", tag)
+            elif kind == "loc" and ident in LOCATIONS and f"loc:{ident}" not in overrides:
+                _pe_set(LOCATIONS[ident], "premium_emoji", tag)
+            elif kind == "p" and ident in POTION_DEFS:
+                _pe_set(POTION_PREMIUM_EMOJIS, ident, tag)
+            elif kind == "s" and ident in SKILL_BUTTON_EMOJI_IDS:
+                _pe_set(SKILL_BUTTON_EMOJI_IDS, ident, nid)   # иконки новых скиллов
+            elif kind == "egg" and ident in PET_EGGS:
+                _pe_set(PET_EGGS[ident], "shop_emoji", tag)
+            elif kind == "crop" and ident in CROPS and isinstance(CROPS[ident], list):
+                _pe_set(CROPS[ident], 1, tag)
+            elif kind == "fish" and ident in FISH_BY_ID:
+                for i, f in enumerate(FISH_TYPES):
+                    if f[0] == ident:
+                        new = (f[0], f[1], tag) + tuple(f[3:])
+                        _pe_set(FISH_TYPES, i, new)
+                        _pe_set(FISH_BY_ID, ident, new)
+            elif kind in ("w", "a"):
+                _pe_set(ITEM_PREMIUM_ICON_IDS, ident, nid)
+        except Exception as e:
+            print(f"[pe] {key}: {e}")
+    # «эмодзи + название» в текстах и на кнопках
+    emojis, names = set(), []
+    for key, emo, name in PE_NAMES:
+        nid = _pe_ids.get(key)
+        if not nid or not emo or not name:
+            continue
+        esc = html.escape(name, quote=False)
+        if esc in _pe_name_map:
+            continue
+        _pe_name_map[esc] = (nid, emo_of.get(key, "⭐"))
+        # у каждого символа может быть вариационный селектор (⚔️🧪 = ⚔ + FE0F + 🧪)
+        emojis.add("".join(re.escape(ch) + "\ufe0f?" for ch in emo.replace("\ufe0f", "")))
+        names.append(esc)
+    if names:
+        names.sort(key=len, reverse=True)
+        emo_alt = "|".join(sorted(emojis, key=len, reverse=True))
+        name_alt = "|".join(re.escape(n) for n in names)
+        _pe_name_re = re.compile(r'(?:' + emo_alt + r')️?(\s*(?:<(?:b|i|u)>\s*)?)(' + name_alt + r')')
+        _pe_btn_re = re.compile(r'^\s*(?:💢)?(?:' + emo_alt + r')️?\s*(' + name_alt + r')')
+
+
+def _pe_rewrite_new_icons(text: str) -> str:
+    """Обычные 📂🎖🎨🏅🔎📭📢🖼 в HTML-тексте → рисунки из пака (кроме <code>/<pre> и готовых прем-эмодзи)."""
+    if not _PE_NEW_TEXT_RE.search(text):
+        return text
+    budget = [PE_MAX_PER_MESSAGE - text.count("<tg-emoji")]
+
+    def _sub(m):
+        nid = _pe_ids.get(PE_NEW_ICONS.get(m.group(1), ""))
+        if not nid or budget[0] <= 0:
+            return m.group(0)
+        budget[0] -= 1
+        return f'<tg-emoji emoji-id="{nid}">{m.group(1)}</tg-emoji>'
+    parts = re.split(r'(<(?:code|pre|tg-emoji)\b[^>]*>.*?</(?:code|pre|tg-emoji)>)', text, flags=re.S)
+    for i in range(0, len(parts), 2):
+        parts[i] = _PE_NEW_TEXT_RE.sub(_sub, parts[i])
+    return "".join(parts)
+
+
+def pe_rewrite_text(text: str, new_icons: bool = False) -> str:
+    if not text or not _pe_enabled:
+        return text
+    if new_icons and _pe_ids:
+        text = _pe_rewrite_new_icons(text)
+    if _pe_remap and "emoji-id" in text:
+        text = _PE_ID_RE.sub(lambda m: f'emoji-id="{_pe_remap.get(m.group(1), m.group(1))}"', text)
+    if _pe_name_re is not None:
+        budget = [PE_MAX_PER_MESSAGE - text.count("<tg-emoji")]
+
+        def _sub(m):
+            if budget[0] <= 0:
+                return m.group(0)
+            nid, emo = _pe_name_map.get(m.group(2), (None, None))
+            if not nid:
+                return m.group(0)
+            budget[0] -= 1
+            return f'<tg-emoji emoji-id="{nid}">{emo}</tg-emoji>{m.group(1)}{m.group(2)}'
+        # внутри <code>/<pre> и уже готовых прем-эмодзи ничего не трогаем
+        parts = re.split(r'(<(?:code|pre|tg-emoji)\b[^>]*>.*?</(?:code|pre|tg-emoji)>)', text, flags=re.S)
+        for i in range(0, len(parts), 2):
+            parts[i] = _pe_name_re.sub(_sub, parts[i])
+        text = "".join(parts)
+    return text
+
+
+# Обычный эмодзи в начале кнопки → прем-иконка (старый id; подменяется на рисунок из пака)
+PE_BTN_EMOJI = {
+    "◀": "5215361191051798408", "⬅": "5215361191051798408", "↩": "5215361191051798408",
+    "▶": "5213214459023076318", "➡": "5213214459023076318",
+    "🗑": "5445267414562389170", "🎒": "5854908544712707500", "📦": "5854908544712707500",
+    "🎲": "5293998404404272267", "🎁": "5293998404404272267", "🍽": "5395625559784968299", "🍬": "5395625559784968299",
+    "🏃": "5217572051237228647", "🔫": "5373268949339227455", "🎯": "5373268949339227455",
+    "⚔": "5373173798633752502", "🗡": "5463277406435422003", "🛡": "5287786962571241490",
+    "✅": "5325762861539016690", "❌": "5352669272575321097", "🔄": "5346321684574003384", "🔁": "5346321684574003384",
+    "🔒": "5296369303661067030", "⚙": "5366231924597604153", "⭐": "6269538837723090339", "🌟": "6269538837723090339",
+    "✨": "5370831521039017384", "🔥": "5332336747072208845", "💎": "5109480514809497205", "🏆": "5226431245918942763",
+    "👑": "5217822164362739968", "🧪": "5431631782455819233", "❤": "5404843113652970870", "💀": "6327816922544997828",
+    "📜": "5431664183689093623", "🐾": "5258111319831227095", "🥚": "5332550902731535734", "🛒": "5440841102871517055",
+    "⏳": "5287473790735890430", "🔔": "5355271322677047411", "🔕": "5359568849773536103", "🍀": "5395325195542078574",
+    "🎣": "5343609421316521960", "🌾": "5289516580261091134", "🍵": "5454360160975722988", "👤": "5442879640379076105",
+    "📊": "5231200819986047254", "🪙": "5463046637842608206", "💰": "5463046637842608206", "🏰": "5382325570782641346",
+}
+# Новые рисунки пака (без «старого» id): символ → ключ пака
+PE_NEW_ICONS = {"📂": "n:folder", "🎖": "n:medal_mil", "🎨": "n:palette", "🏅": "n:medal",
+                "🔎": "n:search", "📭": "n:mailbox", "📢": "n:megaphone", "🖼": "n:picture"}
+_PE_NEW_TEXT_RE = re.compile("(" + "|".join(PE_NEW_ICONS) + ")\ufe0f?")
+_PE_BTN_LEAD_RE = re.compile(r"^\s*([\u2190-\u2BFF\u2600-\u27BF\U0001F000-\U0001FAFF])[\ufe0f\u200d]*\s*")
+
+
+def pe_rewrite_markup(markup):
+    if not _pe_enabled or not isinstance(markup, InlineKeyboardMarkup) or not (_pe_remap or _pe_btn_re or _pe_ids):
+        return markup
+    changed = False
+    rows = []
+    for row in markup.inline_keyboard:
+        new_row = []
+        for btn in row:
+            icon = getattr(btn, "icon_custom_emoji_id", None)
+            upd = {}
+            if icon and icon in _pe_remap:
+                upd["icon_custom_emoji_id"] = _pe_remap[icon]
+            elif not icon and _pe_btn_re is not None and isinstance(btn.text, str):
+                m = _pe_btn_re.match(btn.text)
+                if m:
+                    nid, _ = _pe_name_map.get(html.escape(m.group(1), quote=False), (None, None))
+                    if nid:
+                        upd["icon_custom_emoji_id"] = nid
+                        rest = btn.text[m.start(1):]
+                        upd["text"] = ("💢" if btn.text.lstrip().startswith("💢") else "") + rest
+            if not icon and "icon_custom_emoji_id" not in upd and isinstance(btn.text, str):
+                m2 = _PE_BTN_LEAD_RE.match(btn.text)
+                old_id = PE_BTN_EMOJI.get(m2.group(1)) if m2 else None
+                new_id = _pe_ids.get(PE_NEW_ICONS.get(m2.group(1), "")) if (m2 and not old_id) else None
+                if new_id:
+                    rest = btn.text[m2.end():].strip()
+                    upd["icon_custom_emoji_id"] = new_id
+                    upd["text"] = rest or "\u200e"
+                elif old_id:
+                    rest = btn.text[m2.end():].strip()
+                    upd["icon_custom_emoji_id"] = _pe_remap.get(old_id, old_id)
+                    upd["text"] = rest or "\u200e"   # кнопка из одного эмодзи — остаётся только иконка
+            if upd:
+                btn = btn.model_copy(update=upd)
+                changed = True
+            new_row.append(btn)
+        rows.append(new_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows) if changed else markup
+
+
+class PackEmojiMiddleware(BaseRequestMiddleware):
+    """Подменяет иконки на свой пак во всех исходящих сообщениях и кнопках. При ошибке — шлёт как было."""
+
+    async def __call__(self, make_request, bot, method):
+        if not _pe_enabled or not (_pe_remap or _pe_name_re is not None or _pe_ids):
+            return await make_request(bot, method)
+        originals = {}
+        try:
+            for attr in ("text", "caption"):
+                value = getattr(method, attr, None)
+                if isinstance(value, str) and value:
+                    new = pe_trim_bars(pe_rewrite_text(value, str(getattr(method, "parse_mode", "") or "").upper() == "HTML"))
+                    if new != value:
+                        originals[attr] = value
+                        _decor_set(method, attr, new)
+            mk = getattr(method, "reply_markup", None)
+            if mk is not None:
+                new_mk = pe_rewrite_markup(mk)
+                if new_mk is not mk:
+                    originals["reply_markup"] = mk
+                    _decor_set(method, "reply_markup", new_mk)
+        except Exception as e:
+            print(f"[pe] rewrite: {e}")
+        try:
+            return await make_request(bot, method)
+        except Exception as e:
+            if not originals or getattr(e, "retry_after", None):
+                raise
+            err = str(e).lower()
+            if "not modified" in err or "too old" in err or "not found" in err or "blocked" in err:
+                raise
+            print(f"[pe] откат иконок пака: {e}")
+            for attr, value in originals.items():
+                _decor_set(method, attr, value)
+            return await make_request(bot, method)
+
+
+async def pe_load():
+    global _pe_enabled
+    try:
+        data = await load_kv("pe_pack") or {}
+    except Exception as e:
+        print(f"[pe] load: {e}")
+        data = {}
+    if data.get("ver") == PE_PACK_VER:
+        _pe_ids.clear()
+        _pe_ids.update({str(k): str(v) for k, v in (data.get("ids") or {}).items()})
+    _pe_enabled = bool(data.get("enabled", True))
+    if data.get("ver") == PE_PACK_VER:
+        _pe_patched.clear()
+        _pe_patched.update(str(k) for k in (data.get("patched") or []))
+    pe_apply()
+    print(f"[pe] пак эмодзи: {len(_pe_ids)} шт., {'вкл' if _pe_enabled else 'выкл'}")
+
+
+async def pe_save():
+    try:
+        await save_kv("pe_pack", {"ver": PE_PACK_VER, "ids": dict(_pe_ids), "enabled": _pe_enabled,
+                                  "patched": sorted(globals().get("_pe_patched", set()))})
+    except Exception as e:
+        print(f"[pe] save: {e}")
+
+
+
+# --- Обновление отдельных картинок в уже загруженных наборах («эмодзипак обновить») ---
+# Новые рисунки зелий (у каждого свой значок: меч, звезда, клевер, песочные часы, монета,
+# взрыв, щит, пламя, снежинка, череп). Бот заменяет старые картинки в наборах на месте.
+# [ключ, номер в паке, эмодзи, масштаб, ширина, высота, пиксели (zlib+base64)]
+PE_PATCH = [
+    ["ui:5463413771647069835", 559, "💪", 4, 24, 24, "eNqtlrENwjAQRTMCJQ2CGegYgRmgpWMNKkoWoGYCOsQG9IgB6NMb/UiHzp+zfSa29BUpkd/9XO7O6bpxazpZBK2u4QJvM5tHahVD2OF2iNQiBrP7y/6r+26djeGJrfmn1XLg4gq9jtskH/dC/8i+H3tnPvxb7yDsYTljCJf5Y/xrvnhltcw/vCPnHnaud1J8sIXvZQuT+0b2Mr/Gu+Zy38h+/azGe7T3eY2EPOs4nHurHks9yXzNyuV+qMP3+See9sViVin3Of8WX2aLsHK5KdVMig/hOfoUVy+fazHVlyLw5Vt7+tWa47k8wXdp1shKzXH+rqxafoqja6RmjnlnoWb9e9Za57TFGvOvYO1v8d/xAc6536o="],
+    ["ui:5321348429727700857", 614, "💪", 4, 24, 24, "eNqtlrENwjAQRTMCJQ2CGegYgRmgpWMNKkoWoGYCOsQG9IgB6NMb/UiHzp+zfSa29BUpkd/9XO7O6bpxazpZBK2u4QJvM5tHahVD2OF2iNQiBrP7y/6r+26djeGJrfmn1XLg4gq9jtskH/dC/8i+H3tnPvxb7yDsYTljCJf5Y/xrvnhltcw/vCPnHnaud1J8sIXvZQuT+0b2Mr/Gu+Zy38h+/azGe7T3eY2EPOs4nHurHks9yXzNyuV+qMP3+See9sViVin3Of8WX2aLsHK5KdVMig/hOfoUVy+fazHVlyLw5Vt7+tWa47k8wXdp1shKzXH+rqxafoqja6RmjnlnoWb9e9Za57TFGvOvYO1v8d/xAc6536o="],
+    ["p:damage_potion", 405, "⚔", 4, 23, 24, "eNq11DFOwzAUxvFIZetQxioTQmoGBtShA90806lSRSY2Fg6AxBnYEJdgIBtH6IKK1KnMHTv2BmneQy+yvzzLDgmW/ksS/+S4qZOkOcbnF+VocFZu3u6d6BrdSzoM237NZ9zTzaR3m0ypL9vc5mzZ0bW+7O3h6NTVprkh+y++mJJmS218ba22pd2L8X17ECrG/y8b3XKxjCrm97Xtem419lPj7Ssz5DRCH22aG7LJKa7n3Et6VYe+Zse66N8NLx2/jS3uz8MjZ9sybD/WtteLtoyPzzXb4uPa2+yFz/XZtHb6DjB6lt99t+LQlf1GW/vOi9Q4ic3+1vzmcdHGswr/g45No7IP7zPV1Ww8YzF6nubJesn+fs5UN3QWaIkvoR1yQ+ca+n246IfOkxMAdCkV"],
+    ["p:xp_potion", 406, "✨", 4, 23, 24, "eNq1lTsKwkAQhgPaaylWNlaClYWNYG1pY6VYeQJzC5vgJTyDV0jAK1hYpPQGq//CyGQym13zWPgI7OPL8GezG0XlNhpOzKDXN+l1XwB9GIsaNO5OdgtLvJy27oaTaMu93uysi4O+ttyP/F2gqRtrfe46fnISmpv4x6/Vyl3aWIjflYGPEH9Xbuk9pCYImn+ajZ1+7qZ1aJubm1WSm3mcWa95nZ1+6cbaLt0+XG6NEDfWS+C1PI/qeIi74JF8vSC/b0tjMhdf3eTiwAuyy9pCc7XMkafGL2PFzb3yzJH7HB4N2tM2A+bnXt9ZVfUvUv7w8dqr3PKM1eDflWrlefv8/B0SXjN58JR51707+P519TW9m3x9Hxt6dqY="],
+    ["p:luck_potion", 407, "🍀", 4, 23, 24, "eNq11T0OgkAQBWASLey0tDI26gUoLC2NsbCj0soreAwLY+sFvIW9hYewsfQG6CMZMzxm2eVHyAtZ2P0gswtEUXEbDsZpv9NN7+dtLjiHa1GDTdunJM5ymE9at2FK2rIXqySzdHCuLfvxeufS1MZYn13HF1Ni2ZIqvvWs2rKuhfiuGvgS4v/LZnf33AclxNe2jMO2uG2cia/rdHpcFtYO34NtjPXZvdnoF4zVbe1bts/V/ay2+FVscS7fHUduow9qJX5VG0fpx222+dnL5k+sXL2pXWbjGeBYkXGh9XatczicqvV2faus97BOvV3fWI5YPLfaLbP5HhyZL+1wu+7/Q3z9Hrreyyb/Jr3OrO/JB2yfJHI="],
+    ["p:speed_potion", 408, "⏱", 4, 21, 24, "eNpjYEAACQGF//zMLP9PT45FwSAxkBwDGQDZzInhJmBcaqFKNTNBZsEwpWY6eIWDzUDGIDFyzATpgZl5/sUHFAwzkxRzYWbBMDYzYZgYc7G5DdkMbHKEzMXlX1x4qJmJDWMz8//VEJwYPX1hwzBzMcy84ICBseVXbBhmLoaZIIDDzDRjNawYPb8RY+aLlSZgvf8fNGDFIDlS/Q4y80ylGlZzQWIE44hMM3GlJUJmgtQgm4vNPErMxGUevdwJ0o8NUxKeIL24MDnxjg+Tkj6xlcnomFA+wlW/4iprcNV72DDMTAD8HJd3"],
+    ["p:coins_potion", 409, "🪙", 4, 23, 24, "eNq11DEKwjAUgOGCrkU3XYQseoIOjp2dheLg6g0ERzdxFC/S1TNY6OQFnDp6g+hrSUheXn2JrYF/ac1HaOuLIndNx0KOBkN5v26t4Brcizos075kSd1+Oe/dBlPVl52ustoyg2t92WX1supqw17O/sVXpoqyVSE+dVbTou75+G3PgMvH/5eNXXlLvPJ5v6at98LKRWvVeSJ3s9gJ+44N+xkbHPlYN5WpDvuk7esivzgsLD/E1u7z1ETYpu9rW+c17PwoHFv5ztlDnkWo/Tk7fAe42gYj0Ka+82ITW2kbpWzTxTaeVfg/+M3GLmXjGYuD31MO5XKzgIrzOZeba21+Fxf73Dx5A5D0j6o="],
+    ["p:crit_potion", 410, "💥", 4, 24, 24, "eNrtlC8OwjAUh5eAIwTckBgSDjCBQEyjCAZFggKLgAsgCYaguApXYAlXQCAmuUHZK/zK21ub7J+kyZelW/h+r6+lnmcfvW5fdRpNdTsvMtB7+u5VGNx/mgeG3WhQu5+cnLr84WSuXZKqbu6/x68U9O7v//vLuGWGzMmby/00XP6V1zIZcl62dkAutQ+MU87r8qvNz839tgy41SVwQr8H8KvnNpUFbPtj/Id+Bl6nhrzwf5/x1E+txbqnDr/JIBd4LD/e60zPo2FbI+vP9MbhNxlUM0gyomOoobnLjdrjte8k1aOkXqqbvPSk3gB5dnnt0bhtRbrRd+1PnHoN3/7wHuU5j/xcAu1MPNhXOOX5QUYRsBY4ud91dxTB9v+1nZsqd2Ce++cNbp0a4g=="],
+    ["p:armor_potion", 411, "🛡", 4, 21, 24, "eNpjYEAACQGF//zMLP9PT45FwSAxkBwDGQDZzInhJmBcaqFKNTNBZsEwpWY6eIWDzUDGIDFyzATpgZl5/sUHFAwzkxRzYWbBMDYzYZgYc7G5DdkMbHKEzMXlX1x4uJqZtfgzXoyeBtAxLjO9si5gYEEJc6IwzFx0M0EA3byaA5+JwjBziTUzqusCCj5x4wOc7VO6879VzFycZmLz93AwE2QeqWbCzMVmJrJ5pJppG7ETw1yYmejmYUtLIP3YsJ7zXBRzkc1ENg+bmSC9uDAsbEFmgczE5kZy8jtIPy4/4yuT8WGQWpA5+MxDrzsIYZhafOYBAK3he1Q="],
+    ["p:inferno_potion", 412, "🌋", 4, 24, 24, "eNq1lTFuwjAUhq2WpVIlAlPHKKLslRgYM1cMqAtTV04At2CpmDkIvQJI7SEYMiL1ACbPyoPnx+/EETTSp0RO8v32s+MYcznsNM1KJi9JaruPHbtbf3pQG92jZ+hZ0/JA/q/ZyLEcv/6Ln7zMLf7Kffbn7zPnk1Cb9MdmSLf0/xRHD+WPykDuJn+bDNRvBvmZ2Iy6mkgfuqczQv5QPZpA861z7uiHtdLuv3wYReycSz+/S8dvmgTZ9nt289D3/HPTg/Oh/fR+jJ987KdrOx/ojKC/Cenja+Qn2vq57845vWQVb0+wRrf6HZV//2zQGLz1Wedl95W/JNZPY2CXRtZd+4mQH31jtP40nlf6D4vzGNAcoP0Nfa9X/a680h8YA9yfNXKtOGdJ8f3hzvtVDv3oHyBzJOwnBzs9ynbkVxmZ2q+8TF4/dcj61/zPMpSJxqWRc3sCRF7pHg=="],
+    ["p:frost_potion", 413, "🧊", 4, 24, 24, "eNpjYMAOJAQU/vMzs/w/PTkWA4PEQfIMFABk8yeGm8BxqYUq1c0HmYmMqWW+g1c42Cx0TKnZyOaff/EBBYPERs0fNZ8cs9HtwIZJNR8E8PgBAxOyg5DbYRhkllP3XjDWipoFx4TsIMZ8mNl//v1HsQPEFzVOw2kHzOx5b//jxDCz648/w2k+LjuQze+6gYmRwwRkPgifffgC7heQHTDzYXZgCxdizIdhkLkwTIz5sHDAZT6yeYQwzHx0t1fse4EVg9QjpxVYmIPw2kNnUNyO7H50tyfNP4MV4zIfRIPiAZv5xKZ35LQJ04+cXkAY2Q/I6QdmB7EYZge6+fjSP67yBE85gxEe+PIWOWUgMeUPAKSESWE="],
+    ["p:nightmare_potion", 414, "🏰", 4, 24, 24, "eNrVlS0LAkEQhg+0GRQsYhLBbDEYD6NcM5iMRqPFf2AUo8Vm8Q9oEkxisOg/MBgMVoOszukc4zj7cfgBLjzhbpfnHebmWM+7r7GvijeCXKag0omkWg9bT8A72IMzcNaLuST/oFkJ6VZLb/kf7hc/eBHud82gbvT79Wboo8A74nfO4G70bw6nJ9AfN4PXjUh+hGfY/FLN1CftuX5rnd/Er/2m7/ABf2DK4f5peWmEz5Iux+Tv5ccvtLN9FaQ6kb9R8yNMcyv5Yen86FSXcwTNEfrl7Ofe434bgTlChlN/qJt6kd1qrmaTEc+I7Zfc/+Zf5PwQdOPzt+qH2uPUD7PCoX46+xRXP8y5hDT7/D+wzacN9GNPLL0p6u4XHegHH4f7dfejDV3/pXvtChUDmrc="],
+    ["s:crit_damage", 667, "🔥", 4, 21, 22, "eNpjYEAFEgIK/5HZxGAGPAAk//+8A1ytjr41UZgYc2Hmvfr0nSiMy1x0P8PM3HHkCl68YPXe/029CzHMBfv5zAy4GMzMFx9+EY2RzYSZBwZQc2FuJNdMdHeS4m9kjMv/xIYlKAxBuKpjDgrGlwZg5sL0YsMgd6GbCXMrvjQFkgepw4XxpVVC7sWX1rHlKeS8gyPN/t/bEwbGacYKYAwSIybv4BEn2TwC9qC4cbCbR8hMfHaRa97/LRP+kxsn6Ppg5oEBFnMJhSFY/yyD/7jMJZQWcfmXkvCkJI7x1R2UmAEAcSlO6g=="],
+    ["s:evasion", 668, "🌀", 4, 24, 18, "eNpjYMAOJAQU/pOC0fUy4AEgeT79cKzY0CsNK4aZCaLPfPn/H5cdMLPjPvzHwCBz1v38jxXD7ACZDQIwO3BhkB1uJz5gYJA5s179x4qR7YC5/8a3///RMTXswBeP6GFFqR3ExPVgs6Pt/Au4HYTSMy47rNbeBGN0O0Bmg3De+jP/scUvLI5xpVtks7V79sLTLbrZIExsfkTOE9jMBmF0s0FyxIY9OWYTW05QYjausKGWu3HFLbXCBFfZAzMbZCYMI5sNM5OU8KZG+UwsoKR+QQYAP10ccQ=="],
+    ["s:greed", 669, "🪙", 4, 23, 21, "eNq11b1KA0EUBeCtBcFGEERIFcHWwnbxGcQiD5BnEEFIJ9jqYyj4CHY2AW20FsFen+CaM8m5nL2ZnZ2ALhwyWZZvfu4w0zTLZ29nZM0/PHDt+8mij/+l1LrpER+/J1v7xWziR/e1bYvZxNf2X9qhj5ShNcE3OtdSHeg+XJ6moH1+uLsWfU9/ejz25PaEuu/3Vymcw/Rg29s3k6NOX/Ds687sY5YSfbXpIjARe2m9rba7P8/uz28n6X1uzPST+Xlt9na2zMJnHx0b45VxD9nJhQd7kcfZyO35xdh9t8XN2Zjrmr0Kbbhq06dJV/cPbfpcY6bPZg369km0kZxNl3ZnbrJWQzZ9Wmp3XNY61CLnY57RZx9scy20HnG9+uxctHZuy5qV7Bo/2nDULNnxrCrZPAdq3XjfsI9c+I3vwVVqz9ya+6x0z/0C8xfHFA=="],
+    ["bk:hp:f", 670, "🟥", 4, 24, 12, "eNpjYICD/1TGyOD//7hQqmIkO8D8R1ZWVMVIdsDFPi1bRhUMMw/d/NelpURhYv2Abj618aj5xJl/Wt+KJhhm/nola5pg5DxGI8wAAJjmTik="],
+    ["bk:hp:e", 671, "⬜", 4, 24, 12, "eNpjYICD/1TGyOA/tQGSHWD+y7dfqYqR7EARowaAmYduPrXxqPmDw/xzl+7RBMPMX7PpEE0wch6jEWYAAMZvanQ="],
+    ["bk:xp:f", 672, "🟪", 4, 24, 12, "eNpjYICD/1TGyOD/2bz/VMVIdoD5s/wfUBUj2QEXu7ThI1UwzDx083e0vCQKE+sHdPOpjUfNJ878NqeTNMEw8/OM1tIEI+cxGmEGACGWpfs="],
+    ["bk:xp:e", 673, "⬜", 4, 24, 12, "eNpjYICD/1TGyOA/tQGSHWD+y7dfqYqR7EARowaAmYduPrXxqPmDw/xzl+7RBMPMX7PpEE0wch6jEWYAAMZvanQ="],
+    ["bk:gold:f", 674, "🟨", 4, 24, 12, "eNpjYICD/1TGyOD//8NmVMVIdoD5HzYoUBUj2QEX+3F7NlUwzDx087+cSCYKE+sHdPOpjUfNJ878m13iNMEw8/dG89IEI+cxGmEGAENBlfM="],
+    ["bk:gold:e", 675, "⬜", 4, 24, 12, "eNpjYICD/1TGyOA/tQGSHWD+y7dfqYqR7EARowaAmYduPrXxqPmDw/xzl+7RBMPMX7PpEE0wch6jEWYAAMZvanQ="],
+    ["bk:green:f", 676, "🟩", 4, 24, 12, "eNpjYICD/1TGyOB/zKNMqmIkO8B8+/2hVMVIdsDFVj7aRBUMMw/d/MpLHURhYv2Abj618aj5xJlvvCKQJhhmvmqPD00wch6jEWYAADAPSaM="],
+    ["bk:green:e", 677, "⬜", 4, 24, 12, "eNpjYICD/1TGyOA/tQGSHWD+y7dfqYqR7EARowaAmYduPrXxqPmDw/xzl+7RBMPMX7PpEE0wch6jEWYAAMZvanQ="],
+    ["bk:blue:f", 678, "🟦", 4, 24, 12, "eNpjYICD/1TGyOB/yL7/VMVIdoD5Vl0vqIqR7ICLLTv1lSoYZh66+aVr3xOFifUDuvnUxqPmE2e+fulFmmCY+UoxW2iCkfMYjTADAAuhjes="],
+    ["bk:blue:e", 679, "⬜", 4, 24, 12, "eNpjYICD/1TGyOA/tQGSHWD+y7dfqYqR7EARowaAmYduPrXxqPmDw/xzl+7RBMPMX7PpEE0wch6jEWYAAMZvanQ="],
+    ["bk:cyan:f", 680, "🟦", 4, 24, 12, "eNpjYICD/1TGyOC/++8vVMVIdoD5OiduUBUj2QEXW/DsLVUwzDx087NvPCEKE+sHdPOpjUfNJ8585dUHaYJh5ot3LKEJRs5jNMIMAFyhpiM="],
+    ["bk:cyan:e", 681, "⬜", 4, 24, 12, "eNpjYICD/1TGyOA/tQGSHWD+y7dfqYqR7EARowaAmYduPrXxqPmDw/xzl+7RBMPMX7PpEE0wch6jEWYAAMZvanQ="],
+    ["bk:indigo:f", 682, "🟪", 4, 24, 12, "eNpjYICD/1TGyOD/xKr/VMVIdoD5UVEPqIqR7ICLbd36kSoYZh66+T09L4nCxPoB3Xxq41HziTPf1+ckTTDMfFvrtTTByHmMRpgBABvsfZ0="],
+    ["bk:indigo:e", 683, "⬜", 4, 24, 12, "eNpjYICD/1TGyOA/tQGSHWD+y7dfqYqR7EARowaAmYduPrXxqPmDw/xzl+7RBMPMX7PpEE0wch6jEWYAAMZvanQ="],
+    ["bk:orange:f", 684, "🟧", 4, 24, 12, "eNpjYICD/1TGyOD//0l2VMVIdoD5H6o0qIqR7ICL/Tg8jyoYZh66+V8WZRCFifUDuvnUxqPmE2f+zSh5mmCY+XtNRGiCkfMYjTADAHRrczE="],
+    ["bk:orange:e", 685, "⬜", 4, 24, 12, "eNpjYICD/1TGyOA/tQGSHWD+y7dfqYqR7EARowaAmYduPrXxqPmDw/xzl+7RBMPMX7PpEE0wch6jEWYAAMZvanQ="],
+    ["n:folder", 686, "📂", 4, 24, 19, "eNpjYKAukBBQ+M9AIwAy+/+XC/+x2QESw4VJMRsM0OwAsR14OXFiUu3AZvaf3eE4McwOYjG6nTDzb86wwonx+Q+ff4k1H4Tx+RGbf0k1nxA+VKH/f2mAEkHz01TEqYJh8YFsPkj8/7U8qmCYHTDzUcz+sIEijM39cPPPR5GFX6zyAeMztdY0Mx9kNjbzUcKGQvNhZiOnH1qEDTbzYerIwehhAzMfOWxgasjFyGYjlxHUzFO4ylZqYHRzATqhVTU="],
+    ["n:medal_mil", 687, "🎖", 4, 19, 24, "eNpjYIAACQGF/+iYgQg5dACSM+eSxsAwfZxC9hgYm3kwcz6nxWFgkDhIX/jm3xgYm3nIZl1wcIDjnSZ2KGbppx4EYyXfJTjdhWweulnIboKZg24WMW5DNsuq4gZWN4Ho/18uYMQTPrOw+Q9mDhjgMA9mFrH+QzcHm9uIDXNCaSNNlhcrxhd/2MwD6fl/NQSCzzvA8ZkKNbAcMWZhmEOmeSjmPGoH4zQjFRQMMwufeRjugZrz/1kfBD+q+n9mcihYDGYWLvPQzYKb8/Eg3Cxs5uE1CxQmyGZB8Y4WCbA5JJsFxGCzoG4BmQOjyTULpA/mL3LcBZJHNw8ZExP26ObB1aKlCWLMwWceNkxq2qfUHHTzsGFSzMFXhxFjDgAX8p/7"],
+    ["n:palette", 688, "🎨", 4, 24, 21, "eNq11aFLBEEYBfDNGjzEIIggFkVw7ZtswiIaBTmTeOHAP8AgctVsMGq4bLEYLIJgMIhFzBbBYjAKn/s+fOO3497NDHoLD/aGu9/bm9ndybKfY7o1J9mIDtjy8SC2A+cxibX1+O5AVqcmo5LSYe3P20NNZ3bMhWPjK4su7Aj12Gu2trz0RJ42RB4L/QyzLxfSfTuS8q7rOob9F/+anQ2Xqfz7g3n1YFv/+WxbfzOow/qbEwsu2lG51obJ5CdtDTuafN+W81OR/T15LUv14TKcH7q0WzNbmpveeq3jl125DPzLfK22vrhGxK4v3N0rkfL4Xc/77aK25taHycBGME7XD236+c61jjX5+D4suiGbPlzaIZ8dzDCbPt1YPyXVErq1ZQbNf6qLLC0X7hz3Dmzr23soxYbrB+O+7T8Df/Vjnt9R+LYD8xhK0/zHvKvZwXUKxbqx+1/K3hK7vzR1/Mf++AVUuxyU"],
+    ["n:medal", 689, "🏅", 4, 20, 24, "eNq11TsKwkAQBuBcQLG0EQTBWwh2Skq1txNLS2/gNTxFTmAjCNoIKdUTWGxhtzKJE2d3Z5JJ0IUf8tj9mElINoq+o9vpWz+ae9yA+5P2IAiunc+WQSQTLbtZB4HrsJYbGvMWx0WOo6njGfOyaXq3SXJwLM6kNVKP1gaW70GsuQR1Vnm0NuqBlU+QTdqzplfOkmpEj+uVrqt6z9jrqtfKwvUaKQbMQwNiz+Ms9Fpdy14Xbj4m5LQdqkzHeuzyNDRZyzc9r8wUPTh/7vM09dDEY89DS/IKC+b7hpAy0/EUJrVUNdI0sP7pwRxq+eurnp1kalLnG/mFJf0PqFH3f8DtjdTQ7JNv1tovfQ=="],
+    ["n:search", 690, "🔎", 4, 24, 24, "eNq9lS0OwkAQhXsEDAkSFAknQOCQeATX4BYoDsAdCBqBxeA4AgqNwhSm4W0es7N/pWGSlxK6+30wu91WlV+D3rBGprOFC39ftSzNfDxrF+1qy2am5Hy9ubDLcoS8mr0/Xr7CDkQ75LOUdljs7e7gcrrXzVXzZRyvCxccIbYwQ2G+jNUO/Z/AZzZXzMF8q/+/8rlH1rqW9gbBvtI9CvExNoeNYG/l8tHP3N/P+yz2PMg93nel/Fj/eX3/xU85cnsT6xGfN2Baz7fMeyOS5x0c1nmjzyJmb1aTJiUOzLeYFruNA9FMRFiaX+JIvb8+DI+/no+yHJYr8C7x+Mtxv8iR8gtLuEiXfHYIF+mSzw6kS3ZsrV4W5+sv"],
+    ["n:mailbox", 691, "📭", 4, 23, 24, "eNpjYCAOSAgo/GegAMD0g2h0LC5t/x+bOLHmvvn0H24OOu4/+BurOCE7YOaCAIgGmYMNZ3XdwBBDtgOX2SB5ZHNB5hCLYXagmw8zlxwzkXFU2UEM85HNJtdcmNnusUtQzB8pZsupWuDEQ9ZsPmU4Rs7PlIY3yLwHXl5wDDMfZjYoPsjFhMwGhRfZGIvZyGFOCcZlNq5yFRrf/9dWOf3vitL6X+ys+D9MXRQshq4On9l4ynOcZiOro5XZyOYjp0FqmY0erkTWcUSbTUb9CTYbZC6tzAaZCcPUMBvZfGRMrLkAK1RHhw=="],
+    ["n:megaphone", 692, "📢", 4, 23, 22, "eNrV1S0OwlAMB/BpFBJDQtAEA2oYbsBnsDgEjjNgOQHnIHM4PMHN4jjABK7Ql3TpSrvtjSF4SUPC2K9/HrwuCL5brWYHgh8sdCeNNtTpo0Uu7JYfftVeZJIrbXyF69jru8isVKduL7WrujLrYxrCbTTM2OhqNvXVSmZFV9p57mK+Vktm5SVzW6613DXF1WxtL8lOkmdacXyHKLq4a5pr5eb567Jpv/m+/0Puov1GD+v9dqZ8cls25kTrfFhlyvJ9/99kH7ch7Gd92AzcZ939aOXlLjqXlk3nEy3qoe2JNU+KbD5XqIf8LS2f2+hKW85D6lFmfnMbTSpuazO37Ewln1fevb7PGO2MVVkvy+6nSA=="],
+    ["n:picture", 693, "🖼", 4, 24, 22, "eNpjYIAACQGF/9TEDEgAxDfg5KAqhtkBM/vNmnCqYpgdyOaf7LSiGG/K1v8/1U0Jp/n9N/4ThdOMVOAYWZwa5oPM/P+sD4zPTA5FsYNq5n88CLHjURVtzAeaC8K0cj/IXBimtvm0jl98mFTzvbZkgTEtzIeZjcsObOKUmI9sFi57iTUfm9n4MCnmk2o2KeaTYzayHQOZPkFy1MC4zAeJUwtjq8NoUT8y0Lh+BwBQSrgi"],
+]
+_pe_patched: Set[str] = set()
+_pe_patch_task: Optional["asyncio.Task"] = None
+
+
+def _pe_png_raw(scale: int, w: int, h: int, px: bytes, size: int = 100) -> bytes:
+    import struct, zlib as _z
+    canvas = bytearray(size * size * 4)
+    ox, oy = (size - w * scale) // 2, (size - h * scale) // 2
+    for y in range(h):
+        for x in range(w):
+            i = (y * w + x) * 4
+            c = px[i:i + 4]
+            if c[3] == 0:
+                continue
+            for yy in range(scale):
+                py = oy + y * scale + yy
+                if 0 <= py < size:
+                    for xx in range(scale):
+                        pxx = ox + x * scale + xx
+                        if 0 <= pxx < size:
+                            j = (py * size + pxx) * 4
+                            canvas[j:j + 4] = c
+    raw = b"".join(b"\x00" + bytes(canvas[r * size * 4:(r + 1) * size * 4]) for r in range(size))
+
+    def chunk(tag, body):
+        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", _z.crc32(tag + body) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", _z.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+async def _pe_call(fn, **kw):
+    """Вызов Bot API с ожиданием флуд-лимита."""
+    for _ in range(12):
+        try:
+            return await fn(**kw)
+        except Exception as e:
+            retry = getattr(e, "retry_after", None)
+            if retry:
+                await asyncio.sleep(float(retry) + 1)
+                continue
+            raise
+    raise RuntimeError("Telegram не даёт обновить эмодзи (флуд-лимит)")
+
+
+async def pe_patch_run(bot: Bot, owner_id: int) -> int:
+    import base64 as _b64, zlib as _z
+    from aiogram.types import InputSticker
+    uname = (await bot.get_me()).username
+    done = 0
+    for key, idx, emo, scale, w, h, b64 in PE_PATCH:
+        if key in _pe_patched:
+            continue
+        name = f"lootify_pe{PE_PACK_VER}_{idx // 200 + 1}_by_{uname}"
+        pos = idx % 200
+        before = await _pe_call(bot.get_sticker_set, name=name)
+        old_ids = {s.custom_emoji_id for s in before.stickers}
+        png = _pe_png_raw(scale, w, h, _z.decompress(_b64.b64decode(b64)))
+        fb = emo + ("\ufe0f" if len(emo) == 1 and ord(emo) < 0x1F000 else "")
+        st = InputSticker(sticker=BufferedInputFile(png, filename=f"{key}.png"), format="static", emoji_list=[fb])
+        if pos == len(before.stickers):
+            # новая картинка в конец набора (иконки новых скиллов)
+            await _pe_call(bot.add_sticker_to_set, user_id=owner_id, name=name, sticker=st)
+        elif pos < len(before.stickers):
+            old = before.stickers[pos]
+            await _pe_call(bot.replace_sticker_in_set, user_id=owner_id, name=name, old_sticker=old.file_id, sticker=st)
+        else:
+            raise RuntimeError(f"в наборе {name} нет картинки №{pos + 1}")
+        after = await _pe_call(bot.get_sticker_set, name=name)
+        new_ids = [s.custom_emoji_id for s in after.stickers if s.custom_emoji_id not in old_ids]
+        new_id = new_ids[0] if new_ids else (after.stickers[pos].custom_emoji_id if pos < len(after.stickers) else None)
+        if new_id:
+            _pe_ids[key] = new_id
+        _pe_patched.add(key)
+        done += 1
+        await pe_save()
+        await asyncio.sleep(0.5)
+    pe_apply()
+    return done
+
+def pe_status_text() -> str:
+    lines = [f"{PE_STAR} <b>Пак прем-эмодзи Lootify</b> (версия {PE_PACK_VER})",
+             f"Рисунков в паке: <b>{len(PE_EMO)}</b> · загружено в Telegram: <b>{len(_pe_ids)}</b>",
+             f"Подмена иконок: <b>{'включена' if _pe_enabled else 'выключена'}</b>"]
+    left = [r[0] for r in PE_PATCH if r[0] not in _pe_patched]
+    if left:
+        lines.append(f"Новых картинок ждут замены: <b>{len(left)}</b> — <code>эмодзипак обновить</code>")
+    lines.append("\n<code>эмодзипак выкл</code> / <code>эмодзипак вкл</code> — старые иконки / пак\n"
+                 "<code>эмодзипак статус</code> — этот экран")
+    return "\n".join(lines)
+
+
+@dp.message(lambda msg: msg.text and message_command(msg) in ("эмодзипак", "пакэмодзи", "емодзипак"))
+async def text_pe_admin(message: Message):
+    global _pe_enabled, _pe_patch_task
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split()
+    sub = parts[1].casefold() if len(parts) > 1 else "статус"
+    if sub in ("обновить", "update", "патч"):
+        if not _pe_ids:
+            await reply_to_user(message, f"{PE_CROSS} Пак ещё не загружен в Telegram.")
+            return
+        if _pe_patch_task and not _pe_patch_task.done():
+            await reply_to_user(message, f"{PE_HOURGLASS} Обновление уже идёт.")
+            return
+        left = [r[0] for r in PE_PATCH if r[0] not in _pe_patched]
+        if not left:
+            await reply_to_user(message, f"{PE_OK} Все новые картинки уже на месте.")
+            return
+        owner = message.from_user.id
+        bot = message.bot
+
+        async def run():
+            try:
+                n = await pe_patch_run(bot, owner)
+                await bot.send_message(owner, f"{PE_OK} Обновил картинок: <b>{n}</b>. Новые иконки уже в боте.", parse_mode="HTML")
+            except Exception as e:
+                await bot.send_message(owner, f"{PE_CROSS} Обновление остановилось: {html.escape(str(e))}\n"
+                                              "Команду можно повторить — продолжу с места остановки.", parse_mode="HTML")
+
+        _pe_patch_task = asyncio.create_task(run())
+        await reply_to_user(message, f"{PE_HOURGLASS} Заменяю {len(left)} картинок зелий в наборе — около минуты, пришлю сообщение.")
+        return
+    if sub in ("загрузить", "залить", "upload"):
+        await reply_to_user(message, f"{PE_OK} Пак уже загружен в Telegram — картинки убраны из файла, чтобы он был легче.")
+        return
+    if sub in ("выкл", "off"):
+        _pe_enabled = False
+        pe_apply()
+        await pe_save()
+    elif sub in ("вкл", "on"):
+        _pe_enabled = True
+        pe_apply()
+        await pe_save()
+    await reply_to_user(message, pe_status_text())
+
 
 
 async def main():
@@ -31007,17 +36774,36 @@ async def main():
     bot = Bot(token=TOKEN)
     bot.session.middleware(DecorRequestMiddleware())   # украшения админа для всех экранов
     bot.session.middleware(SafeCallbackAnswerMiddleware())  # повторный ответ на колбэк не роняет обработчик
+    bot.session.middleware(PackEmojiMiddleware())  # свой пак прем-эмодзи (подмена иконок при отправке)
     NOTIFY_BOT = bot
-    await bot.delete_webhook(drop_pending_updates=True)
+    for attempt in range(10):
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            break
+        except Exception as e:
+            retry = getattr(e, "retry_after", None)
+            print(f"[startup] delete_webhook: {e}")
+            if not retry:
+                break   # не критично — запускаемся дальше
+            await asyncio.sleep(min(float(retry), 60) + 1)   # Telegram просит подождать (флуд) — ждём, а не падаем
 
     # Подключение к PostgreSQL
     await init_db()
+    await claim_instance()
+    asyncio.create_task(instance_heartbeat_loop())
 
     await load_banned_users()
     await load_clans()
     await load_command_stickers()
+    await load_bot_lock()   # закрытый режим
+    await load_extra_admins()   # админы, выданные командой «админ+»
+    await load_promos()   # промокоды
+    await pe_load()   # свой пак прем-эмодзи — до ручных замен админа, чтобы они оставались главнее
     await load_emoji_overrides()
+    await load_flood_ban()
     await load_screen_templates()
+    await load_screen_blocks()
+    print(f"[screens] экранов для оформления: {install_screen_tracking()}")
     await load_decor_rules()
     await load_starfall_state()
     # Анонсы поднимаем ДО восстановления авторолла: восстановленные автороллы сразу начинают роллить
@@ -31026,6 +36812,7 @@ async def main():
     if _announce_queue is None:
         _announce_queue = asyncio.Queue(maxsize=500)
     asyncio.create_task(announce_worker())
+    await migrate_relic_buff()   # разовое усиление уже выкованных реликвийных вещей
     await restore_runtime_state()
     print("Lootify RPG Bot started!")
     asyncio.create_task(cleanup_trash())
@@ -31039,6 +36826,7 @@ async def main():
     asyncio.create_task(admin_autofarm_resume())
     asyncio.create_task(boss_auto_attack_loop())
     asyncio.create_task(starfall_loop())
+    asyncio.create_task(kratos_loop())
     try:
         await dp.start_polling(bot)
     finally:
@@ -31049,6 +36837,7 @@ async def main():
             _save_world_boss(force=True)
             await _save_world_boss_db()  # дожидаемся записи босса в БД до закрытия пула
             await save_all_clans()  # троттлинг ударов по Лутиафану — дописываем кланы перед выключением
+            await _save_kratos_db()  # урон по Кратосу за последние секунды тоже сохраняем
         except Exception as e:
             print(f"[shutdown flush] {e}")
         await close_db()
