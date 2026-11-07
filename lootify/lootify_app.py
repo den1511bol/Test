@@ -172,6 +172,47 @@ def _limited(ip: str, key: str, max_n: int, window: float) -> bool:
     return len(arr) > max_n
 
 
+# Общая тема для вложенных страниц (цвета аватара бота: фиолетовый, золото, бронза, узор из ромбов).
+THEME_CSS = r"""
+:root{--gold:#f5b94a;--gold2:#c9923a;--pur:#b44bff;
+--pat:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='34' height='34'%3E%3Cpath d='M17 2 L32 17 L17 32 L2 17Z' fill='none' stroke='%23c9923a' stroke-opacity='.16' stroke-width='1'/%3E%3Cpath d='M17 9 L25 17 L17 25 L9 17Z' fill='none' stroke='%23b44bff' stroke-opacity='.14' stroke-width='1'/%3E%3Ccircle cx='17' cy='17' r='1.5' fill='%23ffc857' fill-opacity='.28'/%3E%3C/svg%3E")}
+html,body{background-color:#07050f!important;background-image:radial-gradient(ellipse at 50% -8%,#43187f 0%,transparent 55%),radial-gradient(ellipse at 100% 100%,#5a1d2e55 0%,transparent 55%),var(--pat)!important;background-attachment:fixed!important}
+#w{background:transparent!important}
+.hd,#hd{background:linear-gradient(#1b1236,#0f0a1f)!important;background-image:var(--pat),linear-gradient(#1b1236,#0f0a1f)!important;border-bottom:1.5px solid var(--gold2)!important;box-shadow:0 4px 18px #7a3dff33}
+.hd b,#hd b{color:#ffe29a;letter-spacing:.04em;text-shadow:0 1px 6px #7a3dffaa}
+.hd a,#hd a,.hd button,#hd button{background:linear-gradient(#2d1d44,#150d24)!important;border:1.5px solid #7d5a2e!important;color:#f1dfc0!important;border-radius:12px!important;padding:8px 13px!important;min-height:36px}
+.hd button.on,#aa.on{background:linear-gradient(#7a3dff,#3b1a86)!important;border-color:var(--gold2)!important;color:#fff6e0!important}
+#aa{background:linear-gradient(#2d1d44,#150d24)!important;border:1.5px solid #7d5a2e!important;color:#f1dfc0!important;border-radius:12px!important;padding:8px 12px!important}
+.card,.loc,.grid .st,.it,#me,#logb,.warn{background-image:var(--pat),linear-gradient(#1a1233,#0c071a)!important;border:1.5px solid #5c4326!important;box-shadow:inset 0 0 0 1px #0008,0 4px 14px #0006}
+.grid .st{background-image:var(--pat),linear-gradient(#241448,#120a24)!important}
+.warn{border-color:#7a2b4b!important;background-image:linear-gradient(#3a1a2a,#2a1020)!important}
+.it{box-shadow:none;border:0!important;background:none!important;border-bottom:1px solid #2b2150!important;border-radius:0!important}.it.eq{background:#3a238044!important;border-radius:12px!important;border:1px solid #5a3bb8!important}
+.tabs button,.chips button,.kb button,#rk button,.row2 button,#acts button,#modal .k button{background:linear-gradient(#2d1d44,#150d24)!important;border:1.5px solid #5c4326!important;color:#f1dfc0!important;border-radius:12px!important;min-height:42px;text-shadow:0 1px 2px #000a}
+.tabs button.on,.chips button.on{background:linear-gradient(180deg,#7a3dff,#3b1a86)!important;border-color:var(--gold2)!important;color:#fff6e0!important;box-shadow:0 0 14px #7a3dff88}
+.btn,#atk,.go,#s,.eqb,#end button,#acts button.main{background-image:var(--pat),linear-gradient(180deg,#7a3dff,#3b1a86)!important;border:1.5px solid var(--gold2)!important;color:#fff6e0!important;border-radius:13px!important;text-shadow:0 1px 3px #000a;box-shadow:inset 0 1px 0 #ffffff33,0 3px 0 #24104f,0 6px 16px #7a3dff44!important}
+#atk,.go,#acts button.main{background-image:var(--pat),linear-gradient(180deg,#e8502f,#8a1a35)!important;box-shadow:inset 0 1px 0 #ffffff44,0 3px 0 #4a0c1c,0 6px 20px #ff5a3a55!important}
+#atk{border-radius:16px!important}
+.btn:active,#atk:active,.go:active,#s:active,.eqb:active{transform:translateY(2px)}
+button[disabled]{opacity:.5}
+.m .tx,.m{border-color:#5c4326}.m .tx{background-image:var(--pat),linear-gradient(#241448,#150d2b)!important}
+.m.me .tx,.m.me{background-image:var(--pat),linear-gradient(#4b2aa6,#2e1a70)!important;border-color:var(--gold2)!important}
+.m .n{color:var(--gold)!important}
+#f,#rk{background:linear-gradient(#150d2b,#0f0a1f)!important;border-top:1.5px solid var(--gold2)!important}
+#t{background:#0a0616!important;border:1.5px solid #5c4326!important;border-radius:14px!important;padding:12px 14px!important}#t:focus{border-color:var(--gold)!important;box-shadow:0 0 0 3px #f5b94a22}
+#s{padding:0 20px!important;font-size:18px!important}
+.bar,.bar.pl{border:1.5px solid #5c4326!important}.bar i{background:linear-gradient(90deg,#c0224f,#ff8a3d)!important}.bar.pl i{background:linear-gradient(90deg,#2fb86a,#a4e65e)!important}
+.pl,.rk .p{color:var(--gold)!important}.row.me,.rk.me{background:#3a238066!important;border:1px solid #5a3bb8}
+#arena{border:1.5px solid var(--gold2)!important;background-image:var(--pat),radial-gradient(ellipse at 50% 0%,#3a1a7a 0%,#150f2b 65%)!important}
+.foe{border:1.5px solid #5c4326!important;background-image:var(--pat),linear-gradient(#1d1238,#0e0820)!important}
+.sw span{background:#2b2150!important}.sw input:checked+span{background:linear-gradient(90deg,#7a3dff,#c9923a)!important}
+#toast{border:1.5px solid var(--gold2)!important;background:#150d2b!important;color:#fff1d0}
+#modal .t,#end .t{border:1.5px solid #5c4326!important;background-image:var(--pat),linear-gradient(#150d2b,#0c071a)!important}
+.nm{color:#ffe29a}.bc{border:1.5px solid #5c4326!important;background-image:var(--pat),linear-gradient(#241448,#120a24)!important}
+.loc>.lh{color:#ffe29a}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:#5c4326;border-radius:3px}
+a:focus,button:focus{outline:0}
+"""
+
 CHAT_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
@@ -879,6 +920,9 @@ $('#test').onclick=function(){N.sync(true);$('#test').textContent='Готово 
 </script></body></html>
 """
 
+for _n in ("CHAT_HTML", "ME_HTML", "BOT_HTML", "BATTLE_HTML", "SHARED_HTML", "NOTIFY_HTML"):
+    globals()[_n] = globals()[_n].replace("</style></head>", THEME_CSS + "</style></head>", 1)
+
 # Маленькая кнопка «в меню» поверх страниц игр, только когда игра открыта из приложения.
 BACK_SCRIPT = (
     '<script>/*__lootifyBack*/(function(){try{var w=window.Telegram&&Telegram.WebApp;'
@@ -919,29 +963,44 @@ APP_HTML = r"""<!doctype html>
 <title>Lootify</title>
 <script src="/app/notify.js"></script>
 <style>
-:root{--bg:#07050f;--panel:#120d22;--panel2:#1c1536;--line:#2b2150;--tx:#ece8ff;--mut:#8f86b8;--acc:#ff5d73;--gold:#ffc857;--pur:#b44bff}
+:root{--bg:#07050f;--panel:#120d22;--panel2:#1c1536;--line:#2b2150;--tx:#ece8ff;--mut:#8f86b8;--acc:#ff5d73;--gold:#f5b94a;--gold2:#c9923a;--pur:#b44bff;
+--pat:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='34' height='34'%3E%3Cpath d='M17 2 L32 17 L17 32 L2 17Z' fill='none' stroke='%23c9923a' stroke-opacity='.16' stroke-width='1'/%3E%3Cpath d='M17 9 L25 17 L17 25 L9 17Z' fill='none' stroke='%23b44bff' stroke-opacity='.14' stroke-width='1'/%3E%3Ccircle cx='17' cy='17' r='1.5' fill='%23ffc857' fill-opacity='.28'/%3E%3C/svg%3E")}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;min-height:100%;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-body{display:flex;justify-content:center}
-#app{width:100%;max-width:520px;min-height:100dvh;padding:calc(env(safe-area-inset-top,0px) + 14px) 14px 20px;display:flex;flex-direction:column;gap:14px}
-h1{margin:0;font-size:26px;font-weight:900}
+body{display:flex;justify-content:center;background-image:radial-gradient(ellipse at 50% -8%,#43187f 0%,transparent 55%),radial-gradient(ellipse at 100% 100%,#5a1d2e66 0%,transparent 55%),var(--pat);background-attachment:fixed}
+#app{width:100%;max-width:520px;min-height:100dvh;padding:calc(env(safe-area-inset-top,0px) + 14px) 14px 22px;display:flex;flex-direction:column;gap:12px}
+h1{margin:0;font-size:30px;font-weight:900;letter-spacing:.06em;background:linear-gradient(#ffe29a,#f5b94a 55%,#b9772b);-webkit-background-clip:text;background-clip:text;color:transparent;filter:drop-shadow(0 2px 8px #7a3dff88)}
 .mut{color:var(--mut);font-size:13px}
 .hero{display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;padding:36px 8px 8px}
-.hero img{width:140px;height:140px;border-radius:50%;box-shadow:0 0 40px #b44bff88}
-.btn{border:0;border-radius:12px;padding:14px;font:800 15px system-ui,sans-serif;color:#fff;background:linear-gradient(#c66bff,#7a4bff);box-shadow:0 3px 0 #3d2394;width:100%;cursor:pointer}
-.btn:active{transform:translateY(2px);box-shadow:0 1px 0 #3d2394}
-.btn.gray{background:var(--panel2);box-shadow:0 3px 0 #07050f;border:1px solid var(--line)}
+.hero img{width:150px;height:150px;border-radius:50%;border:3px solid var(--gold);box-shadow:0 0 0 4px #1a0f33,0 0 44px #b44bffaa}
+.btn{position:relative;border:1.5px solid var(--gold2);border-radius:14px;padding:15px 34px;font:900 15px system-ui,sans-serif;color:#fff6e0;text-shadow:0 1px 3px #000a;
+ background-color:#3a1a82;background-image:var(--pat),linear-gradient(180deg,#7a3dff 0%,#3b1a86 100%);
+ box-shadow:inset 0 0 0 1px #0008,inset 0 1px 0 #ffffff33,0 3px 0 #24104f,0 6px 18px #7a3dff44;width:100%;cursor:pointer}
+.btn:before,.btn:after{content:"\25C6";position:absolute;top:50%;transform:translateY(-50%);font-size:9px;color:#ffc857;opacity:.75}
+.btn:before{left:13px}.btn:after{right:13px}
+.btn:active{transform:translateY(2px);box-shadow:inset 0 0 0 1px #0008,0 1px 0 #24104f}
+.btn.fire{background-color:#7a1530;background-image:var(--pat),linear-gradient(180deg,#e8502f 0%,#8a1a35 100%);box-shadow:inset 0 0 0 1px #0008,inset 0 1px 0 #ffffff44,0 3px 0 #4a0c1c,0 6px 22px #ff5a3a55;font-size:17px;padding:17px 34px}
+.btn.gray,.btn.bronze{background-color:#170f26;background-image:var(--pat),linear-gradient(180deg,#2d1d44 0%,#150d24 100%);border-color:#7d5a2e;color:#f1dfc0;box-shadow:inset 0 0 0 1px #0008,inset 0 1px 0 #ffffff1c,0 3px 0 #07050f}
+.btn.tight{padding:12px 8px;font-size:12.5px;white-space:nowrap}.btn.tight:before,.btn.tight:after{display:none}
+.btn.small{padding:12px 24px;font-size:13.5px}.btn.small:before{left:9px}.btn.small:after{right:9px}
 .btn[disabled]{opacity:.5;pointer-events:none}
 .box{display:flex;flex-direction:column;gap:10px;align-items:center;width:100%;max-width:340px;margin:0 auto}
 .err{color:var(--acc);min-height:18px;font-size:13px;text-align:center}
-.top{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.top .who{display:flex;align-items:center;gap:10px}
-.top img{width:34px;height:34px;border-radius:50%}
+.top{display:flex;align-items:center;justify-content:space-between;gap:10px;background:linear-gradient(#1b1236,#0f0a1f);border:1.5px solid var(--gold2);border-radius:16px;padding:10px 12px;box-shadow:inset 0 0 0 1px #0008,0 4px 18px #7a3dff33;background-image:var(--pat),linear-gradient(#1b1236,#0f0a1f)}
+.top .who{display:flex;align-items:center;gap:11px}
+.top img{width:46px;height:46px;border-radius:50%;border:2px solid var(--gold);box-shadow:0 0 14px #b44bffaa}
+.top b{font-size:16px}
+.sec{display:flex;align-items:center;gap:10px;color:var(--gold);font-weight:900;letter-spacing:.16em;font-size:11.5px;text-transform:uppercase;margin-top:10px}
+.sec:before,.sec:after{content:"";flex:1;height:1px;background:linear-gradient(90deg,transparent,var(--gold2),transparent)}
+.row{display:flex;gap:10px}.row .btn{padding-left:26px;padding-right:26px;min-width:0;flex:1;width:auto}.row .btn.tight{padding-left:4px;padding-right:4px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.tile{background:linear-gradient(#150f2b,#0d0820);border:1px solid var(--line);border-radius:16px;padding:14px 12px;text-align:left;color:var(--tx);cursor:pointer;display:flex;flex-direction:column;gap:6px;min-height:128px}
-.tile:active{transform:scale(.98)}
-.tile .ic{font-size:30px}
-.tile b{font-size:15px}
+.tile{position:relative;background-color:#0d0820;background-image:var(--pat),linear-gradient(160deg,#241448 0%,#0c071a 100%);border:1.5px solid #7d5a2e;border-radius:18px;padding:14px 12px;text-align:left;color:var(--tx);cursor:pointer;display:flex;flex-direction:column;gap:7px;min-height:136px;box-shadow:inset 0 0 0 1px #0008,0 5px 16px #00000066}
+.tile:active{transform:scale(.97)}
+.tile:after{content:"";position:absolute;right:8px;top:8px;width:10px;height:10px;border-top:2px solid var(--gold);border-right:2px solid var(--gold);border-radius:0 4px 0 0;opacity:.7}
+.tile .ic{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;font-size:26px;background:radial-gradient(circle at 50% 35%,#6a35d0,#1a0f33 75%);border:1.5px solid var(--gold2);box-shadow:0 0 16px #7a3dffaa}
+.tile b{font-size:15px;color:#fff1d0}
+.tile .mut{font-size:12.5px}
+#upd{background:linear-gradient(#2a1650,#150c2c);border:1.5px solid var(--gold)!important;box-shadow:0 0 18px #f5b94a44}
 .hidden{display:none!important}
 </style>
 </head>
@@ -958,17 +1017,18 @@ h1{margin:0;font-size:26px;font-weight:900}
   </div>
  </div>
  <div id="menu" class="hidden">
-  <div class="top"><div class="who"><img src="data:image/webp;base64,__ICON__" alt=""><div><b id="nm"></b><div class="mut">Общий прогресс с ботом</div></div></div><button class="btn gray" id="out" style="width:auto;padding:8px 14px">Выйти</button></div>
-  <button class="btn" id="btl" style="margin-top:14px;background:linear-gradient(#ff7a6b,#ff3d6e);box-shadow:0 3px 0 #8f1f3f">⚔ Бой с боссом</button>
-  <button class="btn gray" id="ntf" style="margin-top:10px">🔔 Уведомления</button>
-  <button class="btn gray" id="shr" style="margin-top:10px">🌑 Мировой босс, Лутиафан, Кратос</button>
-  <button class="btn" id="botb" style="margin-top:10px">🤖 Весь бот</button>
-  <button class="btn" id="chat" style="margin-top:10px">💬 Общий чат <span id="bd" style="display:none;background:#ff5d73;border-radius:9px;padding:1px 7px;margin-left:6px;font-size:12px"></span></button>
-  <div style="display:flex;gap:10px;margin-top:10px"><button class="btn gray" id="me1">👤 Профиль</button><button class="btn gray" id="me3">🎒 Вещи</button><button class="btn gray" id="me2">🏆 Рейтинг</button></div>
-  <div id="upd" class="hidden" style="margin-top:12px;background:#1c1536;border:1px solid #5a3bb8;border-radius:14px;padding:12px">
+  <div class="top"><div class="who"><img src="data:image/webp;base64,__ICON__" alt=""><div><b id="nm"></b><div class="mut">Общий прогресс с ботом</div></div></div><button class="btn bronze small tight" id="out" style="width:auto;padding:9px 16px">Выйти</button></div>
+  <div class="sec">Бой</div>
+  <button class="btn fire" id="btl">⚔ Бой с боссом</button>
+  <div class="row"><button class="btn small" id="shr">🌑 Общие боссы</button><button class="btn small" id="botb">🤖 Весь бот</button></div>
+  <div class="sec">Герой</div>
+  <div class="row"><button class="btn bronze small tight" id="me1">👤 Профиль</button><button class="btn bronze small tight" id="me3">🎒 Вещи</button><button class="btn bronze small tight" id="me2">🏆 Рейтинг</button></div>
+  <div class="row"><button class="btn small" id="chat">💬 Чат <span id="bd" style="display:none;background:#ff5d73;border-radius:9px;padding:1px 7px;margin-left:4px;font-size:12px"></span></button><button class="btn bronze small" id="ntf">🔔 Уведомления</button></div>
+  <div id="upd" class="hidden" style="margin-top:4px;border-radius:14px;padding:12px">
    <b>Вышла новая версия приложения</b><div class="mut" id="updt" style="margin:4px 0 10px"></div>
    <button class="btn" id="updb">Скачать обновление</button></div>
-  <div class="grid" id="grid" style="margin-top:12px"></div>
+  <div class="sec">Игры</div>
+  <div class="grid" id="grid"></div>
   <div class="mut" style="text-align:center;margin-top:16px;font-size:11.5px">Developer: @yfeeeee</div>
  </div>
 </div>
