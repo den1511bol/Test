@@ -176,6 +176,7 @@ CHAT_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#07050f"><title>Чат Lootify</title>
+<script src="/app/notify.js"></script>
 <style>
 :root{--bg:#07050f;--panel:#120d22;--line:#2b2150;--tx:#ece8ff;--mut:#8f86b8;--acc:#ff5d73}
 *{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -247,6 +248,7 @@ ME_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#07050f"><title>Профиль Lootify</title>
+<script src="/app/notify.js"></script>
 <style>
 :root{--bg:#07050f;--panel:#120d22;--p2:#1c1536;--line:#2b2150;--tx:#ece8ff;--mut:#8f86b8;--acc:#ff5d73;--gold:#ffc857}
 *{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -324,6 +326,7 @@ BOT_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#07050f"><title>Lootify бот</title>
+<script src="/app/notify.js"></script>
 <style>
 :root{--bg:#07050f;--panel:#120d22;--p2:#1c1536;--line:#2b2150;--tx:#ece8ff;--mut:#8f86b8;--acc:#ff5d73}
 *{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -473,6 +476,7 @@ BATTLE_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#07050f"><title>Бой Lootify</title>
+<script src="/app/notify.js"></script>
 <style>
 :root{--bg:#07050f;--panel:#120d22;--p2:#1c1536;--line:#2b2150;--tx:#ece8ff;--mut:#8f86b8;--acc:#ff5d73;--gold:#ffc857}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -669,6 +673,7 @@ SHARED_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#07050f"><title>Общие боссы Lootify</title>
+<script src="/app/notify.js"></script>
 <style>
 :root{--bg:#07050f;--panel:#120d22;--p2:#1c1536;--line:#2b2150;--tx:#ece8ff;--mut:#8f86b8;--acc:#ff5d73;--gold:#ffc857}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -788,6 +793,92 @@ refresh();
 </script></body></html>
 """
 
+NOTIFY_JS = r"""(function(){
+var LS='lootify_notify';
+function get(){var d={on:true,cats:{boss:true,wb:true,kr:true,cb:false,ko:true,roll:true},off:{},asked:false};
+  try{var j=JSON.parse(localStorage.getItem(LS)||'null');if(j){d.on=j.on!==false;d.asked=!!j.asked;for(var k in (j.cats||{}))d.cats[k]=!!j.cats[k];d.off=j.off||{}}}catch(e){}return d}
+function save(c){try{localStorage.setItem(LS,JSON.stringify(c))}catch(e){}}
+function LN(){var C=window.Capacitor;return C&&C.Plugins&&C.Plugins.LocalNotifications||null}
+function hash(s){var h=0;for(var i=0;i<s.length;i++){h=(h*31+s.charCodeAt(i))|0}return Math.abs(h)%2000000000+1}
+var busy=false;
+async function sync(force){
+  var ln=LN(),tok=null;try{tok=localStorage.getItem('lootify_token')}catch(e){}
+  if(!ln||!tok||busy)return;busy=true;
+  try{
+    var c=get(),pend=await ln.getPending();
+    var old=(pend&&pend.notifications||[]).map(function(n){return{id:n.id}});
+    if(!c.on){if(old.length)await ln.cancel({notifications:old});return}
+    var p=await ln.checkPermissions();
+    if(p.display!=='granted'&&(!c.asked||force)){p=await ln.requestPermissions();c.asked=true;save(c)}
+    if(p.display!=='granted')return;
+    var r=await fetch('/app/api/timers',{headers:{'X-Token':tok},cache:'no-store'});if(!r.ok)return;
+    var d=await r.json(),list=[];
+    (d.timers||[]).forEach(function(t){
+      if(!c.cats[t.cat])return;if(t.cat==='boss'&&c.off[t.key])return;
+      list.push({id:hash(t.key),title:'Lootify',body:t.title,schedule:{at:new Date(t.at*1000),allowWhileIdle:true}});
+    });
+    if(old.length)await ln.cancel({notifications:old});
+    if(list.length)await ln.schedule({notifications:list});
+  }catch(e){}
+  busy=false;
+}
+window.lootifyNotify={get:get,save:save,sync:sync,supported:function(){return !!LN()}};
+setTimeout(sync,1500);setInterval(sync,300000);
+document.addEventListener('visibilitychange',function(){if(!document.hidden)sync()});
+})();
+"""
+
+NOTIFY_HTML = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#07050f"><title>Уведомления Lootify</title>
+<style>
+:root{--bg:#07050f;--panel:#120d22;--p2:#1c1536;--line:#2b2150;--tx:#ece8ff;--mut:#8f86b8}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+#w{max-width:520px;margin:0 auto;padding:calc(env(safe-area-inset-top,0px) + 12px) 14px 30px}
+.hd{display:flex;align-items:center;gap:10px;margin-bottom:12px}.hd a{color:var(--tx);background:var(--p2);border:1px solid var(--line);border-radius:10px;padding:6px 11px;font:700 13px system-ui;text-decoration:none}.hd b{font-size:18px}
+.card{background:linear-gradient(#150f2b,#0d0820);border:1px solid var(--line);border-radius:16px;padding:6px 14px;margin-bottom:12px}
+.row{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #1d1638}.row:last-child{border:0}.row .t{flex:1;min-width:0}.row .t b{display:block}.mut{color:var(--mut);font-size:12.5px}
+.sw{position:relative;width:46px;height:26px;flex:none}.sw input{opacity:0;width:0;height:0}.sw span{position:absolute;inset:0;background:#2b2150;border-radius:14px;transition:.2s}.sw span:before{content:"";position:absolute;left:3px;top:3px;width:20px;height:20px;background:#fff;border-radius:50%;transition:.2s}.sw input:checked+span{background:linear-gradient(#c66bff,#7a4bff)}.sw input:checked+span:before{transform:translateX(20px)}
+.btn{border:0;border-radius:12px;padding:12px;font:800 14px system-ui;color:#fff;background:linear-gradient(#c66bff,#7a4bff);width:100%;cursor:pointer;margin-bottom:12px}
+.warn{background:#3a1a2a;border:1px solid #7a2b4b;border-radius:12px;padding:10px 12px;margin-bottom:12px;font-size:13px}.hidden{display:none}
+</style></head><body><div id="w">
+<div class="hd"><a href="/app">← Меню</a><b>🔔 Уведомления</b></div>
+<div class="warn hidden" id="nosup">Уведомления работают в приложении Lootify для Android. В браузере их включить нельзя.</div>
+<div class="card"><div class="row"><div class="t"><b>Уведомления</b><div class="mut">Главный выключатель</div></div><label class="sw"><input type="checkbox" id="on"><span></span></label></div></div>
+<div class="card" id="cats"></div>
+<div class="card" id="bosses"><div class="mut" style="padding:12px 0">Загрузка боссов…</div></div>
+<button class="btn" id="test">Обновить напоминания сейчас</button>
+<div class="mut" style="text-align:center">Напоминания ставятся на телефоне при открытии приложения. Чтобы они пришли, когда приложение закрыто, открывай его после боя, чтобы время освободилось с учётом актуальных кулдаунов.</div>
+<div class="mut" style="text-align:center;margin-top:10px;font-size:11.5px">Developer: @yfeeeee</div>
+</div>
+<script src="/app/notify.js"></script>
+<script>
+(function(){
+var $=function(s){return document.querySelector(s)};
+var N=window.lootifyNotify,c=N.get();
+function T(x){var d=document.createElement('div');d.textContent=x==null?'':x;return d.innerHTML}
+if(!N.supported())$('#nosup').classList.remove('hidden');
+var CATS=[['boss','⚔ Босс снова доступен','Когда закончится перезарядка выбранных ниже боссов'],['wb','🌑 Мировой босс появился','Каждый день в 19:00 МСК'],['kr','⚔️ Кратос спустился','Ежедневный общий босс'],
+ ['cb','🐉 Лутиафан клана обновился','Новый босс клана'],['ko','💀 Нокаут прошёл','Можно снова бить общего босса'],['roll','🎲 Авторолл завершён','Когда закончится автоматический ролл']];
+function sw(id,on){return '<label class="sw"><input type="checkbox" data-id="'+T(id)+'"'+(on?' checked':'')+'><span></span></label>'}
+$('#on').checked=c.on;
+$('#on').onchange=function(){c.on=this.checked;N.save(c);N.sync(true)};
+$('#cats').innerHTML=CATS.map(function(x){return '<div class="row"><div class="t"><b>'+x[1]+'</b><div class="mut">'+x[2]+'</div></div>'+sw('c:'+x[0],c.cats[x[0]])+'</div>'}).join('');
+$('#cats').onchange=function(e){var id=e.target.dataset.id;if(!id)return;c.cats[id.slice(2)]=e.target.checked;N.save(c);N.sync(true)};
+(async function(){
+  var tok=null;try{tok=localStorage.getItem('lootify_token')}catch(e){}
+  try{var r=await fetch('/app/api/battle/bosses',{headers:{'X-Token':tok}});var d=await r.json();
+    $('#bosses').innerHTML='<div class="row"><div class="t"><b>Какие боссы</b><div class="mut">Для напоминания «босс снова доступен»</div></div></div>'
+     +d.locs.map(function(l){return l.bosses.map(function(b){return '<div class="row"><div style="font-size:24px;width:32px;text-align:center">'+T(b.emoji)+'</div><div class="t"><b>'+T(b.name)+'</b><div class="mut">'+T(l.name)+'</div></div>'+sw('b:'+b.id,!c.off['boss:'+b.id])+'</div>'}).join('')}).join('');
+  }catch(e){$('#bosses').innerHTML='<div class="mut" style="padding:12px 0">Не удалось загрузить список боссов</div>'}
+})();
+$('#bosses').onchange=function(e){var id=e.target.dataset.id;if(!id)return;var k='boss:'+id.slice(2);if(e.target.checked)delete c.off[k];else c.off[k]=true;N.save(c);N.sync(true)};
+$('#test').onclick=function(){N.sync(true);$('#test').textContent='Готово ✓';setTimeout(function(){$('#test').textContent='Обновить напоминания сейчас'},1500)};
+})();
+</script></body></html>
+"""
+
 # Маленькая кнопка «в меню» поверх страниц игр, только когда игра открыта из приложения.
 BACK_SCRIPT = (
     '<script>/*__lootifyBack*/(function(){try{var w=window.Telegram&&Telegram.WebApp;'
@@ -826,6 +917,7 @@ APP_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#07050f">
 <title>Lootify</title>
+<script src="/app/notify.js"></script>
 <style>
 :root{--bg:#07050f;--panel:#120d22;--panel2:#1c1536;--line:#2b2150;--tx:#ece8ff;--mut:#8f86b8;--acc:#ff5d73;--gold:#ffc857;--pur:#b44bff}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -868,6 +960,7 @@ h1{margin:0;font-size:26px;font-weight:900}
  <div id="menu" class="hidden">
   <div class="top"><div class="who"><img src="data:image/webp;base64,__ICON__" alt=""><div><b id="nm"></b><div class="mut">Общий прогресс с ботом</div></div></div><button class="btn gray" id="out" style="width:auto;padding:8px 14px">Выйти</button></div>
   <button class="btn" id="btl" style="margin-top:14px;background:linear-gradient(#ff7a6b,#ff3d6e);box-shadow:0 3px 0 #8f1f3f">⚔ Бой с боссом</button>
+  <button class="btn gray" id="ntf" style="margin-top:10px">🔔 Уведомления</button>
   <button class="btn gray" id="shr" style="margin-top:10px">🌑 Мировой босс, Лутиафан, Кратос</button>
   <button class="btn" id="botb" style="margin-top:10px">🤖 Весь бот</button>
   <button class="btn" id="chat" style="margin-top:10px">💬 Общий чат <span id="bd" style="display:none;background:#ff5d73;border-radius:9px;padding:1px 7px;margin-left:6px;font-size:12px"></span></button>
@@ -909,7 +1002,7 @@ $('#bot').onclick=async function(){
   }catch(e){$('#err').style.color='';$('#err').textContent=e.message}
   b.disabled=false;
 };
-$('#chat').onclick=function(){location.href='/app/chat'};$('#botb').onclick=function(){location.href='/app/bot'};$('#btl').onclick=function(){location.href='/app/battle'};$('#shr').onclick=function(){location.href='/app/shared'};
+$('#chat').onclick=function(){location.href='/app/chat'};$('#botb').onclick=function(){location.href='/app/bot'};$('#btl').onclick=function(){location.href='/app/battle'};$('#shr').onclick=function(){location.href='/app/shared'};$('#ntf').onclick=function(){location.href='/app/notify'};
 $('#me1').onclick=function(){location.href='/app/me'};$('#me2').onclick=function(){location.href='/app/me#top'};$('#me3').onclick=function(){location.href='/app/me#inv'};
 async function badge(){
   var tk=store.get('lootify_token');if(!tk||$('#menu').classList.contains('hidden'))return;
@@ -948,7 +1041,7 @@ if(tok)menu(tok);else if(h!=='#tgfail')login('');
 """
 
 
-def install(app, bot_token: str, bot_username_cb, has_user_cb, icon_b64: str = "", send_cb=None, load_cb=None, save_cb=None, profile_cb=None, top_cb=None, inv_cb=None, toggle_cb=None, bridge=None, boss_list_cb=None, battle_state_cb=None, shared_cb=None):
+def install(app, bot_token: str, bot_username_cb, has_user_cb, icon_b64: str = "", send_cb=None, load_cb=None, save_cb=None, profile_cb=None, top_cb=None, inv_cb=None, toggle_cb=None, bridge=None, boss_list_cb=None, battle_state_cb=None, shared_cb=None, timers_cb=None):
     icon_b64 = icon_b64 or ICON_B64
     """Регистрирует /app (оболочка), /app/api/start, /app/api/poll, /app/tg (виджет Telegram).
     bot_username_cb: async () -> имя бота; has_user_cb: async (uid) -> зарегистрирован ли игрок."""
@@ -1202,6 +1295,25 @@ def install(app, bot_token: str, bot_username_cb, has_user_cb, icon_b64: str = "
             return web.json_response({"error": "Недопустимое действие"}, status=400)
         return web.json_response({"ops": await bridge.press(u["id"], u["first_name"], SHARED_MID[k], d)})
 
+    async def notify_js(request):
+        return web.Response(text=NOTIFY_JS, content_type="application/javascript", charset="utf-8", headers={"Cache-Control": "no-store"})
+
+    async def notify_page(request):
+        return web.Response(text=NOTIFY_HTML, content_type="text/html", charset="utf-8", headers={"Cache-Control": "no-store"})
+
+    async def timers_api(request):
+        u = who(request)
+        if not u:
+            return web.json_response({"error": "auth"}, status=401)
+        if timers_cb is None:
+            return web.json_response({"timers": []})
+        if _limited(str(u["id"]), "tm", 30, 60):
+            return web.json_response({"error": "Не так быстро"}, status=429)
+        return web.json_response({"timers": timers_cb(u["id"]), "now": int(time.time())})
+
+    app.router.add_get("/app/notify.js", notify_js)
+    app.router.add_get("/app/notify", notify_page)
+    app.router.add_get("/app/api/timers", timers_api)
     app.router.add_get("/app/shared", shared_page)
     app.router.add_get("/app/api/shared/state", shared_state)
     app.router.add_post("/app/api/shared/act", shared_act)
