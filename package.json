@@ -1,0 +1,16 @@
+{
+  "name": "pixel-miners",
+  "version": "1.0.0",
+  "description": "Pixel Miners — мультиплеерный пиксельный кликер / идл-игра (PWA). Developer: @yfeeeee",
+  "author": "@yfeeeee",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "DEV_MODE=1 node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

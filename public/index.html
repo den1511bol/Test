@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#1a1226">
+  <meta name="author" content="@yfeeeee">
+  <meta name="description" content="Pixel Miners — мультиплеерный пиксельный кликер. Developer: @yfeeeee">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Pixel Miners">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <title>Pixel Miners</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- Pixel Miners · Developer: @yfeeeee -->
+
+  <!-- ВХОД -->
+  <section id="login" class="screen hidden">
+    <h1 class="logo">PIXEL<br>MINERS</h1>
+    <img id="login-gem" class="px" width="128" height="128" alt="">
+    <p class="sub">Копай золото, нанимай шахтёров и бей боссов всем миром</p>
+    <div id="tg-login"></div>
+    <form id="dev-form" class="hidden">
+      <input id="dev-name" maxlength="24" placeholder="Тестовый ник" autocomplete="off">
+      <button class="btn" type="submit">Войти (тест)</button>
+    </form>
+    <p id="login-msg" class="msg"></p>
+    <footer class="credit">Developer: <a href="https://t.me/yfeeeee" target="_blank" rel="noopener">@yfeeeee</a></footer>
+  </section>
+
+  <!-- ИГРА -->
+  <div id="app" class="hidden">
+    <header class="top panel">
+      <div class="row">
+        <div class="who"><span id="avatar" class="avatar"></span><span id="uname"></span></div>
+        <div class="online"><i></i> <span id="online">0</span> онлайн</div>
+      </div>
+      <div class="coins"><img id="coin-ico" class="px" width="28" height="28" alt=""><span id="coins">0</span></div>
+      <div class="rates"><span id="dps">0</span>/сек &nbsp;·&nbsp; <span id="tapp">1</span>/тап</div>
+    </header>
+
+    <main>
+      <!-- ШАХТА -->
+      <section id="view-mine" class="view active">
+        <div class="mine-center">
+          <button id="gem" class="gem" aria-label="Копать"><img id="gem-img" class="px" alt=""></button>
+          <div class="hint">тапай по самородку!</div>
+        </div>
+        <div class="panel mini-boss" data-go="boss">
+          <div class="row"><span id="mini-boss-name">Босс</span><span class="dim">мировой босс ›</span></div>
+          <div class="bar"><i id="mini-bar"></i></div>
+        </div>
+      </section>
+
+      <!-- МАГАЗИН -->
+      <section id="view-shop" class="view">
+        <div class="panel seg" id="qty">
+          <button data-q="1" class="on">×1</button>
+          <button data-q="10">×10</button>
+          <button data-q="100">×100</button>
+          <button data-q="max">MAX</button>
+        </div>
+        <div id="shop-list"></div>
+        <div class="panel rebirth">
+          <div class="title">✦ Перерождение</div>
+          <p class="dim" id="rebirth-text"></p>
+          <button class="btn full" id="rebirth-btn">Переродиться</button>
+        </div>
+      </section>
+
+      <!-- БОСС -->
+      <section id="view-boss" class="view">
+        <div class="panel boss-card">
+          <div class="boss-name" id="boss-name">—</div>
+          <button id="boss-hit" class="boss-hit" aria-label="Атаковать"><img id="boss-img" class="px" alt=""></button>
+          <div class="bar big"><i id="boss-bar"></i><span id="boss-hp"></span></div>
+          <p class="dim center">Все игроки бьют одного босса. Тапай по нему или по самородку!<br>Победа = награда всем, кто бил. MVP получает ×2.</p>
+        </div>
+        <div class="panel">
+          <div class="title">Топ урона</div>
+          <ol id="boss-top" class="list"></ol>
+        </div>
+      </section>
+
+      <!-- ТОП -->
+      <section id="view-top" class="view">
+        <div class="panel">
+          <div class="title">🏆 Рейтинг игроков</div>
+          <p class="dim" id="lb-info"></p>
+          <ol id="lb" class="list lb"></ol>
+        </div>
+      </section>
+
+      <!-- ЧАТ -->
+      <section id="view-chat" class="view chat-view">
+        <div id="chat-log" class="panel chat-log"></div>
+        <form id="chat-form" class="chat-form">
+          <input id="chat-input" maxlength="120" placeholder="Сообщение..." autocomplete="off">
+          <button class="btn" type="submit">›</button>
+        </form>
+      </section>
+
+      <!-- ПРОФИЛЬ -->
+      <section id="view-me" class="view">
+        <div class="panel">
+          <div class="title">Статистика</div>
+          <div id="stats" class="stats"></div>
+        </div>
+        <div class="panel">
+          <div class="title">Достижения</div>
+          <div id="ach" class="ach"></div>
+        </div>
+        <div class="panel">
+          <button class="btn full hidden" id="install-btn">Установить приложение</button>
+          <p class="dim center" id="ios-hint">На iPhone: «Поделиться» → «На экран Домой».<br>На Android: меню браузера → «Установить приложение».</p>
+          <button class="btn full danger" id="logout-btn">Выйти</button>
+        </div>
+        <footer class="credit">Pixel Miners · Developer: <a href="https://t.me/yfeeeee" target="_blank" rel="noopener">@yfeeeee</a></footer>
+      </section>
+    </main>
+
+    <nav class="tabs">
+      <button data-view="mine" class="on">Шахта</button>
+      <button data-view="shop">Магазин</button>
+      <button data-view="boss">Босс</button>
+      <button data-view="top">Топ</button>
+      <button data-view="chat">Чат<b id="unread" class="badge hidden">0</b></button>
+      <button data-view="me">Я</button>
+    </nav>
+  </div>
+
+  <div id="toast"></div>
+  <script src="/game.js"></script>
+</body>
+</html>

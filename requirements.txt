@@ -1,3 +1,0 @@
-aiogram>=3.4,<4
-aiofiles>=23.0
-asyncpg>=0.29
