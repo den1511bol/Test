@@ -1,10 +1,10 @@
 'use strict';
 /*
- * PIXEL MINERS — мультиплеерная кликер / идл-игра (сервер)
+ * ОХОТНИКИ ЗА ЯДРОМ — мультиплеерная игра с общими боссами (сервер)
  * Developer: @yfeeeee
  *
- * Без внешних зависимостей: только встроенные модули Node.js.
- * Реальное время — через Server-Sent Events (SSE).
+ * Единственная зависимость: pg (PostgreSQL). Реальное время — Server-Sent Events.
+ * Вход: Telegram Login (кнопка-виджет) или ссылка на бота (@autifh_bot).
  */
 const http = require('node:http');
 const fs = require('node:fs');
@@ -17,30 +17,75 @@ const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR =
   process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const BOT_NAME = (process.env.TELEGRAM_BOT_USERNAME || 'autifh_bot').replace(/^@/, '');
+const DEV_LOGIN = process.env.DEV_LOGIN === '1'; // только для локальной проверки
 
 /* ------------------------------------------------------------------ */
 /*  Баланс игры                                                        */
 /* ------------------------------------------------------------------ */
-const MINERS = [
-  { id: 'dwarf', name: 'Гном', base: 15, dps: 0.1 },
-  { id: 'cart', name: 'Вагонетка', base: 100, dps: 1 },
-  { id: 'drill', name: 'Бур', base: 1100, dps: 8 },
-  { id: 'golem', name: 'Голем', base: 12000, dps: 47 },
-  { id: 'dragon', name: 'Дракон', base: 130000, dps: 260 },
-  { id: 'portal', name: 'Портал', base: 1400000, dps: 1400 },
+const MAT = {
+  sk: 'Чертёж', bone: 'Костяная пыль', ember: 'Угольный шлак', gear: 'Шестерня',
+  aether: 'Эфир', scale: 'Чешуя', core: 'Ядро',
+};
+const MK = Object.keys(MAT);
+const COST = [
+  null,
+  { sk: 10, bone: 4, credits: 200 },
+  { sk: 20, bone: 10, ember: 4, credits: 600 },
+  { sk: 40, bone: 20, ember: 10, gear: 4, credits: 1500 },
+  { sk: 70, ember: 20, gear: 10, aether: 4, credits: 4000 },
+  { sk: 100, gear: 20, aether: 10, scale: 4, credits: 9000 },
+  { sk: 150, aether: 20, scale: 10, core: 4, credits: 20000 },
 ];
-const GROWTH = 1.15; // рост цены миньонов
-const TAP_BASE = 10; // цена первой кирки
-const TAP_GROWTH = 1.25; // рост цены кирки
-const OFFLINE_CAP = 8 * 3600; // максимум оффлайн-дохода, сек
-const REBIRTH_MIN = 1e6; // минимум монет за забег для перерождения
-const CRYSTAL_BONUS = 0.1; // +10% к доходу за кристалл
-const BUCKET_CAP = 60; // антиавтокликер: ёмкость «ведра»
-const BUCKET_RATE = 20; // антиавтокликер: тапов в секунду
-const BOSS_NAMES = ['Слизень', 'Кротоед', 'Каменный жук', 'Тролль', 'Циклоп', 'Гидра', 'Левиафан', 'Титан'];
-
-const bossMaxHp = (level) => Math.floor(3000 * Math.pow(1.4, level - 1));
-const bossName = (level) => `${BOSS_NAMES[(level - 1) % BOSS_NAMES.length]} Ур.${level}`;
+const DMG = [1, 1.6, 2.5, 4, 6.5, 10, 16];
+const HP = [25, 50, 85, 130, 200, 300, 430];
+const DEF = [1.5, 3, 4.5, 6, 8, 10, 12];
+const REG = [0.3, 0.6, 1, 1.5, 2.2, 3, 4];
+const DOD = [0.5, 1, 1.5, 2, 3, 4, 5];
+const VAMP = [0, 0, 2, 4, 7, 11, 16];
+const TRU = [0, 0, 3, 6, 10, 16, 25];
+const STUN = [0, 0, 8, 12, 16, 22, 30];
+const WB = { vamp: [14, 18], tru: [12, 16], stun: [16, 22] };
+const ITEMS = {
+  w1: { name: 'Кровавый тесак', slot: 'Оружие', type: 'vamp', desc: 'Вампиризм: лечит при ударе (с 3 ур.)' },
+  w2: { name: 'Клинок рассвета', slot: 'Оружие', type: 'tru', desc: 'Истинный урон: игнорирует защиту (с 3 ур.)' },
+  w3: { name: 'Боевая секира', slot: 'Оружие', type: 'stun', desc: 'Оглушение: босс пропускает ответный удар (с 3 ур.)' },
+  h: { name: 'Шлем стража', slot: 'Голова', k: 0.8 },
+  c: { name: 'Нагрудник стража', slot: 'Грудь', k: 1.4 },
+  l: { name: 'Поножи стража', slot: 'Ноги', k: 1.1 },
+  b: { name: 'Сапоги стража', slot: 'Обувь', k: 0.7 },
+};
+const ARMOR = ['h', 'c', 'l', 'b'];
+const MEDS = {
+  patch: { name: 'Пластырь', heal: 0.25, cd: 3000, price: 150 },
+  pill: { name: 'Целебная пилюля', heal: 0.7, cd: 5000, price: 600 },
+  serum: { name: 'Железная сыворотка', heal: 0.8, cd: 5000, price: 1500 },
+};
+const BOSS_NAMES = [
+  'Лесной слизень', 'Каменный тролль', 'Болотная жаба-король', 'Корнеплёт', 'Грибной шаман',
+  'Пещерный нетопырь', 'Рудный голем', 'Могильный жнец', 'Призрачный скакун', 'Огненный бес',
+  'Угольный пёс', 'Костяной дракончик', 'Вулканический краб', 'Пепельная вдова', 'Паук-автомат',
+  'Заводной рыцарь', 'Паровой бык', 'Ледяной страж', 'Снежный йети', 'Морозная сова',
+  'Сигнальный дрон', 'Золотой змей', 'Звёздный странник', 'Песчаный сфинкс', 'Эфирный дракон',
+  'Морской левиафан', 'Хранитель ядра', 'Повелитель бездны',
+];
+const BOSSES = BOSS_NAMES.map((name, i) => ({
+  i, name, drop: MK[Math.floor(i / 4)],
+  max: Math.max(50, Math.round((900 * Math.pow(1.27, i)) / 50) * 50),
+  dmg: Math.round(5 * Math.pow(1.19, i)),
+  regen: Math.round(i * 0.4),
+  def: Math.min(45, Math.round(i * 1.7)),
+  lvl: 1 + i * 14,
+}));
+const RESPAWN_MS = 30000;
+const REST_MS = 15000; // отдых после поражения
+const TICK_MS = 3000; // тик регенерации
+const ATTACK_CAP = 8; // антиавтокликер: ёмкость «ведра»
+const ATTACK_RATE = 4; // атак в секунду
+const ACTIVE_MS = 20000; // игрок считается «в бою» 20 с после атаки
+const MAX_REPAIR = 100;
+const repairCost = (it) => Math.ceil((MAX_REPAIR - it.dur) * it.lvl * 2);
 
 /* ------------------------------------------------------------------ */
 /*  Хранилище: PostgreSQL (DATABASE_URL) или JSON-файл для локалки      */
@@ -207,121 +252,241 @@ async function saveNow() {
 }
 setInterval(saveNow, 5000).unref();
 
+
 /* ------------------------------------------------------------------ */
 /*  Игровая логика                                                     */
 /* ------------------------------------------------------------------ */
-const mult = (u) => 1 + CRYSTAL_BONUS * u.crystals;
-const tapPower = (u) => (1 + u.tapLvl) * mult(u);
-const dpsOf = (u) =>
-  MINERS.reduce((s, m) => s + (u.miners[m.id] || 0) * m.dps, 0) * mult(u);
-const rebirthGain = (u) => (u.run >= REBIRTH_MIN ? Math.floor(Math.sqrt(u.run / 1e5)) : 0);
+const rnd = (a, b) => a + Math.random() * (b - a);
+const clean = (s, max) =>
+  String(s ?? '')
+    .replace(/[\u0000-\u001f\u007f<>]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
 
-function newUser(id, name, username, photo) {
-  const now = Date.now();
-  return {
-    id, name, username: username || '', photo: photo || '',
-    coins: 0, run: 0, total: 0, taps: 0, tapLvl: 0, miners: {},
-    crystals: 0, rebirths: 0, bossHits: 0, bossKills: 0,
-    last: now, created: now, bucket: BUCKET_CAP, bucketTs: now, reward: null, lastChat: 0,
-  };
-}
-
-function settle(u, now = Date.now()) {
-  const dt = Math.min((now - u.last) / 1000, OFFLINE_CAP);
-  if (dt > 0) {
-    const gain = dpsOf(u) * dt;
-    u.coins += gain;
-    u.run += gain;
-    u.total += gain;
-  }
-  u.last = now;
-}
-
-function view(u) {
-  return {
-    id: u.id, name: u.name, username: u.username, photo: u.photo,
-    coins: u.coins, run: u.run, total: u.total, taps: u.taps,
-    tapLvl: u.tapLvl, miners: u.miners, crystals: u.crystals, rebirths: u.rebirths,
-    bossHits: u.bossHits, bossKills: u.bossKills,
-    tapPower: tapPower(u), dps: dpsOf(u), mult: mult(u),
-    rebirthGain: rebirthGain(u), reward: u.reward, now: Date.now(),
-    hasLogin: !!u.nick, nick: u.nick || '',
-  };
-}
-
-const bulkCost = (base, owned, n, growth = GROWTH) =>
-  Math.floor((base * Math.pow(growth, owned) * (Math.pow(growth, n) - 1)) / (growth - 1));
-
-function maxAffordable(base, owned, coins, growth = GROWTH) {
-  let n = Math.floor(
-    Math.log((coins * (growth - 1)) / (base * Math.pow(growth, owned)) + 1) / Math.log(growth)
-  );
-  n = Math.max(0, Math.min(n || 0, 1000));
-  while (n > 0 && bulkCost(base, owned, n, growth) > coins) n--;
-  return n;
-}
-
-/* ---- Мировой босс ------------------------------------------------- */
+const bossActive = BOSSES.map(() => new Map()); // userId -> время последней атаки (только в памяти)
 let bossDirty = true;
-function bossView() {
-  const b = db.boss;
-  const top = Object.entries(b.dmg)
-    .sort((a, c) => c[1] - a[1])
-    .slice(0, 5)
-    .map(([id, dmg]) => ({ id, name: db.users[id]?.name || '???', dmg }));
-  return { level: b.level, name: bossName(b.level), hp: Math.max(0, b.hp), maxHp: bossMaxHp(b.level), top };
+
+function freshBosses() {
+  return { v: 2, list: BOSSES.map((b) => ({ hp: b.max, state: 'alive', respawnAt: 0, dmg: {}, hits: {} })) };
 }
 
-function damageBoss(u, dmg) {
-  const b = db.boss;
-  b.hp -= dmg;
-  b.dmg[u.id] = (b.dmg[u.id] || 0) + dmg;
-  u.bossHits++;
-  bossDirty = true;
-  if (b.hp <= 0) defeatBoss();
+function newUser(id, name, tgId, username) {
+  const now = Date.now();
+  const items = {};
+  for (const k of Object.keys(ITEMS)) items[k] = { lvl: 1, dur: MAX_REPAIR };
+  return {
+    v: 2, id, name, tgId: tgId || '', username: username || '',
+    credits: 500, mats: { sk: 10, bone: 4, ember: 0, gear: 0, aether: 0, scale: 0, core: 0 },
+    meds: { patch: 3, pill: 1, serum: 0 }, items, eq: { weapon: 'w1' },
+    hp: 9999, hpTs: now, dead: 0, medLock: 0, regenUntil: 0, defUntil: 0,
+    total: 0, hitsDone: 0, kills: 0, pending: {}, lastChat: 0,
+    bucket: ATTACK_CAP, bucketTs: now, created: now,
+  };
 }
 
-function defeatBoss() {
-  const b = db.boss;
-  const maxHp = bossMaxHp(b.level);
-  const ranked = Object.entries(b.dmg).sort((a, c) => c[1] - a[1]);
-  const mvpId = ranked[0]?.[0];
-  const ts = Date.now();
-  for (const [id] of ranked) {
-    const p = db.users[id];
-    if (!p) continue;
-    const isMvp = id === mvpId;
-    const coins = Math.floor(maxHp * 0.25) + (isMvp ? Math.floor(maxHp * 0.25) : 0);
-    p.coins += coins;
-    p.run += coins;
-    p.total += coins;
-    p.bossKills++;
-    p.reward = { level: b.level, coins, mvp: isMvp, ts };
+const alive = (u, id) => u.items[id].dur > 0;
+
+function statsOf(u, now = Date.now()) {
+  const s = { hp: 100, regen: 1, def: 0, dodge: 2, crit: 5, min: 4, max: 7, vamp: 0, tru: 0, stun: 0 };
+  const wid = u.eq.weapon;
+  if (alive(u, wid)) {
+    const L = u.items[wid].lvl - 1;
+    const w = ITEMS[wid];
+    const b = WB[w.type];
+    s.min = b[0] * DMG[L];
+    s.max = b[1] * DMG[L];
+    s.crit += L * 1.5;
+    if (w.type === 'vamp') s.vamp = VAMP[L];
+    if (w.type === 'tru') s.tru = TRU[L];
+    if (w.type === 'stun') s.stun = STUN[L];
   }
-  const top = bossView().top;
-  pushChat({ sys: true, text: `Босс «${bossName(b.level)}» повержен! MVP: ${db.users[mvpId]?.name || '???'}` });
-  broadcast('bossDefeated', { level: b.level, name: bossName(b.level), top });
-  db.boss = { level: b.level + 1, hp: bossMaxHp(b.level + 1), dmg: {} };
+  for (const id of ARMOR) {
+    if (!alive(u, id)) continue;
+    const L = u.items[id].lvl - 1;
+    const k = ITEMS[id].k;
+    s.hp += HP[L] * k;
+    s.def += DEF[L] * k;
+    s.regen += REG[L] * k;
+    s.dodge += DOD[L] * k;
+  }
+  s.def = Math.min(95, s.def);
+  if (now < u.regenUntil) s.regen += 3.5;
+  if (now < u.defUntil) s.def = Math.min(95, s.def + 10);
+  return s;
+}
+
+// Регенерация здоровья по тикам; после отдыха возвращаемся с 30% здоровья.
+function syncHp(u, now) {
+  const st = statsOf(u, now);
+  if (u.dead) {
+    if (now < u.dead) return st;
+    u.dead = 0;
+    u.hp = st.hp * 0.3;
+    u.hpTs = now;
+  }
+  if (u.hp >= st.hp) {
+    u.hp = st.hp;
+    u.hpTs = now;
+    return st;
+  }
+  const ticks = Math.floor((now - u.hpTs) / TICK_MS);
+  if (ticks > 0) {
+    u.hp = Math.min(st.hp, u.hp + st.regen * ticks);
+    u.hpTs += ticks * TICK_MS;
+  }
+  return st;
+}
+
+function view(u, now = Date.now()) {
+  const st = syncHp(u, now);
+  return {
+    id: u.id, name: u.name, username: u.username,
+    credits: u.credits, mats: u.mats, meds: u.meds, items: u.items, eq: u.eq,
+    hp: u.hp, stats: st, dead: u.dead, medLock: u.medLock, regenUntil: u.regenUntil, defUntil: u.defUntil,
+    total: u.total, kills: u.kills, pending: u.pending, now,
+    repair: Object.fromEntries(Object.entries(u.items).map(([k, it]) => [k, repairCost(it)])),
+  };
+}
+
+function bossesView(now = Date.now()) {
+  return db.boss.list.map((b, i) => {
+    let n = 0;
+    for (const [uid, ts] of bossActive[i]) {
+      if (now - ts < ACTIVE_MS) n++;
+      else bossActive[i].delete(uid);
+    }
+    return { hp: Math.max(0, Math.round(b.hp)), state: b.state, respawnAt: b.respawnAt, n };
+  });
+}
+
+function wear(u, id, n) {
+  const it = u.items[id];
+  it.dur = Math.max(0, it.dur - n);
+}
+
+function killBoss(i, now) {
+  const def = BOSSES[i];
+  const b = db.boss.list[i];
+  const total = Object.values(b.dmg).reduce((a, c) => a + c, 0) || 1;
+  let top = null;
+  const players = Object.keys(b.hits).length;
+  for (const [uid, hits] of Object.entries(b.hits)) {
+    const p = db.users[uid];
+    if (!p || hits < 1) continue;
+    const dmg = b.dmg[uid] || 0;
+    const share = dmg / total;
+    if (!top || dmg > top.dmg) top = { name: p.name, dmg };
+    const chance = Math.min(0.95, 0.06 * hits + 0.1);
+    const qty = Math.random() < chance ? 1 + (Math.random() < 0.35 ? 1 : 0) + Math.floor(hits / 15) : 0;
+    const prev = p.pending[i] || { credits: 0, qty: 0, dmg: 0, hits: 0 };
+    p.pending[i] = {
+      credits: prev.credits + Math.floor(def.max * 0.12 * (0.3 + 0.7 * share)),
+      drop: def.drop, qty: prev.qty + qty, dmg: prev.dmg + Math.round(dmg), hits: prev.hits + hits,
+      players, share: Math.round(share * 100),
+    };
+    p.kills++;
+  }
+  b.state = 'respawn';
+  b.respawnAt = now + RESPAWN_MS;
+  b.hp = 0;
   bossDirty = true;
+  pushChat({ sys: true, text: `Босс «${def.name}» повержен! Больше всех урона: ${top ? top.name : '???'}` });
+  broadcast('bossDefeated', { i, name: def.name });
   saveSoon();
 }
 
-function applyTaps(u, n, now) {
-  const elapsed = Math.max(0, (now - u.bucketTs) / 1000);
-  u.bucket = Math.min(BUCKET_CAP, u.bucket + elapsed * BUCKET_RATE);
+// Один обмен ударами. Возвращает события боя для клиента.
+function doAttack(u, i, now) {
+  const def = BOSSES[i];
+  const b = db.boss.list[i];
+  if (!def) return { error: 'Нет такого босса' };
+  if (b.state !== 'alive') return { error: 'Босс ещё не возродился' };
+  const st = syncHp(u, now);
+  if (u.dead) return { error: 'Ты отдыхаешь после поражения' };
+  const el = Math.max(0, (now - u.bucketTs) / 1000);
+  u.bucket = Math.min(ATTACK_CAP, u.bucket + el * ATTACK_RATE);
   u.bucketTs = now;
-  const k = Math.max(0, Math.min(Math.floor(n) || 0, Math.floor(u.bucket), 200));
-  u.bucket -= k;
-  if (k > 0) {
-    const gain = k * tapPower(u);
-    u.coins += gain;
-    u.run += gain;
-    u.total += gain;
-    u.taps += k;
-    damageBoss(u, gain);
+  if (u.bucket < 1) return { error: 'Слишком быстро' };
+  u.bucket -= 1;
+  bossActive[i].set(u.id, now);
+  wear(u, u.eq.weapon, 1);
+  const ev = [];
+
+  const playerStrike = () => {
+    if (Math.random() < 0.12) return ev.push({ k: 'pmiss' }), null;
+    if (Math.random() < 0.04) return ev.push({ k: 'bdodge' }), null;
+    let d = rnd(st.min, st.max);
+    const crit = Math.random() * 100 < st.crit;
+    if (crit) d *= 2;
+    const stun = Math.random() * 100 < st.stun;
+    if (stun) d *= 1.2;
+    d = Math.max(1, d * (1 - def.def / 100) + st.tru);
+    if (st.vamp) u.hp = Math.min(st.hp, u.hp + st.vamp);
+    b.hp -= d;
+    b.dmg[u.id] = (b.dmg[u.id] || 0) + d;
+    b.hits[u.id] = (b.hits[u.id] || 0) + 1;
+    u.total += d;
+    u.hitsDone++;
+    ev.push({ k: 'hit', d: Math.round(d), crit, stun });
+    bossDirty = true;
+    return { stun };
+  };
+  const bossStrike = () => {
+    if (Math.random() < 0.1) return void ev.push({ k: 'bmiss' });
+    if (Math.random() * 100 < st.dodge) return void ev.push({ k: 'pdodge' });
+    const d = Math.max(1, rnd(def.dmg * 0.6, def.dmg) * (1 - st.def / 100));
+    u.hp -= d;
+    const av = ARMOR.filter((id) => alive(u, id));
+    if (av.length) wear(u, av[Math.floor(Math.random() * av.length)], 1);
+    ev.push({ k: 'bhit', d: Math.round(d) });
+  };
+
+  let killed = false;
+  if (Math.random() < 0.5) {
+    const r = playerStrike();
+    if (b.hp <= 0) killed = true;
+    else if (!(r && r.stun)) bossStrike();
+  } else {
+    bossStrike();
+    if (u.hp > 0) {
+      playerStrike();
+      if (b.hp <= 0) killed = true;
+    }
   }
-  return k;
+  if (u.hp <= 0) {
+    u.hp = 0;
+    u.dead = now + REST_MS;
+    if (u.credits > 1000) u.credits -= Math.floor(u.credits * 0.07);
+    ev.push({ k: 'lost' });
+  }
+  if (killed) killBoss(i, now);
+  return { ev };
 }
+
+setInterval(() => {
+  const now = Date.now();
+  for (let i = 0; i < BOSSES.length; i++) {
+    const b = db.boss.list[i];
+    if (b.state === 'respawn' && now >= b.respawnAt) {
+      b.state = 'alive';
+      b.hp = BOSSES[i].max;
+      b.dmg = {};
+      b.hits = {};
+      bossDirty = true;
+      saveSoon();
+    }
+  }
+}, 1000).unref();
+setInterval(() => {
+  for (let i = 0; i < BOSSES.length; i++) {
+    const b = db.boss.list[i];
+    if (b.state === 'alive' && b.hp < BOSSES[i].max && BOSSES[i].regen) {
+      b.hp = Math.min(BOSSES[i].max, b.hp + BOSSES[i].regen);
+      bossDirty = true;
+    }
+  }
+}, TICK_MS).unref();
 
 /* ---- Чат ----------------------------------------------------------- */
 function pushChat(m) {
@@ -331,13 +496,6 @@ function pushChat(m) {
   broadcast('chat', msg);
   saveSoon();
 }
-
-const clean = (s, max) =>
-  String(s ?? '')
-    .replace(/[\u0000-\u001f\u007f<>]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, max);
 
 /* ---- Рейтинг -------------------------------------------------------- */
 let lbCache = { ts: 0, list: [] };
@@ -351,11 +509,10 @@ function leaderboard(forId) {
   const all = sortedUsers();
   const online = new Set([...clients].map((c) => c.userId));
   const top = all.slice(0, 20).map((u, i) => ({
-    rank: i + 1, id: u.id, name: u.name, photo: u.photo, total: u.total,
-    crystals: u.crystals, online: online.has(u.id),
+    rank: i + 1, id: u.id, name: u.name, total: Math.round(u.total), kills: u.kills, online: online.has(u.id),
   }));
   const idx = forId ? all.findIndex((u) => u.id === forId) : -1;
-  return { top, me: idx >= 0 ? { rank: idx + 1, total: all[idx].total } : null, players: all.length };
+  return { top, me: idx >= 0 ? { rank: idx + 1, total: Math.round(all[idx].total) } : null, players: all.length };
 }
 
 /* ------------------------------------------------------------------ */
@@ -371,11 +528,11 @@ function broadcast(type, data) {
 const onlineCount = () => new Set([...clients].map((c) => c.userId)).size;
 
 setInterval(() => {
-  if (bossDirty && clients.size) {
+  if (clients.size) {
     bossDirty = false;
-    broadcast('boss', bossView());
+    broadcast('bosses', bossesView());
   }
-}, 500).unref();
+}, 1000).unref();
 setInterval(() => {
   if (clients.size) {
     broadcast('online', { count: onlineCount() });
@@ -385,107 +542,13 @@ setInterval(() => {
 setInterval(() => {
   for (const c of clients) c.res.write(': hb\n\n');
 }, 20000).unref();
-
-/* ------------------------------------------------------------------ */
-/*  Авторизация                                                        */
-/* ------------------------------------------------------------------ */
-const NICK_RE = /^[\p{L}\p{N}_]{3,16}$/u;
-const sha = (x) => crypto.createHash('sha256').update(x).digest('hex');
-
-function hashSecret(secret) {
-  const salt = crypto.randomBytes(16);
-  return salt.toString('hex') + ':' + crypto.scryptSync(secret, salt, 32).toString('hex');
-}
-function checkSecret(secret, stored) {
-  if (!stored) return false;
-  const [saltHex, hashHex] = stored.split(':');
-  const h = crypto.scryptSync(secret, Buffer.from(saltHex, 'hex'), 32);
-  const want = Buffer.from(hashHex, 'hex');
-  return h.length === want.length && crypto.timingSafeEqual(h, want);
-}
-
-function createSession(userId) {
-  const token = crypto.randomBytes(32).toString('hex');
-  db.sessions[token] = { userId, ts: Date.now() };
-  saveSoon();
-  return token;
-}
-
-// Код восстановления: 12 символов (≈60 бит), в базе хранится только sha256.
-function issueCode(u) {
-  if (u.recKey) delete db.recovery[u.recKey];
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let raw = '';
-  for (const byte of crypto.randomBytes(12)) raw += alphabet[byte % alphabet.length];
-  const code = raw.match(/.{4}/g).join('-');
-  u.recKey = sha(raw);
-  db.recovery[u.recKey] = u.id;
-  saveSoon();
-  return code;
-}
-const normCode = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-
-function createGuest() {
-  const id = 'g' + crypto.randomBytes(8).toString('hex');
-  const u = (db.users[id] = newUser(id, 'Гость' + (1000 + Math.floor(Math.random() * 9000)), '', ''));
-  return { token: createSession(id), code: issueCode(u) };
-}
-
-// Проверка ника и пароля; возвращает текст ошибки или null.
-function validateCreds(nick, password, selfId) {
-  if (!NICK_RE.test(nick)) return 'Ник: 3–16 символов, буквы, цифры и _';
-  if (typeof password !== 'string' || password.length < 6 || password.length > 64) return 'Пароль: от 6 до 64 символов';
-  const owner = db.nicks[nick.toLowerCase()];
-  if (owner && owner !== selfId) return 'Этот ник уже занят';
-  return null;
-}
-function setCreds(u, nick, password) {
-  if (u.nick) delete db.nicks[u.nick.toLowerCase()];
-  u.nick = nick;
-  u.name = nick;
-  u.pass = hashSecret(password);
-  db.nicks[nick.toLowerCase()] = u.id;
-  saveSoon();
-}
-
-const failLogins = new Map(); // защита от подбора пароля по нику
-function loginBlocked(key) {
-  const f = failLogins.get(key);
-  return f && f.n >= 8 && Date.now() - f.t < 15 * 60000;
-}
-function loginFailed(key) {
-  const f = failLogins.get(key);
-  failLogins.set(key, !f || Date.now() - f.t > 15 * 60000 ? { n: 1, t: Date.now() } : { n: f.n + 1, t: Date.now() });
-}
-
-function authUser(req, url) {
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : url.searchParams.get('t');
-  const s = token && db.sessions[token];
-  return s ? { token, user: db.users[s.userId] } : null;
-}
-
-// После загрузки данных: значения по умолчанию, индексы, чистка старых сессий
-function afterLoad() {
-  if (!db.boss) db.boss = { level: 1, hp: bossMaxHp(1), dmg: {} };
-  db.nicks = {};
-  db.recovery = {};
-  for (const u of Object.values(db.users)) {
-    if (u.nick) db.nicks[u.nick.toLowerCase()] = u.id;
-    if (u.recKey) db.recovery[u.recKey] = u.id;
-  }
-  for (const [t, x] of Object.entries(db.sessions)) {
-    if (Date.now() - x.ts > 180 * 86400e3 || !db.users[x.userId]) delete db.sessions[t];
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /*  HTTP                                                               */
 /* ------------------------------------------------------------------ */
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8',
-  '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.svg': 'image/svg+xml',
+  '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.webp': 'image/webp', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
 
@@ -549,114 +612,251 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+
+/* ------------------------------------------------------------------ */
+/*  Авторизация через Telegram                                         */
+/* ------------------------------------------------------------------ */
+const sha = (x) => crypto.createHash('sha256').update(x).digest('hex');
+
+function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  db.sessions[token] = { userId, ts: Date.now() };
+  saveSoon();
+  return token;
+}
+
+function authUser(req, url) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : url.searchParams.get('t');
+  const s = token && db.sessions[token];
+  return s && db.users[s.userId] ? { token, user: db.users[s.userId] } : null;
+}
+
+// Подпись данных Telegram Login Widget: HMAC-SHA256, ключ — sha256(токен бота).
+function verifyWidget(q) {
+  if (!TG_TOKEN || !q.hash || !q.id || !q.auth_date) return false;
+  const check = Object.keys(q)
+    .filter((k) => k !== 'hash')
+    .sort()
+    .map((k) => `${k}=${q[k]}`)
+    .join('\n');
+  const key = crypto.createHash('sha256').update(TG_TOKEN).digest();
+  const want = crypto.createHmac('sha256', key).update(check).digest('hex');
+  const a = Buffer.from(want);
+  const b = Buffer.from(String(q.hash));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  return Date.now() / 1000 - Number(q.auth_date) < 86400;
+}
+
+function upsertTg(tg) {
+  const id = 'tg' + String(tg.id).replace(/\D/g, '');
+  const name = clean([tg.first_name, tg.last_name].filter(Boolean).join(' ') || tg.username || 'Игрок', 24) || 'Игрок';
+  let u = db.users[id];
+  if (!u) u = db.users[id] = newUser(id, name, String(tg.id), tg.username);
+  else {
+    u.name = name;
+    u.username = tg.username || '';
+  }
+  saveSoon();
+  return u;
+}
+
+// Вход по ссылке на бота: игра выдаёт код, бот видит «/start код» и подтверждает вход.
+const pendingLogins = new Map(); // code -> { ts, token }
+setInterval(() => {
+  for (const [c, p] of pendingLogins) if (Date.now() - p.ts > 10 * 60000) pendingLogins.delete(c);
+}, 60000).unref();
+
+async function tgApi(method, body) {
+  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+    signal: AbortSignal.timeout(40000),
+  });
+  return r.json();
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function botLoop() {
+  if (!TG_TOKEN) {
+    console.log('TELEGRAM_BOT_TOKEN не задан: вход через Telegram отключён');
+    return;
+  }
+  try { await tgApi('deleteWebhook'); } catch { /* ок */ }
+  let offset = 0;
+  for (;;) {
+    try {
+      const r = await tgApi('getUpdates', { offset, timeout: 25, allowed_updates: ['message'] });
+      if (!r.ok) { await sleep(5000); continue; }
+      for (const up of r.result) {
+        offset = up.update_id + 1;
+        const m = up.message;
+        if (!m || !m.from || typeof m.text !== 'string') continue;
+        const mm = m.text.match(/^\/start\s+([a-f0-9]{16,64})/i);
+        if (mm) {
+          const p = pendingLogins.get(mm[1]);
+          if (p && !p.token) {
+            p.token = createSession(upsertTg(m.from).id);
+            await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Вход выполнен. Возвращайся в игру «Охотники за Ядром».' });
+          } else {
+            await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Ссылка устарела. Нажми «Войти» в игре ещё раз.' });
+          }
+        } else if (/^\/start/.test(m.text)) {
+          await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Это бот входа в игру «Охотники за Ядром». Открой игру и нажми «Войти через бота».' });
+        }
+      }
+    } catch (e) {
+      await sleep(5000);
+    }
+  }
+}
+
+// После загрузки данных: старую игру (Pixel Miners, v1) убираем, чинить нечего.
+function afterLoad() {
+  if (!db.boss || db.boss.v !== 2 || db.boss.list?.length !== BOSSES.length) db.boss = freshBosses();
+  for (const [id, u] of Object.entries(db.users)) if (u.v !== 2) delete db.users[id];
+  for (const [t, x] of Object.entries(db.sessions)) {
+    if (Date.now() - x.ts > 180 * 86400e3 || !db.users[x.userId]) delete db.sessions[t];
+  }
+  db.chat = (db.chat || []).filter((m) => m && m.text);
+  db.nicks = {};
+  db.recovery = {};
+}
+
+/* ------------------------------------------------------------------ */
+/*  API                                                                */
+/* ------------------------------------------------------------------ */
 async function handleApi(req, res, url) {
   const route = `${req.method} ${url.pathname}`;
 
   if (route === 'GET /api/config') {
     return json(res, 200, {
-      build: BUILD, miners: MINERS, growth: GROWTH, tapBase: TAP_BASE, tapGrowth: TAP_GROWTH,
-      rebirthMin: REBIRTH_MIN, crystalBonus: CRYSTAL_BONUS, developer: DEVELOPER,
+      build: BUILD, developer: DEVELOPER, bot: BOT_NAME, tg: !!TG_TOKEN, dev: DEV_LOGIN,
+      bosses: BOSSES, items: ITEMS, armor: ARMOR, cost: COST, mats: MAT, meds: MEDS,
+      respawnMs: RESPAWN_MS, restMs: REST_MS, tickMs: TICK_MS,
     });
   }
 
-  if (route === 'POST /api/guest') {
-    if (limited(req, 'guest', 5, 3600e3)) return fail(res, 'Слишком много новых гостей с вашего адреса. Попробуйте позже', 429);
-    return json(res, 200, createGuest());
+  if (route === 'POST /api/tg/start') {
+    if (!TG_TOKEN) return fail(res, 'Вход через Telegram ещё не настроен на сервере', 503);
+    if (limited(req, 'tgstart', 30, 3600e3)) return fail(res, 'Слишком много попыток. Попробуйте позже', 429);
+    const code = crypto.randomBytes(12).toString('hex');
+    pendingLogins.set(code, { ts: Date.now(), token: null });
+    return json(res, 200, { code, link: `https://t.me/${BOT_NAME}?start=${code}` });
   }
 
-  if (route === 'POST /api/register') {
-    if (limited(req, 'reg', 5, 3600e3)) return fail(res, 'Слишком много регистраций. Попробуйте позже', 429);
-    const body = await readBody(req);
-    const nick = String(body.nick || '').trim();
-    const err = validateCreds(nick, body.password, null);
-    if (err) return fail(res, err);
-    const id = 'u' + crypto.randomBytes(8).toString('hex');
-    const u = (db.users[id] = newUser(id, nick, '', ''));
-    setCreds(u, nick, body.password);
-    return json(res, 200, { token: createSession(id), code: issueCode(u) });
+  if (route === 'GET /api/tg/poll') {
+    const p = pendingLogins.get(String(url.searchParams.get('c') || ''));
+    if (!p) return json(res, 200, { expired: true });
+    if (!p.token) return json(res, 200, { wait: true });
+    pendingLogins.delete(url.searchParams.get('c'));
+    return json(res, 200, { token: p.token });
   }
 
-  if (route === 'POST /api/login') {
-    if (limited(req, 'login', 15, 60000)) return fail(res, 'Слишком часто. Подождите минуту', 429);
+  if (route === 'POST /api/devlogin' && DEV_LOGIN) {
     const body = await readBody(req);
-    const nick = String(body.nick || '').trim().toLowerCase();
-    if (loginBlocked(nick)) return fail(res, 'Слишком много неверных попыток. Подождите 15 минут', 429);
-    const u = db.users[db.nicks[nick]];
-    const pass = typeof body.password === 'string' ? body.password.slice(0, 64) : '';
-    if (!u || !checkSecret(pass, u.pass)) {
-      loginFailed(nick);
-      return fail(res, 'Неверный ник или пароль', 401);
-    }
-    failLogins.delete(nick);
+    const name = clean(body.name, 16) || 'Тест';
+    const id = 'tg' + (900000 + [...name].reduce((a, c) => a + c.charCodeAt(0), 0));
+    const u = db.users[id] || (db.users[id] = newUser(id, name, id, name));
     return json(res, 200, { token: createSession(u.id) });
   }
 
-  if (route === 'POST /api/recover') {
-    if (limited(req, 'rec', 10, 60000)) return fail(res, 'Слишком часто. Подождите минуту', 429);
-    const body = await readBody(req);
-    const id = db.recovery[sha(normCode(body.code))];
-    if (!id || !db.users[id]) return fail(res, 'Неверный код восстановления', 401);
-    return json(res, 200, { token: createSession(id) });
-  }
-
   const auth = authUser(req, url);
-  if (!auth || !auth.user) return fail(res, 'Нужна авторизация', 401);
+  if (!auth) return fail(res, 'Нужна авторизация', 401);
   const u = auth.user;
   const now = Date.now();
+  const body = req.method === 'POST' ? await readBody(req) : {};
 
   switch (route) {
     case 'GET /api/me':
-      settle(u, now);
       saveSoon();
-      return json(res, 200, view(u));
+      return json(res, 200, view(u, now));
 
-    case 'POST /api/tap': {
-      const body = await readBody(req);
-      settle(u, now);
-      const accepted = applyTaps(u, Number(body.n), now);
+    case 'GET /api/bosses':
+      return json(res, 200, bossesView(now));
+
+    case 'POST /api/attack': {
+      const r = doAttack(u, Number(body.boss), now);
+      if (r.error) return fail(res, r.error, 409);
       saveSoon();
-      return json(res, 200, { ...view(u), accepted });
+      return json(res, 200, { ev: r.ev, me: view(u, now), boss: bossesView(now)[Number(body.boss)] });
     }
 
-    case 'POST /api/buy': {
-      const body = await readBody(req);
-      settle(u, now);
-      let base, owned, growth;
-      if (body.item === 'tap') {
-        base = TAP_BASE; owned = u.tapLvl; growth = TAP_GROWTH;
-      } else {
-        const m = MINERS.find((x) => x.id === body.item);
-        if (!m) return fail(res, 'Неизвестный предмет');
-        base = m.base; owned = u.miners[m.id] || 0; growth = GROWTH;
+    case 'POST /api/claim': {
+      const i = String(Number(body.boss));
+      const p = u.pending[i];
+      if (!p) return fail(res, 'Награды нет');
+      u.credits += p.credits;
+      if (p.qty) u.mats[p.drop] += p.qty;
+      delete u.pending[i];
+      saveSoon();
+      return json(res, 200, { got: p, me: view(u, now) });
+    }
+
+    case 'POST /api/med': {
+      const m = MEDS[body.k];
+      if (!m) return fail(res, 'Неизвестный предмет');
+      const st = syncHp(u, now);
+      if (u.dead) return fail(res, 'Сначала дождись конца отдыха');
+      if (now < u.medLock) return fail(res, 'Медикаменты на перезарядке');
+      if (!u.meds[body.k]) return fail(res, 'Нет в запасе');
+      u.meds[body.k]--;
+      u.hp = Math.min(st.hp, u.hp + st.hp * m.heal);
+      u.medLock = now + m.cd;
+      if (body.k === 'pill') u.regenUntil = now + 30000;
+      if (body.k === 'serum') u.defUntil = now + 60000;
+      saveSoon();
+      return json(res, 200, view(u, now));
+    }
+
+    case 'POST /api/buymed': {
+      const m = MEDS[body.k];
+      if (!m) return fail(res, 'Неизвестный предмет');
+      if (u.credits < m.price) return fail(res, 'Не хватает кредитов');
+      u.credits -= m.price;
+      u.meds[body.k]++;
+      saveSoon();
+      return json(res, 200, view(u, now));
+    }
+
+    case 'POST /api/upgrade': {
+      const it = u.items[body.item];
+      if (!it) return fail(res, 'Нет такого предмета');
+      const c = COST[it.lvl];
+      if (!c) return fail(res, 'Максимальный уровень');
+      for (const [k, v] of Object.entries(c)) {
+        if ((k === 'credits' ? u.credits : u.mats[k]) < v) return fail(res, 'Не хватает ресурсов');
       }
-      const n =
-        body.qty === 'max'
-          ? maxAffordable(base, owned, u.coins, growth)
-          : Math.max(1, Math.min(Math.floor(Number(body.qty)) || 1, 1000));
-      if (n < 1) return fail(res, 'Недостаточно монет');
-      const cost = bulkCost(base, owned, n, growth);
-      if (cost > u.coins) return fail(res, 'Недостаточно монет');
-      u.coins -= cost;
-      if (body.item === 'tap') u.tapLvl += n;
-      else u.miners[body.item] = owned + n;
+      for (const [k, v] of Object.entries(c)) {
+        if (k === 'credits') u.credits -= v;
+        else u.mats[k] -= v;
+      }
+      it.lvl++;
       saveSoon();
-      return json(res, 200, view(u));
+      return json(res, 200, view(u, now));
     }
 
-    case 'POST /api/rebirth': {
-      settle(u, now);
-      const gain = rebirthGain(u);
-      if (gain < 1) return fail(res, `Нужно заработать за забег минимум ${REBIRTH_MIN} монет`);
-      u.crystals += gain;
-      u.rebirths++;
-      u.coins = 0; u.run = 0; u.tapLvl = 0; u.miners = {};
-      pushChat({ sys: true, text: `${u.name} переродился и получил ${gain} кристаллов!` });
+    case 'POST /api/repair': {
+      const it = u.items[body.item];
+      if (!it) return fail(res, 'Нет такого предмета');
+      const c = repairCost(it);
+      if (c < 1) return fail(res, 'Чинить нечего');
+      if (u.credits < c) return fail(res, 'Не хватает кредитов');
+      u.credits -= c;
+      it.dur = MAX_REPAIR;
       saveSoon();
-      return json(res, 200, view(u));
+      return json(res, 200, view(u, now));
+    }
+
+    case 'POST /api/wear': {
+      if (!ITEMS[body.item] || ITEMS[body.item].slot !== 'Оружие') return fail(res, 'Это нельзя надеть');
+      u.eq.weapon = body.item;
+      saveSoon();
+      return json(res, 200, view(u, now));
     }
 
     case 'POST /api/chat': {
-      const body = await readBody(req);
       const text = clean(body.text, 120);
       if (!text) return fail(res, 'Пустое сообщение');
       if (now - u.lastChat < 2000) return fail(res, 'Не так быстро');
@@ -667,21 +867,6 @@ async function handleApi(req, res, url) {
 
     case 'GET /api/leaderboard':
       return json(res, 200, leaderboard(u.id));
-
-    case 'POST /api/bind': {
-      const body = await readBody(req);
-      const nick = String(body.nick || '').trim();
-      if (u.nick) {
-        if (!checkSecret(String(body.old || '').slice(0, 64), u.pass)) return fail(res, 'Старый пароль неверный', 403);
-      }
-      const err = validateCreds(nick, body.password, u.id);
-      if (err) return fail(res, err);
-      setCreds(u, nick, body.password);
-      return json(res, 200, view(u));
-    }
-
-    case 'POST /api/newcode':
-      return json(res, 200, { code: issueCode(u) });
 
     case 'POST /api/logout':
       delete db.sessions[auth.token];
@@ -701,9 +886,7 @@ async function handleApi(req, res, url) {
         clients.delete(client);
         broadcast('online', { count: onlineCount() });
       });
-      send(res, 'init', {
-        boss: bossView(), online: onlineCount(), lb: leaderboard(u.id), chat: db.chat,
-      });
+      send(res, 'init', { bosses: bossesView(), online: onlineCount(), lb: leaderboard(u.id), chat: db.chat });
       broadcast('online', { count: onlineCount() });
       return;
     }
@@ -715,6 +898,18 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname === '/health') return json(res, 200, { ok: true, dev: DEVELOPER });
+
+    // Возврат из окна Telegram Login Widget: проверяем подпись и отдаём токен странице игры
+    if (url.pathname === '/auth/tg' && req.method === 'GET') {
+      const q = Object.fromEntries(url.searchParams);
+      if (!verifyWidget(q)) {
+        res.writeHead(302, { Location: '/#tgfail' });
+        return res.end();
+      }
+      const token = createSession(upsertTg(q).id);
+      res.writeHead(302, { Location: '/#tg=' + token, 'Cache-Control': 'no-store' });
+      return res.end();
+    }
 
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 'Метод не поддерживается', 405);
@@ -730,15 +925,17 @@ async function start() {
     const needSave = await store.load();
     afterLoad();
     if (needSave) dirty = true;
+    dirty = true;
     await saveNow();
   } catch (e) {
     console.error('Не удалось подключиться к хранилищу:', e.message);
     process.exit(1);
   }
   server.listen(PORT, () => {
-    console.log(`⛏  Pixel Miners запущен на порту ${PORT}  |  developer ${DEVELOPER}`);
-    console.log(`   Вход: гость + код восстановления, ник + пароль  |  Хранилище: ${store.name}`);
+    console.log(`Охотники за Ядром запущены на порту ${PORT}  |  developer ${DEVELOPER}`);
+    console.log(`Вход: Telegram (@${BOT_NAME})  |  Хранилище: ${store.name}`);
   });
+  botLoop();
 }
 
 let stopping = false;

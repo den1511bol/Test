@@ -1,7 +1,7 @@
 {
-  "name": "pixel-miners-android",
+  "name": "core-hunters-android",
   "version": "1.0.0",
-  "description": "Android-обёртка (Capacitor) для Pixel Miners. Developer: @yfeeeee",
+  "description": "Android-обёртка (Capacitor) для Охотники за Ядром. Developer: @yfeeeee",
   "author": "@yfeeeee",
   "private": true,
   "dependencies": {

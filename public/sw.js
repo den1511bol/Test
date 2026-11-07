@@ -1,6 +1,6 @@
-/* Pixel Miners service worker · Developer: @yfeeeee */
-const CACHE = 'pixel-miners-v2';
-const SHELL = ['/', '/style.css', '/game.js', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png'];
+/* Охотники за Ядром service worker · Developer: @yfeeeee */
+const CACHE = 'core-hunters-v1';
+const SHELL = ['/', '/game.js', '/manifest.webmanifest', '/img/icon.webp'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

@@ -1,13 +1,13 @@
 {
-  "name": "Pixel Miners",
-  "short_name": "Pixel Miners",
-  "description": "Мультиплеерный пиксельный кликер. Developer: @yfeeeee",
+  "name": "Охотники за Ядром",
+  "short_name": "Охотники за Ядром",
+  "description": "Общие бои с боссами. Developer: @yfeeeee",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#1a1226",
-  "theme_color": "#1a1226",
+  "background_color": "#0e0a1c",
+  "theme_color": "#0e0a1c",
   "lang": "ru",
   "icons": [
     { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },

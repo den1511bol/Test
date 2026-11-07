@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       server_url:
-        description: "Адрес сервера на Railway, например https://pixel-miners.up.railway.app"
+        description: "Адрес сервера на Railway, например https://core-hunters.up.railway.app"
         required: false
 
 permissions:
@@ -60,7 +60,7 @@ jobs:
           for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
             d=${pair%%:*}; s=${pair##*:}
             for name in ic_launcher ic_launcher_round ic_launcher_foreground; do
-              convert ../public/icons/icon-512.png -filter point -resize ${s}x${s} $RES/mipmap-$d/$name.png
+              convert ../public/icons/icon-512.png -resize ${s}x${s} $RES/mipmap-$d/$name.png
             done
           done
           sed -i 's/<activity$/<activity android:screenOrientation="portrait"/' android/app/src/main/AndroidManifest.xml
@@ -79,27 +79,27 @@ jobs:
           ./gradlew assembleDebug --no-daemon
 
       - name: Подготовить файл
-        run: cp app/android/app/build/outputs/apk/debug/app-debug.apk PixelMiners.apk
+        run: cp app/android/app/build/outputs/apk/debug/app-debug.apk CoreHunters.apk
 
       - name: Опубликовать релиз с APK
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "apk-${{ github.run_number }}" PixelMiners.apk \
-            --title "Pixel Miners APK #${{ github.run_number }}" \
-            --notes "Android-приложение Pixel Miners. Сервер: $SERVER_URL. Developer: @yfeeeee"
+          gh release create "apk-${{ github.run_number }}" CoreHunters.apk \
+            --title "Охотники за Ядром APK #${{ github.run_number }}" \
+            --notes "Android-приложение Охотники за Ядром. Сервер: $SERVER_URL. Developer: @yfeeeee"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: PixelMiners-apk
-          path: PixelMiners.apk
+          name: CoreHunters-apk
+          path: CoreHunters.apk
 
       - name: Сообщить игре о новой версии (apk.json)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git pull --rebase origin main
-          printf '{"versionCode":%s,"versionName":"1.0.%s","url":"https://github.com/${{ github.repository }}/releases/download/apk-%s/PixelMiners.apk"}\n' \
+          printf '{"versionCode":%s,"versionName":"1.0.%s","url":"https://github.com/${{ github.repository }}/releases/download/apk-%s/CoreHunters.apk"}\n' \
             "${{ github.run_number }}" "${{ github.run_number }}" "${{ github.run_number }}" > public/apk.json
           git add public/apk.json
           git commit -m "Update apk.json to build ${{ github.run_number }}" -m "Developer: @yfeeeee"

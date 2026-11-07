@@ -7,11 +7,11 @@ if (!/^https:\/\/[^\s/]+/.test(url)) {
 }
 const config = {
   appId: 'com.yfeeeee.pixelminers',
-  appName: 'Pixel Miners',
+  appName: 'Охотники за Ядром',
   webDir: 'www',
-  backgroundColor: '#1a1226',
+  backgroundColor: '#0e0a1c',
   server: { url, cleartext: false, errorPath: 'error.html' },
-  android: { backgroundColor: '#1a1226' },
+  android: { backgroundColor: '#0e0a1c' },
 };
 fs.writeFileSync('capacitor.config.json', JSON.stringify(config, null, 2));
 console.log('capacitor.config.json создан, сервер:', url);
