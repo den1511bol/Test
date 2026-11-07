@@ -42,33 +42,166 @@ const bossMaxHp = (level) => Math.floor(3000 * Math.pow(1.4, level - 1));
 const bossName = (level) => `${BOSS_NAMES[(level - 1) % BOSS_NAMES.length]} Ур.${level}`;
 
 /* ------------------------------------------------------------------ */
-/*  Хранилище (JSON-файл, атомарная запись)                            */
+/*  Хранилище: PostgreSQL (DATABASE_URL) или JSON-файл для локалки      */
 /* ------------------------------------------------------------------ */
-fs.mkdirSync(DATA_DIR, { recursive: true });
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 
 let db = { users: {}, sessions: {}, nicks: {}, recovery: {}, boss: null, chat: [] };
-try {
-  db = Object.assign(db, JSON.parse(fs.readFileSync(DB_FILE, 'utf8')));
-} catch (e) {
-  if (e.code !== 'ENOENT') console.error('Не удалось прочитать БД:', e.message);
+
+function readLegacyFile() {
+  try {
+    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error('Не удалось прочитать db.json:', e.message);
+    return null;
+  }
 }
-if (!db.boss) db.boss = { level: 1, hp: bossMaxHp(1), dmg: {} };
+
+function fileStore() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  return {
+    name: `JSON-файл ${DB_FILE}`,
+    async load() {
+      const d = readLegacyFile();
+      if (d) db = Object.assign(db, d);
+    },
+    async save() {
+      const tmp = DB_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(db));
+      fs.renameSync(tmp, DB_FILE);
+    },
+    async close() {},
+  };
+}
+
+// В PostgreSQL пишутся только изменившиеся строки (сравнение по JSON).
+function pgStore() {
+  const { Pool } = require('pg');
+  const needSsl = process.env.PGSSL === '1' || /rlwy\.net|proxy\.rlwy/.test(DATABASE_URL);
+  const pool = new Pool({
+    connectionString: DATABASE_URL,
+    max: 5,
+    ssl: needSsl ? { rejectUnauthorized: false } : undefined,
+  });
+  pool.on('error', (e) => console.error('PG pool error:', e.message));
+  const seen = { users: new Map(), sessions: new Map(), meta: new Map() };
+
+  return {
+    name: 'PostgreSQL',
+    async load() {
+      await pool.query(`CREATE TABLE IF NOT EXISTS users (
+        id text PRIMARY KEY, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS sessions (
+        token text PRIMARY KEY, user_id text NOT NULL, ts bigint NOT NULL)`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS meta (key text PRIMARY KEY, value jsonb NOT NULL)`);
+
+      const users = await pool.query('SELECT id, data FROM users');
+      const sessions = await pool.query('SELECT token, user_id, ts FROM sessions');
+      const meta = await pool.query('SELECT key, value FROM meta');
+
+      if (!users.rows.length && !meta.rows.length) {
+        // Первый запуск: переносим старый db.json, если он есть
+        const legacy = readLegacyFile();
+        if (legacy) {
+          db = Object.assign(db, legacy);
+          console.log('Данные из db.json будут перенесены в PostgreSQL');
+          return true; // нужно сохранить
+        }
+      }
+      for (const r of users.rows) db.users[r.id] = r.data;
+      for (const r of sessions.rows) db.sessions[r.token] = { userId: r.user_id, ts: Number(r.ts) };
+      for (const r of meta.rows) {
+        if (r.key === 'boss') db.boss = r.value;
+        if (r.key === 'chat') db.chat = r.value;
+      }
+      for (const [id, u] of Object.entries(db.users)) seen.users.set(id, JSON.stringify(u));
+      for (const [t, x] of Object.entries(db.sessions)) seen.sessions.set(t, `${x.userId}|${x.ts}`);
+      seen.meta.set('boss', JSON.stringify(db.boss));
+      seen.meta.set('chat', JSON.stringify(db.chat));
+      return false;
+    },
+    async save() {
+      // всё, что нужно записать, собираем синхронно, пока игра не изменила данные
+      const uIds = [], uData = [];
+      const nowUsers = new Map();
+      for (const [id, u] of Object.entries(db.users)) {
+        const str = JSON.stringify(u);
+        nowUsers.set(id, str);
+        if (seen.users.get(id) !== str) { uIds.push(id); uData.push(str); }
+      }
+      const sTok = [], sUid = [], sTs = [];
+      const nowSessions = new Map();
+      for (const [t, x] of Object.entries(db.sessions)) {
+        nowSessions.set(t, `${x.userId}|${x.ts}`);
+        if (!seen.sessions.has(t)) { sTok.push(t); sUid.push(x.userId); sTs.push(x.ts); }
+      }
+      const sDel = [...seen.sessions.keys()].filter((t) => !db.sessions[t]);
+      const metaNow = { boss: JSON.stringify(db.boss), chat: JSON.stringify(db.chat) };
+      const metaChanged = Object.keys(metaNow).filter((k) => seen.meta.get(k) !== metaNow[k]);
+      if (!uIds.length && !sTok.length && !sDel.length && !metaChanged.length) return;
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        if (uIds.length) {
+          await client.query(
+            `INSERT INTO users (id, data)
+             SELECT t.id, t.data::jsonb FROM unnest($1::text[], $2::text[]) AS t(id, data)
+             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+            [uIds, uData]
+          );
+        }
+        if (sTok.length) {
+          await client.query(
+            `INSERT INTO sessions (token, user_id, ts)
+             SELECT * FROM unnest($1::text[], $2::text[], $3::bigint[])
+             ON CONFLICT (token) DO NOTHING`,
+            [sTok, sUid, sTs]
+          );
+        }
+        if (sDel.length) await client.query('DELETE FROM sessions WHERE token = ANY($1::text[])', [sDel]);
+        for (const k of metaChanged) {
+          await client.query(
+            `INSERT INTO meta (key, value) VALUES ($1, $2::jsonb)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+            [k, metaNow[k]]
+          );
+        }
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+      } finally {
+        client.release();
+      }
+      // запись удалась — запоминаем состояние
+      seen.users = nowUsers;
+      seen.sessions = nowSessions;
+      for (const k of metaChanged) seen.meta.set(k, metaNow[k]);
+    },
+    close: () => pool.end(),
+  };
+}
+
+const store = DATABASE_URL ? pgStore() : fileStore();
 
 let dirty = false;
+let saving = false;
 const saveSoon = () => {
   dirty = true;
 };
-function saveNow() {
-  if (!dirty) return;
+async function saveNow() {
+  if (!dirty || saving) return;
+  saving = true;
   dirty = false;
-  const tmp = DB_FILE + '.tmp';
   try {
-    fs.writeFileSync(tmp, JSON.stringify(db));
-    fs.renameSync(tmp, DB_FILE);
+    await store.save();
   } catch (e) {
     console.error('Ошибка сохранения:', e.message);
     dirty = true;
+  } finally {
+    saving = false;
   }
 }
 setInterval(saveNow, 5000).unref();
@@ -331,9 +464,18 @@ function authUser(req, url) {
   return s ? { token, user: db.users[s.userId] } : null;
 }
 
-// чистим старые сессии
-for (const [t, s] of Object.entries(db.sessions)) {
-  if (Date.now() - s.ts > 180 * 86400e3) delete db.sessions[t];
+// После загрузки данных: значения по умолчанию, индексы, чистка старых сессий
+function afterLoad() {
+  if (!db.boss) db.boss = { level: 1, hp: bossMaxHp(1), dmg: {} };
+  db.nicks = {};
+  db.recovery = {};
+  for (const u of Object.values(db.users)) {
+    if (u.nick) db.nicks[u.nick.toLowerCase()] = u.id;
+    if (u.recKey) db.recovery[u.recKey] = u.id;
+  }
+  for (const [t, x] of Object.entries(db.sessions)) {
+    if (Date.now() - x.ts > 180 * 86400e3 || !db.users[x.userId]) delete db.sessions[t];
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -582,16 +724,34 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`⛏  Pixel Miners запущен на порту ${PORT}  |  developer ${DEVELOPER}`);
-  console.log(`   Вход: гость + код восстановления, ник + пароль  |  Данные: ${DATA_DIR}`);
-});
+async function start() {
+  try {
+    const needSave = await store.load();
+    afterLoad();
+    if (needSave) dirty = true;
+    await saveNow();
+  } catch (e) {
+    console.error('Не удалось подключиться к хранилищу:', e.message);
+    process.exit(1);
+  }
+  server.listen(PORT, () => {
+    console.log(`⛏  Pixel Miners запущен на порту ${PORT}  |  developer ${DEVELOPER}`);
+    console.log(`   Вход: гость + код восстановления, ник + пароль  |  Хранилище: ${store.name}`);
+  });
+}
 
-function shutdown() {
+let stopping = false;
+async function shutdown() {
+  if (stopping) return;
+  stopping = true;
+  setTimeout(() => process.exit(1), 8000).unref();
+  while (saving) await new Promise((r) => setTimeout(r, 50));
   dirty = true;
-  saveNow();
+  await saveNow();
+  await store.close().catch(() => {});
   process.exit(0);
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 process.on('uncaughtException', (e) => console.error('uncaught:', e));
+start();
