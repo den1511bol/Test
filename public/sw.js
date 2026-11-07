@@ -1,5 +1,5 @@
-/* Охотники за Ядром service worker · Developer: @yfeeeee */
-const CACHE = 'core-hunters-v1';
+/* Lootify service worker · Developer: @yfeeeee */
+const CACHE = 'lootify-v1';
 const SHELL = ['/', '/game.js', '/manifest.webmanifest', '/img/icon.webp'];
 
 self.addEventListener('install', (e) => {

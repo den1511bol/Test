@@ -1,4 +1,4 @@
-/* Охотники за Ядром · клиент · Developer: @yfeeeee */
+/* Lootify · клиент · Developer: @yfeeeee */
 (() => {
   'use strict';
   const $ = (s) => document.querySelector(s);

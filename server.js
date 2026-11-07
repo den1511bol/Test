@@ -717,12 +717,12 @@ async function botLoop() {
           const p = pendingLogins.get(mm[1]);
           if (p && !p.token) {
             p.token = createSession(upsertTg(m.from).id);
-            await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Вход выполнен. Возвращайся в игру «Охотники за Ядром».' });
+            await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Вход выполнен. Возвращайся в игру «Lootify».' });
           } else {
             await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Ссылка устарела. Нажми «Войти» в игре ещё раз.' });
           }
         } else if (/^\/start/.test(m.text)) {
-          await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Это бот входа в игру «Охотники за Ядром». Открой игру и нажми «Войти через бота».' });
+          await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Это бот входа в игру «Lootify». Открой игру и нажми «Войти через бота».' });
         }
       }
     } catch (e) {
@@ -951,7 +951,7 @@ async function start() {
     process.exit(1);
   }
   server.listen(PORT, () => {
-    console.log(`Охотники за Ядром запущены на порту ${PORT}  |  developer ${DEVELOPER}`);
+    console.log(`Lootify запущен на порту ${PORT}  |  developer ${DEVELOPER}`);
     console.log(`Вход: Telegram (@${BOT_NAME})  |  Хранилище: ${store.name}`);
   });
   botLoop();

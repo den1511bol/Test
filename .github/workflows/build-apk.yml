@@ -88,8 +88,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "apk-${{ github.run_number }}" CoreHunters.apk \
-            --title "Охотники за Ядром APK #${{ github.run_number }}" \
-            --notes "Android-приложение Охотники за Ядром. Сервер: $SERVER_URL. Developer: @yfeeeee"
+            --title "Lootify APK #${{ github.run_number }}" \
+            --notes "Android-приложение Lootify. Сервер: $SERVER_URL. Developer: @yfeeeee"
 
       - uses: actions/upload-artifact@v4
         with:

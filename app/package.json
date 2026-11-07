@@ -1,7 +1,7 @@
 {
   "name": "core-hunters-android",
   "version": "1.0.0",
-  "description": "Android-обёртка (Capacitor) для Охотники за Ядром. Developer: @yfeeeee",
+  "description": "Android-обёртка (Capacitor) для Lootify. Developer: @yfeeeee",
   "author": "@yfeeeee",
   "private": true,
   "dependencies": {

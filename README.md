@@ -1,4 +1,4 @@
-# Охотники за Ядром
+# Lootify
 
 Мультиплеерная игра с общими боссами для всех игроков (PWA + Android-приложение).
 **Developer: [@yfeeeee](https://t.me/yfeeeee)**

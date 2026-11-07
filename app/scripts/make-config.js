@@ -7,7 +7,7 @@ if (!/^https:\/\/[^\s/]+/.test(url)) {
 }
 const config = {
   appId: 'com.yfeeeee.pixelminers',
-  appName: 'Охотники за Ядром',
+  appName: 'Lootify',
   webDir: 'www',
   backgroundColor: '#07050f',
   server: { url, cleartext: false, errorPath: 'error.html' },
