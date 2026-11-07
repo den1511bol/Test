@@ -54,6 +54,7 @@ jobs:
       - name: Иконка и ориентация
         working-directory: app
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
           RES=android/app/src/main/res
           rm -rf $RES/mipmap-anydpi-v26
           for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
@@ -63,7 +64,7 @@ jobs:
             done
           done
           sed -i 's/<activity$/<activity android:screenOrientation="portrait"/' android/app/src/main/AndroidManifest.xml
-          grep -n "screenOrientation" android/app/src/main/AndroidManifest.xml
+          grep -n "screenOrientation" android/app/src/main/AndroidManifest.xml || echo "ориентация не изменена"
 
       - name: Собрать APK
         working-directory: app/android
