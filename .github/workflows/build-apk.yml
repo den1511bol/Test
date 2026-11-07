@@ -66,6 +66,18 @@ jobs:
           sed -i 's/<activity$/<activity android:screenOrientation="portrait"/' android/app/src/main/AndroidManifest.xml
           grep -n "screenOrientation" android/app/src/main/AndroidManifest.xml || echo "ориентация не изменена"
 
+      - name: Голосовой чат (микрофон и фоновый сервис)
+        working-directory: app
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          PKG_DIR=android/app/src/main/java/com/yfeeeee/pixelminers
+          mkdir -p $PKG_DIR
+          cp native/MainActivity.java $PKG_DIR/MainActivity.java
+          cp native/VoiceService.java $PKG_DIR/VoiceService.java
+          sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />\n    <uses-feature android:name="android.hardware.microphone" android:required="false" />\n    <application#' $M
+          sed -i 's#</application>#<service android:name=".VoiceService" android:exported="false" android:foregroundServiceType="microphone" />\n    </application>#' $M
+          grep -n "RECORD_AUDIO\|VoiceService" $M
+
       - name: Номер версии приложения
         working-directory: app
         run: |
