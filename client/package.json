@@ -1,0 +1,20 @@
+{
+  "name": "ashen-crown-client",
+  "version": "1.0.0",
+  "description": "Ashen Crown — Android-клиент (Capacitor). Разработчик: @yfeeeee",
+  "author": "@yfeeeee",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare:web": "node scripts/prepare.js",
+    "android:add": "cap add android",
+    "android:sync": "node scripts/prepare.js && cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.1.2",
+    "@capacitor/core": "^6.1.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.2"
+  }
+}

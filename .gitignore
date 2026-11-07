@@ -1,0 +1,12 @@
+node_modules/
+.env
+*.log
+.DS_Store
+
+# генерируется скриптом client/scripts/prepare.js
+client/www/shared/
+
+# генерируется командой `npx cap add android` в CI
+client/android/
+client/node_modules/
+client/package-lock.json

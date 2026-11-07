@@ -1,0 +1,16 @@
+{
+  "name": "Ashen Crown — Пепельная Корона",
+  "short_name": "Ashen Crown",
+  "description": "Мобильная RPG: кампания, башня, арена и мировой босс. Разработчик: @yfeeeee",
+  "start_url": "./index.html",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#0b0d17",
+  "theme_color": "#0b0d17",
+  "lang": "ru",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
