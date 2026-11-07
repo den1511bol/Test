@@ -160,11 +160,13 @@ function pgStore() {
       for (const r of meta.rows) {
         if (r.key === 'boss') db.boss = r.value;
         if (r.key === 'chat') db.chat = r.value;
+        if (r.key === 'tgchat') db.tgChat = r.value;
       }
       for (const [id, u] of Object.entries(db.users)) seen.users.set(id, JSON.stringify(u));
       for (const [t, x] of Object.entries(db.sessions)) seen.sessions.set(t, `${x.userId}|${x.ts}`);
       seen.meta.set('boss', JSON.stringify(db.boss));
       seen.meta.set('chat', JSON.stringify(db.chat));
+      seen.meta.set('tgchat', JSON.stringify(db.tgChat ?? null));
       return false;
     },
     async save() {
@@ -183,7 +185,7 @@ function pgStore() {
         if (!seen.sessions.has(t)) { sTok.push(t); sUid.push(x.userId); sTs.push(x.ts); }
       }
       const sDel = [...seen.sessions.keys()].filter((t) => !db.sessions[t]);
-      const metaNow = { boss: JSON.stringify(db.boss), chat: JSON.stringify(db.chat) };
+      const metaNow = { boss: JSON.stringify(db.boss), chat: JSON.stringify(db.chat), tgchat: JSON.stringify(db.tgChat ?? null) };
       const metaChanged = Object.keys(metaNow).filter((k) => seen.meta.get(k) !== metaNow[k]);
       if (!uIds.length && !sTok.length && !sDel.length && !metaChanged.length) return;
 
@@ -489,12 +491,13 @@ setInterval(() => {
 }, TICK_MS).unref();
 
 /* ---- Чат ----------------------------------------------------------- */
-function pushChat(m) {
+function pushChat(m, fromTg) {
   const msg = { t: Date.now(), name: m.name || '', text: m.text, sys: !!m.sys };
   db.chat.push(msg);
   if (db.chat.length > 50) db.chat.splice(0, db.chat.length - 50);
   broadcast('chat', msg);
   saveSoon();
+  if (!fromTg && db.tgChat) tgSend(msg.sys ? '⚔ ' + msg.text : `${msg.name}: ${msg.text}`);
 }
 
 /* ---- Рейтинг -------------------------------------------------------- */
@@ -678,6 +681,38 @@ async function tgApi(method, body) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Группа Telegram, связанная с игровым чатом: /bind (только админ группы) включает пересылку в обе стороны.
+async function tgSend(text) {
+  if (!TG_TOKEN || !db.tgChat) return;
+  try { await tgApi('sendMessage', { chat_id: db.tgChat, text: String(text).slice(0, 1000) }); } catch { /* нет связи */ }
+}
+async function groupMessage(m) {
+  const cmd = m.text.match(/^\/(bind|unbind)(@\w+)?(\s|$)/i);
+  if (cmd) {
+    if (cmd[2] && cmd[2].slice(1).toLowerCase() !== BOT_NAME.toLowerCase()) return;
+    try {
+      const r = await tgApi('getChatMember', { chat_id: m.chat.id, user_id: m.from.id });
+      if (!r.ok || !['creator', 'administrator'].includes(r.result.status)) {
+        return void (await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Привязать чат может только администратор группы.' }));
+      }
+    } catch { return; }
+    if (cmd[1].toLowerCase() === 'bind') {
+      db.tgChat = m.chat.id;
+      saveSoon();
+      await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Чат привязан к игре «Охотники за Ядром». Сообщения идут в обе стороны. Отвязать: /unbind' });
+    } else {
+      db.tgChat = null;
+      saveSoon();
+      await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Чат отвязан.' });
+    }
+    return;
+  }
+  if (m.chat.id !== db.tgChat || m.from.is_bot || m.text.startsWith('/')) return;
+  const name = clean([m.from.first_name, m.from.last_name].filter(Boolean).join(' ') || m.from.username || 'TG', 20);
+  const text = clean(m.text, 120);
+  if (text) pushChat({ name: name + ' (TG)', text }, true);
+}
+
 async function botLoop() {
   if (!TG_TOKEN) {
     console.log('TELEGRAM_BOT_TOKEN не задан: вход через Telegram отключён');
@@ -693,6 +728,7 @@ async function botLoop() {
         offset = up.update_id + 1;
         const m = up.message;
         if (!m || !m.from || typeof m.text !== 'string') continue;
+        if (m.chat.type !== 'private') { await groupMessage(m); continue; }
         const mm = m.text.match(/^\/start\s+([a-f0-9]{16,64})/i);
         if (mm) {
           const p = pendingLogins.get(mm[1]);
