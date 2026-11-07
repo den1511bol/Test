@@ -308,5 +308,6 @@
     } catch { /* нет связи */ }
   }
 
+  try { const tg = window.Telegram && window.Telegram.WebApp; if (tg) { tg.ready(); tg.expand(); tg.setHeaderColor && tg.setHeaderColor('#07050f'); } } catch { /* не в Telegram */ }
   boot();
 })();

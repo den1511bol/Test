@@ -9,9 +9,9 @@ const config = {
   appId: 'com.yfeeeee.pixelminers',
   appName: 'Охотники за Ядром',
   webDir: 'www',
-  backgroundColor: '#0e0a1c',
+  backgroundColor: '#07050f',
   server: { url, cleartext: false, errorPath: 'error.html' },
-  android: { backgroundColor: '#0e0a1c' },
+  android: { backgroundColor: '#07050f' },
 };
 fs.writeFileSync('capacitor.config.json', JSON.stringify(config, null, 2));
 console.log('capacitor.config.json создан, сервер:', url);
