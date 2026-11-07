@@ -497,7 +497,7 @@ function pushChat(m, fromTg) {
   if (db.chat.length > 50) db.chat.splice(0, db.chat.length - 50);
   broadcast('chat', msg);
   saveSoon();
-  if (!fromTg && db.tgChat) tgSend(msg.sys ? '⚔ ' + msg.text : `${msg.name}: ${msg.text}`);
+  if (!fromTg) tgSend(msg.sys ? '⚔ ' + msg.text : `${msg.name}: ${msg.text}`);
 }
 
 /* ---- Рейтинг -------------------------------------------------------- */
@@ -681,33 +681,14 @@ async function tgApi(method, body) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Группа Telegram, связанная с игровым чатом: /bind (только админ группы) включает пересылку в обе стороны.
+// Единственный чат Telegram, связанный с игровым чатом (пересылка в обе стороны).
+const TG_CHAT = Number(process.env.TELEGRAM_CHAT_ID || '3503048370');
 async function tgSend(text) {
-  if (!TG_TOKEN || !db.tgChat) return;
-  try { await tgApi('sendMessage', { chat_id: db.tgChat, text: String(text).slice(0, 1000) }); } catch { /* нет связи */ }
+  if (!TG_TOKEN || !TG_CHAT) return;
+  try { await tgApi('sendMessage', { chat_id: TG_CHAT, text: String(text).slice(0, 1000) }); } catch { /* нет связи */ }
 }
-async function groupMessage(m) {
-  const cmd = m.text.match(/^\/(bind|unbind)(@\w+)?(\s|$)/i);
-  if (cmd) {
-    if (cmd[2] && cmd[2].slice(1).toLowerCase() !== BOT_NAME.toLowerCase()) return;
-    try {
-      const r = await tgApi('getChatMember', { chat_id: m.chat.id, user_id: m.from.id });
-      if (!r.ok || !['creator', 'administrator'].includes(r.result.status)) {
-        return void (await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Привязать чат может только администратор группы.' }));
-      }
-    } catch { return; }
-    if (cmd[1].toLowerCase() === 'bind') {
-      db.tgChat = m.chat.id;
-      saveSoon();
-      await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Чат привязан к игре «Охотники за Ядром». Сообщения идут в обе стороны. Отвязать: /unbind' });
-    } else {
-      db.tgChat = null;
-      saveSoon();
-      await tgApi('sendMessage', { chat_id: m.chat.id, text: 'Чат отвязан.' });
-    }
-    return;
-  }
-  if (m.chat.id !== db.tgChat || m.from.is_bot || m.text.startsWith('/')) return;
+function fromTelegramChat(m) {
+  if (m.from.is_bot || m.text.startsWith('/')) return;
   const name = clean([m.from.first_name, m.from.last_name].filter(Boolean).join(' ') || m.from.username || 'TG', 20);
   const text = clean(m.text, 120);
   if (text) pushChat({ name: name + ' (TG)', text }, true);
@@ -728,7 +709,8 @@ async function botLoop() {
         offset = up.update_id + 1;
         const m = up.message;
         if (!m || !m.from || typeof m.text !== 'string') continue;
-        if (m.chat.type !== 'private') { await groupMessage(m); continue; }
+        if (m.chat.id === TG_CHAT && !m.text.startsWith('/')) { fromTelegramChat(m); continue; }
+        if (m.chat.type !== 'private') continue;
         const mm = m.text.match(/^\/start\s+([a-f0-9]{16,64})/i);
         if (mm) {
           const p = pendingLogins.get(mm[1]);
