@@ -1,0 +1,12 @@
+{
+  "name": "pixel-miners-android",
+  "version": "1.0.0",
+  "description": "Android-обёртка (Capacitor) для Pixel Miners. Developer: @yfeeeee",
+  "author": "@yfeeeee",
+  "private": true,
+  "dependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/cli": "^6.2.0",
+    "@capacitor/core": "^6.2.0"
+  }
+}

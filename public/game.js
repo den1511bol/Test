@@ -533,6 +533,8 @@
     $('#install-btn').classList.add('hidden');
   });
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // Внутри Android-приложения подсказки про установку не нужны
+  if (window.Capacitor) $('#ios-hint').classList.add('hidden');
 
   boot();
 })();
