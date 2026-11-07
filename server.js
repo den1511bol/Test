@@ -682,7 +682,8 @@ async function tgApi(method, body) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Единственный чат Telegram, связанный с игровым чатом (пересылка в обе стороны).
-const TG_CHAT = Number(process.env.TELEGRAM_CHAT_ID || '3503048370');
+// Номер из ссылки tg://chat?id=3503048370 — внутренний; для Bot API у супергруппы он с префиксом -100.
+const TG_CHAT = Number(process.env.TELEGRAM_CHAT_ID || '-1003503048370');
 async function tgSend(text) {
   if (!TG_TOKEN || !TG_CHAT) return;
   try { await tgApi('sendMessage', { chat_id: TG_CHAT, text: String(text).slice(0, 1000) }); } catch { /* нет связи */ }
