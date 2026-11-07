@@ -214,6 +214,7 @@
   /* ---------------- запуск ---------------- */
   async function boot() {
     try { CFG = await api('/api/config'); } catch { document.body.textContent = 'Сервер недоступен'; return; }
+    checkApkUpdate();
     tok = localStorage.getItem('pm_token');
     if (tok) {
       try { setState(await api('/api/me')); startGame(); return; }
@@ -241,6 +242,8 @@
     document.addEventListener('visibilitychange', async () => {
       if (document.visibilityState === 'visible') {
         try { await flush(); setState(await api('/api/me')); } catch { /* ок */ }
+        // сервер обновился — перезагружаем игру, чтобы получить новую версию
+        try { const c = await api('/api/config'); if (c.build !== CFG.build) location.reload(); } catch { /* ок */ }
       } else flush();
     });
   }
@@ -535,6 +538,30 @@
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   // Внутри Android-приложения подсказки про установку не нужны
   if (window.Capacitor) $('#ios-hint').classList.add('hidden');
+
+  /* ---------------- обновление приложения (APK) ---------------- */
+  async function appBuild() {
+    try { return Number((await window.Capacitor.Plugins.App.getInfo()).build) || 0; } catch { return 0; }
+  }
+  async function checkApkUpdate() {
+    if (!window.Capacitor) return; // в браузере обновляется само
+    try {
+      const r = await fetch('/apk.json', { cache: 'no-store' });
+      if (!r.ok) return;
+      const latest = await r.json();
+      if (latest.versionCode <= (await appBuild())) return;
+      if (sessionStorage.getItem('pm_upd_skip') === String(latest.versionCode)) return;
+      $('#update-text').textContent = `Вышла новая версия приложения (${latest.versionName || latest.versionCode}). Скачай и установи её поверх старой, прогресс сохранится.`;
+      $('#update-modal').classList.remove('hidden');
+      $('#update-ok').onclick = () => {
+        try { window.Capacitor.Plugins.Browser.open({ url: latest.url }); } catch { location.href = latest.url; }
+      };
+      $('#update-later').onclick = () => {
+        sessionStorage.setItem('pm_upd_skip', String(latest.versionCode));
+        $('#update-modal').classList.add('hidden');
+      };
+    } catch { /* нет связи — не мешаем игре */ }
+  }
 
   boot();
 })();

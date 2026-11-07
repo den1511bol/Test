@@ -12,6 +12,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const DEVELOPER = '@yfeeeee';
+const BUILD = Date.now().toString(36); // меняется при каждом запуске сервера (новая версия игры)
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR =
   process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
@@ -541,7 +542,7 @@ function serveStatic(req, res, pathname) {
     const ext = path.extname(file);
     res.writeHead(200, {
       'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Cache-Control': p === '/sw.js' || ext === '.html' ? 'no-cache' : 'public, max-age=300',
+      'Cache-Control': p === '/sw.js' || p === '/apk.json' || ext === '.html' ? 'no-cache' : 'public, max-age=300',
       'X-Content-Type-Options': 'nosniff',
     });
     res.end(data);
@@ -553,7 +554,7 @@ async function handleApi(req, res, url) {
 
   if (route === 'GET /api/config') {
     return json(res, 200, {
-      miners: MINERS, growth: GROWTH, tapBase: TAP_BASE, tapGrowth: TAP_GROWTH,
+      build: BUILD, miners: MINERS, growth: GROWTH, tapBase: TAP_BASE, tapGrowth: TAP_GROWTH,
       rebirthMin: REBIRTH_MIN, crystalBonus: CRYSTAL_BONUS, developer: DEVELOPER,
     });
   }

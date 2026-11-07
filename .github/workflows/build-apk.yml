@@ -66,6 +66,12 @@ jobs:
           sed -i 's/<activity$/<activity android:screenOrientation="portrait"/' android/app/src/main/AndroidManifest.xml
           grep -n "screenOrientation" android/app/src/main/AndroidManifest.xml || echo "ориентация не изменена"
 
+      - name: Номер версии приложения
+        working-directory: app
+        run: |
+          sed -i "s/versionCode [0-9]*/versionCode ${{ github.run_number }}/; s/versionName \"[^\"]*\"/versionName \"1.0.${{ github.run_number }}\"/" android/app/build.gradle
+          grep -n "versionCode\|versionName" android/app/build.gradle
+
       - name: Собрать APK
         working-directory: app/android
         run: |
@@ -87,3 +93,14 @@ jobs:
         with:
           name: PixelMiners-apk
           path: PixelMiners.apk
+
+      - name: Сообщить игре о новой версии (apk.json)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+          printf '{"versionCode":%s,"versionName":"1.0.%s","url":"https://github.com/${{ github.repository }}/releases/download/apk-%s/PixelMiners.apk"}\n' \
+            "${{ github.run_number }}" "${{ github.run_number }}" "${{ github.run_number }}" > public/apk.json
+          git add public/apk.json
+          git commit -m "Update apk.json to build ${{ github.run_number }}" -m "Developer: @yfeeeee"
+          git push origin HEAD:main
