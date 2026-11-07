@@ -152,30 +152,57 @@
     $('#login').classList.remove('hidden');
     $('#login-gem').src = GEM;
     $('#login-msg').textContent = msg || '';
-    const box = $('#tg-login');
-    box.innerHTML = '';
-    if (CFG.tgReady) {
-      const s = document.createElement('script');
-      s.async = true;
-      s.src = 'https://telegram.org/js/telegram-widget.js?22';
-      s.setAttribute('data-telegram-login', CFG.botUsername);
-      s.setAttribute('data-size', 'large');
-      s.setAttribute('data-radius', '0');
-      s.setAttribute('data-auth-url', '/auth/telegram');
-      box.append(s);
-    } else if (!CFG.dev) {
-      $('#login-msg').textContent = 'Вход через Telegram ещё не настроен (нужны BOT_TOKEN и BOT_USERNAME).';
-    }
-    if (CFG.dev) $('#dev-form').classList.remove('hidden');
   }
 
-  $('#dev-form').addEventListener('submit', async (e) => {
+  // Показываем код восстановления один раз, потом запускаем игру
+  function showCode(code) {
+    $('#code-val').textContent = code;
+    $('#code-modal').classList.remove('hidden');
+    $('#code-copy').onclick = async () => {
+      try { await navigator.clipboard.writeText(code); toast('Код скопирован'); }
+      catch { toast('Выдели код и скопируй вручную'); }
+    };
+    return new Promise((res) => { $('#code-ok').onclick = () => { $('#code-modal').classList.add('hidden'); res(); }; });
+  }
+
+  async function authDone(r) {
+    localStorage.setItem('pm_token', r.token);
+    if (r.code) await showCode(r.code);
+    location.reload();
+  }
+  async function authCall(path, body) {
+    $('#login-msg').textContent = '';
+    try { await authDone(await api(path, body)); }
+    catch (e) { $('#login-msg').textContent = e.message; }
+  }
+  const creds = () => ({ nick: $('#auth-nick').value.trim(), password: $('#auth-pass').value });
+  $('#guest-btn').addEventListener('click', () => authCall('/api/guest', {}));
+  $('#auth-form').addEventListener('submit', (e) => { e.preventDefault(); authCall('/api/login', creds()); });
+  $('#reg-btn').addEventListener('click', () => authCall('/api/register', creds()));
+  $('#rec-toggle').addEventListener('click', () => $('#rec-form').classList.toggle('hidden'));
+  $('#rec-form').addEventListener('submit', (e) => { e.preventDefault(); authCall('/api/recover', { code: $('#rec-code').value }); });
+
+  /* ---------------- аккаунт (профиль) ---------------- */
+  function renderAccount() {
+    $('#acc-text').textContent = S.hasLogin
+      ? `Ты вошёл как «${S.nick}». Здесь можно сменить ник и пароль.`
+      : 'Ты играешь как гость. Привяжи ник и пароль, чтобы входить с любого телефона.';
+    $('#bind-old').classList.toggle('hidden', !S.hasLogin);
+    $('#bind-nick').value = S.hasLogin ? S.nick : '';
+    $('#bind-btn').textContent = S.hasLogin ? 'Сменить ник / пароль' : 'Привязать ник и пароль';
+  }
+  $('#bind-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     try {
-      const r = await api('/api/dev-login', { name: $('#dev-name').value });
-      localStorage.setItem('pm_token', r.token);
-      location.reload();
-    } catch (err) { $('#login-msg').textContent = err.message; }
+      setState(await api('/api/bind', { nick: $('#bind-nick').value, password: $('#bind-pass').value, old: $('#bind-old').value }));
+      $('#bind-pass').value = ''; $('#bind-old').value = '';
+      $('#uname').textContent = S.name;
+      renderAccount(); toast('Аккаунт сохранён');
+    } catch (err) { toast(err.message, 3500); }
+  });
+  $('#newcode-btn').addEventListener('click', async () => {
+    if (!confirm('Выдать новый код? Старый перестанет работать.')) return;
+    try { await showCode((await api('/api/newcode', {})).code); } catch (err) { toast(err.message); }
   });
 
   async function logout() {
@@ -187,10 +214,6 @@
   /* ---------------- запуск ---------------- */
   async function boot() {
     try { CFG = await api('/api/config'); } catch { document.body.textContent = 'Сервер недоступен'; return; }
-    const h = new URLSearchParams(location.hash.slice(1));
-    if (h.get('login')) localStorage.setItem('pm_token', h.get('login'));
-    const authErr = h.get('err');
-    if (location.hash) history.replaceState(null, '', location.pathname);
     tok = localStorage.getItem('pm_token');
     if (tok) {
       try { setState(await api('/api/me')); startGame(); return; }
@@ -199,7 +222,7 @@
         localStorage.removeItem('pm_token'); tok = null;
       }
     }
-    showLogin(authErr ? 'Не удалось подтвердить вход через Telegram' : '');
+    showLogin('');
   }
 
   function startGame() {
@@ -208,14 +231,7 @@
     $('#coin-ico').src = GEM;
     $('#gem-img').src = GEM;
     $('#uname').textContent = S.name;
-    const av = $('#avatar');
-    if (S.photo) {
-      const im = document.createElement('img');
-      im.referrerPolicy = 'no-referrer';
-      im.src = S.photo;
-      im.onerror = () => { av.textContent = S.name[0] || '?'; };
-      av.append(im);
-    } else av.textContent = (S.name[0] || '?').toUpperCase();
+    $('#avatar').textContent = (S.name[0] || '?').toUpperCase();
     buildShop();
     connect();
     renderAll();
@@ -486,7 +502,7 @@
     $$('.tabs button').forEach((b) => b.classList.toggle('on', b.dataset.view === view));
     if (view === 'chat') { unread = 0; renderUnread(); renderChat(true); }
     if (view === 'top') { renderLb(); api('/api/leaderboard').then((d) => { lb = d; renderLb(); }).catch(() => {}); }
-    if (view === 'me') renderStats();
+    if (view === 'me') { renderStats(); renderAccount(); }
     if (view === 'shop') refreshShop();
     $('main').scrollTop = 0;
   }

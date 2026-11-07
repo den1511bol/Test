@@ -13,9 +13,6 @@ const crypto = require('node:crypto');
 
 const DEVELOPER = '@yfeeeee';
 const PORT = Number(process.env.PORT) || 3000;
-const BOT_TOKEN = process.env.BOT_TOKEN || '';
-const BOT_USERNAME = (process.env.BOT_USERNAME || '').replace(/^@/, '');
-const DEV_MODE = process.env.DEV_MODE === '1';
 const DATA_DIR =
   process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -50,7 +47,7 @@ const bossName = (level) => `${BOSS_NAMES[(level - 1) % BOSS_NAMES.length]} Ур
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 
-let db = { users: {}, sessions: {}, boss: null, chat: [] };
+let db = { users: {}, sessions: {}, nicks: {}, recovery: {}, boss: null, chat: [] };
 try {
   db = Object.assign(db, JSON.parse(fs.readFileSync(DB_FILE, 'utf8')));
 } catch (e) {
@@ -114,6 +111,7 @@ function view(u) {
     bossHits: u.bossHits, bossKills: u.bossKills,
     tapPower: tapPower(u), dps: dpsOf(u), mult: mult(u),
     rebirthGain: rebirthGain(u), reward: u.reward, now: Date.now(),
+    hasLogin: !!u.nick, nick: u.nick || '',
   };
 }
 
@@ -257,19 +255,19 @@ setInterval(() => {
 /* ------------------------------------------------------------------ */
 /*  Авторизация                                                        */
 /* ------------------------------------------------------------------ */
-function verifyTelegram(q) {
-  if (!BOT_TOKEN || !q.hash || !q.id || !q.auth_date) return false;
-  const check = Object.keys(q)
-    .filter((k) => k !== 'hash')
-    .sort()
-    .map((k) => `${k}=${q[k]}`)
-    .join('\n');
-  const secret = crypto.createHash('sha256').update(BOT_TOKEN).digest();
-  const hmac = crypto.createHmac('sha256', secret).update(check).digest('hex');
-  const a = Buffer.from(hmac);
-  const b = Buffer.from(String(q.hash));
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
-  return Date.now() / 1000 - Number(q.auth_date) < 86400;
+const NICK_RE = /^[\p{L}\p{N}_]{3,16}$/u;
+const sha = (x) => crypto.createHash('sha256').update(x).digest('hex');
+
+function hashSecret(secret) {
+  const salt = crypto.randomBytes(16);
+  return salt.toString('hex') + ':' + crypto.scryptSync(secret, salt, 32).toString('hex');
+}
+function checkSecret(secret, stored) {
+  if (!stored) return false;
+  const [saltHex, hashHex] = stored.split(':');
+  const h = crypto.scryptSync(secret, Buffer.from(saltHex, 'hex'), 32);
+  const want = Buffer.from(hashHex, 'hex');
+  return h.length === want.length && crypto.timingSafeEqual(h, want);
 }
 
 function createSession(userId) {
@@ -279,15 +277,51 @@ function createSession(userId) {
   return token;
 }
 
-function loginUser(id, name, username, photo) {
-  let u = db.users[id];
-  if (!u) u = db.users[id] = newUser(id, name, username, photo);
-  else {
-    u.name = name;
-    u.username = username || '';
-    u.photo = photo || u.photo;
-  }
-  return createSession(id);
+// Код восстановления: 12 символов (≈60 бит), в базе хранится только sha256.
+function issueCode(u) {
+  if (u.recKey) delete db.recovery[u.recKey];
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let raw = '';
+  for (const byte of crypto.randomBytes(12)) raw += alphabet[byte % alphabet.length];
+  const code = raw.match(/.{4}/g).join('-');
+  u.recKey = sha(raw);
+  db.recovery[u.recKey] = u.id;
+  saveSoon();
+  return code;
+}
+const normCode = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+function createGuest() {
+  const id = 'g' + crypto.randomBytes(8).toString('hex');
+  const u = (db.users[id] = newUser(id, 'Гость' + (1000 + Math.floor(Math.random() * 9000)), '', ''));
+  return { token: createSession(id), code: issueCode(u) };
+}
+
+// Проверка ника и пароля; возвращает текст ошибки или null.
+function validateCreds(nick, password, selfId) {
+  if (!NICK_RE.test(nick)) return 'Ник: 3–16 символов, буквы, цифры и _';
+  if (typeof password !== 'string' || password.length < 6 || password.length > 64) return 'Пароль: от 6 до 64 символов';
+  const owner = db.nicks[nick.toLowerCase()];
+  if (owner && owner !== selfId) return 'Этот ник уже занят';
+  return null;
+}
+function setCreds(u, nick, password) {
+  if (u.nick) delete db.nicks[u.nick.toLowerCase()];
+  u.nick = nick;
+  u.name = nick;
+  u.pass = hashSecret(password);
+  db.nicks[nick.toLowerCase()] = u.id;
+  saveSoon();
+}
+
+const failLogins = new Map(); // защита от подбора пароля по нику
+function loginBlocked(key) {
+  const f = failLogins.get(key);
+  return f && f.n >= 8 && Date.now() - f.t < 15 * 60000;
+}
+function loginFailed(key) {
+  const f = failLogins.get(key);
+  failLogins.set(key, !f || Date.now() - f.t > 15 * 60000 ? { n: 1, t: Date.now() } : { n: f.n + 1, t: Date.now() });
 }
 
 function authUser(req, url) {
@@ -340,15 +374,17 @@ function readBody(req) {
   });
 }
 
-const authHits = new Map(); // простой лимит на вход по IP
-function authLimited(req) {
+const hits = new Map(); // простой лимит запросов по IP
+function limited(req, key, max, windowMs) {
   const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
+  const k = `${key}:${ip}`;
   const now = Date.now();
-  const arr = (authHits.get(ip) || []).filter((t) => now - t < 60000);
+  const arr = (hits.get(k) || []).filter((t) => now - t < windowMs);
   arr.push(now);
-  authHits.set(ip, arr);
-  return arr.length > 20;
+  hits.set(k, arr);
+  return arr.length > max;
 }
+setInterval(() => hits.clear(), 3600e3).unref();
 
 function serveStatic(req, res, pathname) {
   let p = decodeURIComponent(pathname);
@@ -375,19 +411,49 @@ async function handleApi(req, res, url) {
 
   if (route === 'GET /api/config') {
     return json(res, 200, {
-      botUsername: BOT_USERNAME, tgReady: !!(BOT_TOKEN && BOT_USERNAME), dev: DEV_MODE,
       miners: MINERS, growth: GROWTH, tapBase: TAP_BASE, tapGrowth: TAP_GROWTH,
       rebirthMin: REBIRTH_MIN, crystalBonus: CRYSTAL_BONUS, developer: DEVELOPER,
     });
   }
 
-  if (route === 'POST /api/dev-login') {
-    if (!DEV_MODE) return fail(res, 'Тестовый вход выключен', 403);
-    if (authLimited(req)) return fail(res, 'Слишком часто', 429);
+  if (route === 'POST /api/guest') {
+    if (limited(req, 'guest', 5, 3600e3)) return fail(res, 'Слишком много новых гостей с вашего адреса. Попробуйте позже', 429);
+    return json(res, 200, createGuest());
+  }
+
+  if (route === 'POST /api/register') {
+    if (limited(req, 'reg', 5, 3600e3)) return fail(res, 'Слишком много регистраций. Попробуйте позже', 429);
     const body = await readBody(req);
-    const name = clean(body.name, 24) || 'Игрок';
-    const id = 'dev_' + crypto.createHash('sha1').update(name.toLowerCase()).digest('hex').slice(0, 10);
-    return json(res, 200, { token: loginUser(id, name, '', '') });
+    const nick = String(body.nick || '').trim();
+    const err = validateCreds(nick, body.password, null);
+    if (err) return fail(res, err);
+    const id = 'u' + crypto.randomBytes(8).toString('hex');
+    const u = (db.users[id] = newUser(id, nick, '', ''));
+    setCreds(u, nick, body.password);
+    return json(res, 200, { token: createSession(id), code: issueCode(u) });
+  }
+
+  if (route === 'POST /api/login') {
+    if (limited(req, 'login', 15, 60000)) return fail(res, 'Слишком часто. Подождите минуту', 429);
+    const body = await readBody(req);
+    const nick = String(body.nick || '').trim().toLowerCase();
+    if (loginBlocked(nick)) return fail(res, 'Слишком много неверных попыток. Подождите 15 минут', 429);
+    const u = db.users[db.nicks[nick]];
+    const pass = typeof body.password === 'string' ? body.password.slice(0, 64) : '';
+    if (!u || !checkSecret(pass, u.pass)) {
+      loginFailed(nick);
+      return fail(res, 'Неверный ник или пароль', 401);
+    }
+    failLogins.delete(nick);
+    return json(res, 200, { token: createSession(u.id) });
+  }
+
+  if (route === 'POST /api/recover') {
+    if (limited(req, 'rec', 10, 60000)) return fail(res, 'Слишком часто. Подождите минуту', 429);
+    const body = await readBody(req);
+    const id = db.recovery[sha(normCode(body.code))];
+    if (!id || !db.users[id]) return fail(res, 'Неверный код восстановления', 401);
+    return json(res, 200, { token: createSession(id) });
   }
 
   const auth = authUser(req, url);
@@ -459,6 +525,21 @@ async function handleApi(req, res, url) {
     case 'GET /api/leaderboard':
       return json(res, 200, leaderboard(u.id));
 
+    case 'POST /api/bind': {
+      const body = await readBody(req);
+      const nick = String(body.nick || '').trim();
+      if (u.nick) {
+        if (!checkSecret(String(body.old || '').slice(0, 64), u.pass)) return fail(res, 'Старый пароль неверный', 403);
+      }
+      const err = validateCreds(nick, body.password, u.id);
+      if (err) return fail(res, err);
+      setCreds(u, nick, body.password);
+      return json(res, 200, view(u));
+    }
+
+    case 'POST /api/newcode':
+      return json(res, 200, { code: issueCode(u) });
+
     case 'POST /api/logout':
       delete db.sessions[auth.token];
       saveSoon();
@@ -492,20 +573,6 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname === '/health') return json(res, 200, { ok: true, dev: DEVELOPER });
 
-    // Callback Telegram Login Widget (режим redirect)
-    if (req.method === 'GET' && url.pathname === '/auth/telegram') {
-      if (authLimited(req)) return fail(res, 'Слишком часто', 429);
-      const q = Object.fromEntries(url.searchParams);
-      if (!verifyTelegram(q)) {
-        res.writeHead(302, { Location: '/#err=auth' });
-        return res.end();
-      }
-      const name = clean([q.first_name, q.last_name].filter(Boolean).join(' '), 24) || q.username || 'Игрок';
-      const token = loginUser(String(q.id), name, clean(q.username, 32), clean(q.photo_url, 300));
-      res.writeHead(302, { Location: `/#login=${token}` });
-      return res.end();
-    }
-
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 'Метод не поддерживается', 405);
     return serveStatic(req, res, url.pathname);
@@ -517,8 +584,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`⛏  Pixel Miners запущен на порту ${PORT}  |  developer ${DEVELOPER}`);
-  console.log(`   Telegram-вход: ${BOT_TOKEN && BOT_USERNAME ? 'включён' : 'НЕ настроен (BOT_TOKEN / BOT_USERNAME)'}`);
-  console.log(`   Тестовый вход: ${DEV_MODE ? 'включён (DEV_MODE=1)' : 'выключен'}  |  Данные: ${DATA_DIR}`);
+  console.log(`   Вход: гость + код восстановления, ник + пароль  |  Данные: ${DATA_DIR}`);
 });
 
 function shutdown() {

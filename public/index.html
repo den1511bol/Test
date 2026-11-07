@@ -24,11 +24,23 @@
     <h1 class="logo">PIXEL<br>MINERS</h1>
     <img id="login-gem" class="px" width="128" height="128" alt="">
     <p class="sub">Копай золото, нанимай шахтёров и бей боссов всем миром</p>
-    <div id="tg-login"></div>
-    <form id="dev-form" class="hidden">
-      <input id="dev-name" maxlength="24" placeholder="Тестовый ник" autocomplete="off">
-      <button class="btn" type="submit">Войти (тест)</button>
-    </form>
+    <div class="auth">
+      <button id="guest-btn" class="btn full" type="button">Играть как гость</button>
+      <div class="or">или войди в аккаунт</div>
+      <form id="auth-form">
+        <input id="auth-nick" maxlength="16" placeholder="Ник" autocomplete="username" autocapitalize="off">
+        <input id="auth-pass" type="password" maxlength="64" placeholder="Пароль (от 6 символов)" autocomplete="current-password">
+        <div class="two">
+          <button class="btn" id="login-btn" type="submit">Войти</button>
+          <button class="btn alt" id="reg-btn" type="button">Создать</button>
+        </div>
+      </form>
+      <button id="rec-toggle" class="link" type="button">Есть код восстановления?</button>
+      <form id="rec-form" class="hidden">
+        <input id="rec-code" maxlength="20" placeholder="XXXX-XXXX-XXXX" autocapitalize="characters" autocomplete="off">
+        <button class="btn" type="submit">Войти по коду</button>
+      </form>
+    </div>
     <p id="login-msg" class="msg"></p>
     <footer class="credit">Developer: <a href="https://t.me/yfeeeee" target="_blank" rel="noopener">@yfeeeee</a></footer>
   </section>
@@ -115,6 +127,17 @@
           <div class="title">Достижения</div>
           <div id="ach" class="ach"></div>
         </div>
+        <div class="panel" id="account">
+          <div class="title">Аккаунт</div>
+          <p class="dim" id="acc-text"></p>
+          <form id="bind-form">
+            <input id="bind-nick" maxlength="16" placeholder="Ник" autocomplete="username" autocapitalize="off">
+            <input id="bind-old" type="password" maxlength="64" placeholder="Старый пароль" class="hidden" autocomplete="current-password">
+            <input id="bind-pass" type="password" maxlength="64" placeholder="Новый пароль (от 6 символов)" autocomplete="new-password">
+            <button class="btn full" id="bind-btn" type="submit">Сохранить</button>
+          </form>
+          <button class="btn full alt" id="newcode-btn" type="button">Новый код восстановления</button>
+        </div>
         <div class="panel">
           <button class="btn full hidden" id="install-btn">Установить приложение</button>
           <p class="dim center" id="ios-hint">На iPhone: «Поделиться» → «На экран Домой».<br>На Android: меню браузера → «Установить приложение».</p>
@@ -132,6 +155,16 @@
       <button data-view="chat">Чат<b id="unread" class="badge hidden">0</b></button>
       <button data-view="me">Я</button>
     </nav>
+  </div>
+
+  <div id="code-modal" class="modal hidden">
+    <div class="panel">
+      <div class="title">Твой код восстановления</div>
+      <div id="code-val" class="code-val"></div>
+      <p class="dim">Сохрани его в заметках. Он показывается только сейчас. С ним можно вернуться в аккаунт на любом телефоне, даже если забыл пароль.</p>
+      <button class="btn full" id="code-copy" type="button">Скопировать</button>
+      <button class="btn full alt" id="code-ok" type="button">Я сохранил, играть</button>
+    </div>
   </div>
 
   <div id="toast"></div>

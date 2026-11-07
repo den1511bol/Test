@@ -1,5 +1,5 @@
 /* Pixel Miners service worker · Developer: @yfeeeee */
-const CACHE = 'pixel-miners-v1';
+const CACHE = 'pixel-miners-v2';
 const SHELL = ['/', '/style.css', '/game.js', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {

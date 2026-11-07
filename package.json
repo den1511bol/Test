@@ -8,7 +8,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "DEV_MODE=1 node server.js"
+    "dev": "node server.js"
   },
   "engines": {
     "node": ">=20"
