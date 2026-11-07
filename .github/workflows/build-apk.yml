@@ -76,12 +76,18 @@ jobs:
         working-directory: app/android
         run: |
           chmod +x gradlew
-          # Постоянный ключ подписи: новые сборки ставятся поверх старых без удаления приложения
-          mkdir -p ~/.android && cp ../debug.keystore ~/.android/debug.keystore
-          ./gradlew assembleDebug --no-daemon
+          # Релизная сборка с постоянным ключом подписи (не отладочная): Play Protect относится к ней мягче,
+          # а новые версии ставятся поверх старых
+          ./gradlew assembleRelease --no-daemon
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          cd app/build/outputs/apk/release
+          $BT/zipalign -p 4 app-release-unsigned.apk aligned.apk
+          $BT/apksigner sign --ks $GITHUB_WORKSPACE/app/release.keystore --ks-pass pass:lootify-yfeeeee --key-pass pass:lootify-yfeeeee \
+            --ks-key-alias lootify --out app-release.apk aligned.apk
+          $BT/apksigner verify --print-certs app-release.apk | head -3
 
       - name: Подготовить файл
-        run: cp app/android/app/build/outputs/apk/debug/app-debug.apk CoreHunters.apk
+        run: cp app/android/app/build/outputs/apk/release/app-release.apk CoreHunters.apk
 
       - name: Опубликовать релиз с APK
         env:
