@@ -103,6 +103,8 @@ def main():
     raw = sys.argv[1]
     done = missing = 0
     for rel, size, kind, _ in M.entries():
+        if kind == "ui":
+            continue                           # UI делает tools/process_ui.py
         src = find_source(raw, rel)
         dst = os.path.normpath(os.path.join(ROOT, "assets", rel))
         if not src:

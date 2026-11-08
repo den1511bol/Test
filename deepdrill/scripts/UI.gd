@@ -16,12 +16,22 @@ const C_BAD := Color("ff7060")
 static func style(kind: String) -> StyleBox:
 	var path := "res://assets/ui/%s.png" % kind
 	if Assets.has_art(path):
+		var m: Array = _margins().get(kind, [28, 28])
 		var sb := StyleBoxTexture.new()
 		sb.texture = Assets.get_tex(path)
-		sb.texture_margin_left = 28
-		sb.texture_margin_right = 28
-		sb.texture_margin_top = 28
-		sb.texture_margin_bottom = 28
+		sb.texture_margin_left = m[0]
+		sb.texture_margin_right = m[0]
+		sb.texture_margin_top = m[1]
+		sb.texture_margin_bottom = m[1]
+		sb.content_margin_left = m[0] * 0.7 + 4
+		sb.content_margin_right = m[0] * 0.7 + 4
+		sb.content_margin_top = m[1] * 0.6 + 2
+		sb.content_margin_bottom = m[1] * 0.6 + 2
+		if kind == "bar_bg":
+			sb.content_margin_left = 6
+			sb.content_margin_right = 6
+			sb.content_margin_top = 5
+			sb.content_margin_bottom = 5
 		return sb
 	var f := StyleBoxFlat.new()
 	f.set_corner_radius_all(14)
@@ -78,6 +88,17 @@ static func style(kind: String) -> StyleBox:
 		_:
 			f.bg_color = C_PANEL
 	return f
+
+
+static var _m_cache := {}
+
+
+static func _margins() -> Dictionary:
+	if _m_cache.is_empty() and FileAccess.file_exists("res://assets/ui/margins.json"):
+		var d = JSON.parse_string(FileAccess.get_file_as_string("res://assets/ui/margins.json"))
+		if d is Dictionary:
+			_m_cache = d
+	return _m_cache
 
 
 static func lbl(text: String, size: int = 24, color: Color = C_TEXT, align: int = HORIZONTAL_ALIGNMENT_LEFT, outline: bool = false) -> Label:
