@@ -69,6 +69,8 @@ func _ready() -> void:
 		Game.offline_report = {}
 	if "--shots" in OS.get_cmdline_user_args():
 		_run_shots()
+	if "--scrolltest" in OS.get_cmdline_user_args():
+		_scroll_test()
 
 
 func _build_header() -> void:
@@ -209,4 +211,57 @@ func _run_shots() -> void:
 		if i == 0:
 			await get_tree().create_timer(2.5).timeout
 		get_viewport().get_texture().get_image().save_png("%s/tab%d.png" % [out, i])
+	get_tree().quit()
+
+
+func _scroll_test() -> void:
+	Game.s = Game.new_state()
+	Game.monster = {}
+	Game.running = false
+	for r in Data.RES:
+		Game.s.res[r] = 9999
+	Game.changed.emit()
+	_select(1)
+	for f in 10:
+		await get_tree().process_frame
+	var sc: ScrollContainer = pages[1].get_child(0)
+	var p := Vector2(560, 700)   # над кнопкой «Купить» второго шнека
+	var ev := InputEventMouseButton.new()
+	ev.button_index = MOUSE_BUTTON_LEFT
+	ev.pressed = true
+	ev.position = p
+	Input.parse_input_event(ev)
+	await get_tree().process_frame
+	for i in 20:
+		var m := InputEventMouseMotion.new()
+		p.y -= 20
+		m.position = p
+		m.relative = Vector2(0, -20)
+		m.button_mask = MOUSE_BUTTON_MASK_LEFT
+		Input.parse_input_event(m)
+		await get_tree().process_frame
+	var up := InputEventMouseButton.new()
+	up.button_index = MOUSE_BUTTON_LEFT
+	up.pressed = false
+	up.position = p
+	Input.parse_input_event(up)
+	for f in 10:
+		await get_tree().process_frame
+	print("SCROLL=", sc.scroll_vertical, " OWNED=", Game.s.owned.size())
+	# обычный тап по кнопке должен покупать
+	sc.scroll_vertical = 0
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var btn: Button = pages[1]._cards[1].btn
+	var tap := btn.get_global_rect().get_center()
+	print("BTN ", btn.text, " ", btn.disabled, " ", tap)
+	var b: int = Game.s.owned.size()
+	for pr in [true, false]:
+		var e := InputEventMouseButton.new()
+		e.button_index = MOUSE_BUTTON_LEFT
+		e.pressed = pr
+		e.position = tap
+		Input.parse_input_event(e)
+		await get_tree().process_frame
+	print("TAP_BOUGHT=", Game.s.owned.size() - b)
 	get_tree().quit()

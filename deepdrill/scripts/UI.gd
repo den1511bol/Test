@@ -179,7 +179,7 @@ static func heading(text: String, color: Color = C_ACCENT) -> Label:
 
 static func scroll_page() -> Array:
 	## возвращает [ScrollContainer, VBoxContainer]
-	var sc := ScrollContainer.new()
+	var sc: ScrollContainer = load("res://scripts/DragScroll.gd").new()
 	sc.set_anchors_preset(Control.PRESET_FULL_RECT)
 	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	var m := MarginContainer.new()
