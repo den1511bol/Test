@@ -46,7 +46,7 @@ text, letters, watermark, signature, logo, frame, border, UI, blurry, low resolu
 
 ## Бур
 
-### `assets/drill/body.png` — 760x540
+### `assets/drill/body.png` — 720x800
 ```
 hand-painted 2D game art, dark-fantasy mining theme, rich painterly textures, crisp readable silhouette, dramatic rim lighting, warm amber highlights against cool cave tones, highly detailed, polished mobile game asset, consistent art style across the whole set, a heavy steampunk mining drill machine seen from the front, sturdy riveted brass and steel body with a small glass cockpit, glowing amber engine core, pistons and gears, a round empty socket at the very bottom center where a drill auger attaches, pointing downward, rugged and powerful, isolated on a flat solid pure magenta #FF00FF background, no ground, no cast shadow, centered with small margin, whole object fully visible
 ```

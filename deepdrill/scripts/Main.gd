@@ -194,8 +194,8 @@ func _run_shots() -> void:
 	DirAccess.make_dir_recursive_absolute(out)
 	for r in Data.RES:
 		Game.s.res[r] = 40 + randi() % 200
-	Game.s.owned = ["a00", "a01", "a02", "a03"]
-	Game.s.equipped = "a03"
+	Game.s.owned = ["a00"]
+	Game.s.equipped = "a00"
 	Game.s.depth = 140.0
 	Game.s.max_depth = 140.0
 	Game.s.gate = 1

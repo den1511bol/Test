@@ -118,7 +118,7 @@ UPGRADES = [
 # (путь относительно assets/, размер, тип)
 def entries():
     out = []
-    out.append(("drill/body.png", (760, 540), "key", f"{DRILL}, {KEY}"))
+    out.append(("drill/body.png", (720, 800), "key", f"{DRILL}, {KEY}"))
     for i, d in enumerate(AUGERS):
         out.append((f"augers/a{i:02d}.png", (360, 560), "key",
                     f"vertical drill auger bit seen from the side, the pointed tip faces DOWN, the top end has a round attachment collar, "

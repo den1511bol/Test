@@ -32,7 +32,7 @@ var _shake: Tween
 var _jit := 0.0
 var _flash: Tween
 
-const BODY_SIZE := Vector2(380, 270)
+const BODY_SIZE := Vector2(340, 380)
 const AUGER_SIZE := Vector2(180, 280)
 const MON_SIZE := 340.0
 
@@ -151,8 +151,8 @@ func _layout() -> void:
 	var h := size.y
 	for bg in [bg_a, bg_b]:
 		bg.size = Vector2(w, h)
-	body_node.position = Vector2(w * 0.5 - BODY_SIZE.x * 0.5, h * 0.15 - BODY_SIZE.y * 0.5)
-	auger_holder.position = Vector2(w * 0.5 - AUGER_SIZE.x * 0.5, h * 0.15 + BODY_SIZE.y * 0.5 - 40.0)
+	body_node.position = Vector2(w * 0.5 - BODY_SIZE.x * 0.5, h * 0.03)
+	auger_holder.position = Vector2(w * 0.5 - AUGER_SIZE.x * 0.5, h * 0.03 + BODY_SIZE.y * 0.74)
 	var tip := _tip()
 	dust.position = tip
 	sparks.position = tip
@@ -384,7 +384,7 @@ func _process(delta: float) -> void:
 	_jit += delta * 60.0
 	var amp := 3.0 if digging else (1.5 if not m.is_empty() else 0.5)
 	auger_holder.position.x = size.x * 0.5 - AUGER_SIZE.x * 0.5 + sin(_jit) * amp
-	body_node.position.y = size.y * 0.15 - BODY_SIZE.y * 0.5 + cos(_jit * 0.9) * amp * 0.6
+	body_node.position.y = size.y * 0.03 + cos(_jit * 0.9) * amp * 0.6
 	dust.emitting = digging or not m.is_empty()
 	dust.amount = 26 if digging else 10
 	if not m.is_empty() and mon_sprite and is_instance_valid(mon_sprite):
