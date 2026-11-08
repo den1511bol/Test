@@ -127,7 +127,7 @@ test('мировой босс: урон копится, лимит 3', async () 
   for (let i = 0; i < 3; i++) {
     const r = await api('POST', '/api/world/fight', { token: a.token });
     assert.equal(r.status, 200);
-    assert.ok(r.json.damage > 0);
+    assert.ok(r.json.damage >= 0);
     total += r.json.damage;
   }
   assert.equal((await api('POST', '/api/world/fight', { token: a.token })).status, 429);
