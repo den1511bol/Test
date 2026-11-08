@@ -35,10 +35,11 @@ jobs:
         run: |
           set -e
           B=https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable
-          curl -sSL -o /tmp/godot.zip $B/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip
+          curl -fL --retry 5 --retry-delay 5 -o /tmp/godot.zip $B/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip
+          file /tmp/godot.zip; ls -la /tmp/godot.zip
           unzip -q /tmp/godot.zip -d /tmp/godot
           sudo mv /tmp/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64 /usr/local/bin/godot
-          curl -sSL -o /tmp/tpl.tpz $B/Godot_v${GODOT_VERSION}-stable_export_templates.tpz
+          curl -fL --retry 5 --retry-delay 5 -o /tmp/tpl.tpz $B/Godot_v${GODOT_VERSION}-stable_export_templates.tpz
           T=$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable
           mkdir -p $T /tmp/tpl
           unzip -q -j /tmp/tpl.tpz "templates/android_*" "templates/version.txt" -d $T
