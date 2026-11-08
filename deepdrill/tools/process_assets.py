@@ -38,6 +38,32 @@ def chroma_key(im):
     return Image.fromarray(out, "RGBA")
 
 
+def drop_edge_junk(im):
+    """Убирает мелкие обрезки других картинок у краёв (генераторы иногда их оставляют)."""
+    try:
+        from scipy import ndimage
+    except ImportError:
+        return im
+    a = np.asarray(im).copy()
+    mask = a[..., 3] > 30
+    lab, n = ndimage.label(mask)
+    if n < 2:
+        return im
+    sizes = ndimage.sum(mask, lab, range(1, n + 1))
+    big = sizes.max()
+    h, w = mask.shape
+    bw, bh = int(w * 0.12), int(h * 0.12)
+    band = np.zeros_like(mask)
+    band[:bh] = band[-bh:] = True
+    band[:, :bw] = band[:, -bw:] = True
+    edge = set(np.unique(lab[band & mask])) - {0}
+    for k in edge:
+        inside = (lab == k)
+        if sizes[k - 1] < big * 0.1 and (inside & band).sum() > 0.5 * sizes[k - 1]:
+            a[lab == k, 3] = 0
+    return Image.fromarray(a, "RGBA")
+
+
 def fit_contain(im, size, margin=0.05):
     bbox = im.getchannel("A").point(lambda v: 255 if v > 12 else 0).getbbox()
     if bbox:
@@ -84,9 +110,9 @@ def main():
             continue
         im = Image.open(src)
         if kind == "key":
-            out = fit_contain(chroma_key(im), size)
+            out = fit_contain(drop_edge_junk(chroma_key(im)), size)
         elif kind == "bg":
-            out = make_seamless_v(fit_cover(im.convert("RGB"), size))
+            out = fit_cover(im.convert("RGB"), size)   # стык делает игра зеркалом
         else:                                  # ui, icon
             out = fit_cover(im.convert("RGBA" if kind == "ui" else "RGB"), size)
         os.makedirs(os.path.dirname(dst), exist_ok=True)

@@ -46,6 +46,7 @@ func _ready() -> void:
 
 	bg_a = _make_bg()
 	bg_b = _make_bg()
+	bg_b.flip_v = true   # зеркальный стык — шов не виден
 
 	# затемнение сверху/снизу для глубины
 	var g := Gradient.new()
@@ -377,9 +378,15 @@ func _process(delta: float) -> void:
 	elif m.is_empty() and not Game.s.settings.auto:
 		_scroll += 40.0 * delta
 	var h := maxf(size.y, 1.0)
-	var off := fmod(_scroll, h)
-	bg_a.position.y = -off
-	bg_b.position.y = h - off
+	var off := fmod(_scroll, 2.0 * h)
+	var ya := -off
+	if ya <= -h:
+		ya += 2.0 * h
+	var yb := h - off
+	if yb <= -h:
+		yb += 2.0 * h
+	bg_a.position.y = ya
+	bg_b.position.y = yb
 	# дрожь шнека
 	_jit += delta * 60.0
 	var amp := 3.0 if digging else (1.5 if not m.is_empty() else 0.5)
