@@ -1,0 +1,108 @@
+name: Build Deep Drill APK (Godot 4)
+# Разработчик: @yfeeeee
+
+on:
+  push:
+    paths: ["deepdrill/**", ".github/workflows/build-deepdrill.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.3"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deepdrill
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Server tests
+        working-directory: deepdrill/server
+        run: |
+          npm install --no-audit --no-fund
+          npm test
+
+      - name: Install Godot ${{ env.GODOT_VERSION }} and Android export templates
+        run: |
+          set -e
+          B=https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable
+          curl -sSL -o /tmp/godot.zip $B/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip
+          unzip -q /tmp/godot.zip -d /tmp/godot
+          sudo mv /tmp/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64 /usr/local/bin/godot
+          curl -sSL -o /tmp/tpl.tpz $B/Godot_v${GODOT_VERSION}-stable_export_templates.tpz
+          T=$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          mkdir -p $T /tmp/tpl
+          unzip -q -j /tmp/tpl.tpz "templates/android_*" "templates/version.txt" -d $T
+          ls -la $T
+          godot --version
+
+      - name: Android SDK
+        run: |
+          set -e
+          SDK=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}
+          yes | $SDK/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          $SDK/cmdline-tools/latest/bin/sdkmanager "platform-tools" "build-tools;34.0.0" "platforms;android-34" "cmdline-tools;latest"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+      - name: Debug keystore + editor settings
+        run: |
+          set -e
+          keytool -genkeypair -v -keystore $HOME/debug.keystore -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p $HOME/.config/godot
+          for f in editor_settings-4.tres editor_settings-4.3.tres; do
+            cat > $HOME/.config/godot/$f <<EOS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$SDK"
+          export/android/java_sdk_path = "${JAVA_HOME_17_X64:-$JAVA_HOME}"
+          export/android/debug_keystore = "$HOME/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          export/android/force_system_user = false
+          EOS
+          done
+          sed -i 's/^          //' $HOME/.config/godot/editor_settings-4*.tres
+
+      - name: Configure server URL and version
+        env:
+          API_URL: ${{ vars.DRILL_API_URL }}
+        run: |
+          echo "{ \"api_url\": \"${API_URL}\" }" > config.json
+          sed -i "s/^version\/code=.*/version\/code=${{ github.run_number }}/" export_presets.cfg
+          cat config.json
+
+      - name: Import resources
+        run: godot --headless --import || true
+
+      - name: Export APK
+        run: |
+          mkdir -p build
+          godot --headless --export-debug "Android" build/DeepDrill.apk
+          ls -la build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeepDrill-apk
+          path: deepdrill/build/DeepDrill.apk
+
+      - name: Publish release "deepdrill-latest"
+        if: github.ref == 'refs/heads/main'
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete deepdrill-latest --yes --cleanup-tag || true
+          gh release create deepdrill-latest deepdrill/build/DeepDrill.apk \
+            --title "Бурильщик: Глубь (сборка ${{ github.run_number }})" \
+            --notes "Автосборка Godot 4. Разработчик: @yfeeeee" --latest=false

@@ -1,0 +1,12 @@
+{
+  "name": "deepdrill-server",
+  "version": "1.0.0",
+  "description": "Облачные сохранения и рейтинг для «Бурильщик: Глубь». Разработчик: @yfeeeee",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": { "start": "node index.js", "test": "node --test --test-force-exit test.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "pg": "^8.11.0" },
+  "author": "@yfeeeee",
+  "license": "MIT"
+}

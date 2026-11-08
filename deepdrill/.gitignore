@@ -1,0 +1,6 @@
+.godot/
+build/
+raw/
+*.import
+.DS_Store
+node_modules/
