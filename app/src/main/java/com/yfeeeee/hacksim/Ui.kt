@@ -89,13 +89,18 @@ fun HackApp(game: Game) {
         ) {
             StatusBar(game)
             Box(Modifier.weight(1f).fillMaxWidth()) {
+                MatrixRain(Modifier.fillMaxSize())
                 val m = game.mini
-                when (m) {
+                if (game.showShop && m == null) {
+                    ShopScreen(game)
+                } else when (m) {
                     is Mini.Code -> CodeGame(m, game)
                     is Mini.Firewall -> FirewallGame(m, game)
                     is Mini.Sequence -> SequenceGame(m, game)
                     is Mini.Wires -> WiresGame(m, game)
                     is Mini.Whack -> WhackGame(m, game)
+                    is Mini.Binary -> BinaryGame(m, game)
+                    is Mini.Cards -> CardsGame(m, game)
                     null -> Column(Modifier.fillMaxSize()) {
                         ActionPanel(game)
                         Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -125,6 +130,7 @@ fun StatusBar(game: Game) {
             Text("LVL ${game.level}", color = GREEN, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
             Text("PWN ${game.hackedCount}", color = AMBER, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
         }
+        Text(game.rankName(), color = GREEN_DIM, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
         val d = game.conn
         if (d != null) {
             Text(
@@ -193,7 +199,7 @@ fun InputBar(game: Game) {
         game.submit(t)
     }
 
-    val chips = listOf("shop", "collect", "mission", "status", "help", "clear")
+    val chips = listOf("collect", "mission", "status", "sound", "help", "clear")
 
     Column(Modifier.fillMaxWidth().background(PANEL)) {
         Row(
@@ -615,6 +621,18 @@ fun ActionPanel(game: Game) {
                         .clickable { game.submit("scan") }
                         .padding(horizontal = 16.dp, vertical = 10.dp)
                 )
+                Text(
+                    "🛒 SHOP",
+                    color = GOLD,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    modifier = Modifier
+                        .padding(end = 6.dp)
+                        .border(2.dp, GOLD, RoundedCornerShape(8.dp))
+                        .clickable { game.submit("shop") }
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                )
                 for (t in DeviceType.values()) {
                     val locked = t.minLevel > game.level
                     Text(
@@ -973,6 +991,358 @@ fun WhackGame(m: Mini.Whack, game: Game) {
                         if (active == i) {
                             Text("👾", fontSize = 40.sp)
                         }
+                    }
+                }
+            }
+        }
+        Button(
+            onClick = { game.abortMini() },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp)
+        ) {
+            Text("Прервать")
+        }
+    }
+}
+
+// ======================= Эффект «дождь из кода» =======================
+
+@Composable
+fun MatrixRain(modifier: Modifier = Modifier) {
+    val cols = 26
+    val speeds = remember { FloatArray(cols) { 0.12f + Random.nextFloat() * 0.3f } }
+    val offsets = remember { FloatArray(cols) { Random.nextFloat() } }
+    var t by remember { mutableFloatStateOf(0f) }
+
+    LaunchedEffect(Unit) {
+        var last = withFrameNanos { it }
+        while (true) {
+            val now = withFrameNanos { it }
+            t += (now - last) / 1_000_000_000f
+            last = now
+        }
+    }
+
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val cw = w / cols
+        for (c in 0 until cols) {
+            val head = ((offsets[c] + t * speeds[c]) % 1f) * (h * 1.4f) - h * 0.2f
+            for (k in 0 until 10) {
+                val a = (0.2f - k * 0.02f).coerceAtLeast(0f)
+                drawRect(
+                    Color(0xFF00FF66).copy(alpha = a),
+                    topLeft = Offset(c * cw + cw * 0.35f, head - k * 26f),
+                    size = Size(cw * 0.3f, 18f)
+                )
+            }
+        }
+    }
+}
+
+// ======================= Магазин =======================
+
+@Composable
+fun ShopScreen(game: Game) {
+    val items = listOf(
+        listOf("crack", "🔓", "Брутфорсер", "больше попыток и времени в подборе пароля"),
+        listOf("bypass", "🧱", "Обход фаервола", "шире зона, больше времени на провода"),
+        listOf("stealth", "🕶", "Прокси и VPN", "трассировка растёт медленнее"),
+        listOf("scanner", "📡", "Сканер сети", "+1 устройство в каждом скане")
+    )
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(BG)
+            .padding(12.dp)
+    ) {
+        Text(
+            "🛒 МАГАЗИН     " + cash(game.money),
+            color = GOLD,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp
+        )
+        for (row in items) {
+            val key = row[0]
+            val lvl = game.levelOf(key)
+            val maxed = lvl >= 10
+            val price = game.costOf(lvl + 1)
+            val canBuy = !maxed && game.money >= price
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(top = 10.dp)
+                    .border(1.dp, GREEN_DIM, RoundedCornerShape(10.dp))
+                    .background(Color(0xFF0C1A12), RoundedCornerShape(10.dp))
+                    .padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(row[1], fontSize = 30.sp, modifier = Modifier.padding(end = 10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(row[2], color = Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(row[3], color = Color(0xFFC8E6C9), fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    Text(
+                        "█".repeat(lvl) + "░".repeat(10 - lvl) + "  " + lvl + "/10",
+                        color = GREEN,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp
+                    )
+                }
+                Button(
+                    onClick = { game.submit("buy " + key) },
+                    enabled = canBuy
+                ) {
+                    Text(if (maxed) "MAX" else cash(price))
+                }
+            }
+        }
+        Box(Modifier.weight(1f))
+        Button(
+            onClick = { game.showShop = false },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp)
+        ) {
+            Text("← НАЗАД")
+        }
+    }
+}
+
+// ======================= Мини-игра: двоичный замок =======================
+
+@Composable
+fun BinaryGame(m: Mini.Binary, game: Game) {
+    val d = m.device
+    val bits = if (d.security <= 3) 5 else if (d.security <= 6) 6 else if (d.security <= 8) 7 else 8
+    val target = remember(m) { 1 + Random.nextInt((1 shl bits) - 1) }
+    val on = remember(m) {
+        val l = mutableStateListOf<Boolean>()
+        for (i in 0 until bits) l.add(false)
+        l
+    }
+    val totalTime = 20f + bits * 3f + game.crackLvl * 1.5f
+    var time by remember(m) { mutableFloatStateOf(totalTime) }
+    var tries by remember(m) { mutableIntStateOf(3) }
+
+    fun current(): Int {
+        var s = 0
+        for (i in 0 until bits) {
+            if (on[i]) s += 1 shl (bits - 1 - i)
+        }
+        return s
+    }
+
+    LaunchedEffect(m) {
+        var last = withFrameNanos { it }
+        while (time > 0f) {
+            val now = withFrameNanos { it }
+            time -= (now - last) / 1_000_000_000f
+            last = now
+        }
+        game.onCodeResult(false, "")
+    }
+
+    fun submitAnswer() {
+        if (current() == target) {
+            game.onCodeResult(true, "")
+        } else {
+            tries -= 1
+            if (tries <= 0) {
+                game.onCodeResult(false, "")
+            }
+        }
+    }
+
+    Column(Modifier.fillMaxSize().padding(12.dp)) {
+        Text(
+            "ДВОИЧНЫЙ ЗАМОК: ${d.hostname}",
+            color = GREEN,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 16.sp
+        )
+        Text(
+            "Включай биты так, чтобы сумма весов стала равна числу.\nКаждая цифра сверху - вес бита.",
+            color = Color(0xFFC8E6C9),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+        Text(
+            "⏱ " + "%.1f".format(time.coerceAtLeast(0f)) + " c     Попытки: $tries",
+            color = if (time < 8f) RED else AMBER,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 15.sp,
+            modifier = Modifier.padding(vertical = 8.dp)
+        )
+        Box(Modifier.weight(1f))
+        Text(
+            "ЦЕЛЬ: $target",
+            color = GOLD,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 40.sp
+        )
+        Text(
+            "СЕЙЧАС: " + current(),
+            color = if (current() == target) GREEN else Color.White,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 24.sp,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(vertical = 16.dp)
+        ) {
+            for (i in 0 until bits) {
+                val weightValue = 1 shl (bits - 1 - i)
+                Column(
+                    Modifier
+                        .weight(1f)
+                        .padding(2.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("" + weightValue, color = GREEN_DIM, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(64.dp)
+                            .background(if (on[i]) GREEN else Color(0xFF0B3D20), RoundedCornerShape(10.dp))
+                            .clickable { on[i] = !on[i] },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            if (on[i]) "1" else "0",
+                            color = if (on[i]) BG else GREEN,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 26.sp
+                        )
+                    }
+                }
+            }
+        }
+        Button(
+            onClick = { submitAnswer() },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp)
+                .padding(vertical = 3.dp)
+        ) {
+            Text("ВВОД", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        }
+        Button(
+            onClick = { game.abortMini() },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp)
+        ) {
+            Text("Прервать")
+        }
+    }
+}
+
+// ======================= Мини-игра: поиск пар (дешифровка) =======================
+
+@Composable
+fun CardsGame(m: Mini.Cards, game: Game) {
+    val d = m.device
+    val pairs = if (d.security <= 3) 4 else if (d.security <= 7) 6 else 8
+    val symbols = listOf("A3", "F7", "09", "7C", "E1", "5B", "D2", "88")
+    val deck = remember(m) {
+        val half = symbols.take(pairs)
+        (half + half).shuffled()
+    }
+    val revealed = remember(m) { mutableStateListOf<Int>() }
+    val matched = remember(m) { mutableStateListOf<Int>() }
+    var lives by remember(m) { mutableIntStateOf(5 + game.crackLvl / 2) }
+    var lock by remember(m) { mutableStateOf(false) }
+    var check by remember(m) { mutableIntStateOf(0) }
+
+    LaunchedEffect(m, check) {
+        if (revealed.size == 2) {
+            delay(650)
+            val a = revealed[0]
+            val b = revealed[1]
+            if (deck[a] == deck[b]) {
+                matched.add(a)
+                matched.add(b)
+                revealed.clear()
+                lock = false
+                if (matched.size >= deck.size) {
+                    game.onCodeResult(true, "")
+                }
+            } else {
+                lives -= 1
+                revealed.clear()
+                lock = false
+                if (lives <= 0) {
+                    game.onCodeResult(false, "")
+                }
+            }
+        }
+    }
+
+    fun tap(i: Int) {
+        if (lock) return
+        if (revealed.contains(i) || matched.contains(i)) return
+        revealed.add(i)
+        if (revealed.size == 2) {
+            lock = true
+            check += 1
+        }
+    }
+
+    val rows = deck.size / 4
+
+    Column(Modifier.fillMaxSize().padding(12.dp)) {
+        Text(
+            "ДЕШИФРОВКА: ${d.hostname}",
+            color = GREEN,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 16.sp
+        )
+        Text(
+            "Найди все пары одинаковых блоков. Ошибка стоит жизнь.",
+            color = Color(0xFFC8E6C9),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+        Text(
+            "Пар: ${matched.size / 2}/$pairs     Жизни: " + "❤".repeat(lives.coerceAtLeast(0)),
+            color = AMBER,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 15.sp,
+            modifier = Modifier.padding(vertical = 10.dp)
+        )
+        for (r in 0 until rows) {
+            Row(Modifier.fillMaxWidth().weight(1f)) {
+                for (c in 0..3) {
+                    val i = r * 4 + c
+                    val faceUp = revealed.contains(i) || matched.contains(i)
+                    val bg = if (matched.contains(i)) Color(0xFF145A2E) else if (faceUp) Color(0xFF1565C0) else Color(0xFF0B3D20)
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .padding(4.dp)
+                            .background(bg, RoundedCornerShape(10.dp))
+                            .clickable { tap(i) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            if (faceUp) deck[i] else "?",
+                            color = if (faceUp) Color.White else GREEN_DIM,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 24.sp
+                        )
                     }
                 }
             }

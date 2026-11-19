@@ -19,6 +19,8 @@ sealed interface Mini {
     class Sequence(val device: Device) : Mini
     class Wires(val device: Device) : Mini
     class Whack(val device: Device) : Mini
+    class Binary(val device: Device) : Mini
+    class Cards(val device: Device) : Mini
 }
 
 class Game(private val prefs: SharedPreferences) {
@@ -31,7 +33,13 @@ class Game(private val prefs: SharedPreferences) {
     var crackLvl by mutableIntStateOf(prefs.getInt("crack", 0))
     var bypassLvl by mutableIntStateOf(prefs.getInt("bypass", 0))
     var stealthLvl by mutableIntStateOf(prefs.getInt("stealth", 0))
+    var scannerLvl by mutableIntStateOf(prefs.getInt("scanner", 0))
+    var soundOn by mutableStateOf(prefs.getBoolean("sound", true))
+    var showShop by mutableStateOf(false)
     var hackedCount by mutableIntStateOf(0)
+
+    /** Звук и вибрация: подключается из MainActivity. */
+    var fx: ((String) -> Unit)? = null
 
     var conn by mutableStateOf<Device?>(null)
     var probed by mutableStateOf(false)
@@ -56,6 +64,24 @@ class Game(private val prefs: SharedPreferences) {
     val level: Int get() = 1 + rep / 40
 
     fun isOwned(id: Int): Boolean = id in hacked
+
+    private val ranks = listOf(
+        "Новичок", "Скрипт-кидди", "Взломщик", "Хакер", "Эксперт",
+        "Мастер", "Элита", "Легенда", "Призрак", "Тень сети"
+    )
+
+    fun rankName(): String = ranks[minOf(level - 1, ranks.size - 1)]
+
+    private fun playFx(kind: String) {
+        if (soundOn) fx?.invoke(kind)
+    }
+
+    fun levelOf(key: String): Int = when (key) {
+        "crack" -> crackLvl
+        "bypass" -> bypassLvl
+        "stealth" -> stealthLvl
+        else -> scannerLvl
+    }
 
     init {
         val saved = prefs.getString("hacked", "") ?: ""
@@ -100,6 +126,8 @@ class Game(private val prefs: SharedPreferences) {
             .putInt("crack", crackLvl)
             .putInt("bypass", bypassLvl)
             .putInt("stealth", stealthLvl)
+            .putInt("scanner", scannerLvl)
+            .putBoolean("sound", soundOn)
             .putString("hacked", hacked.joinToString(","))
             .putLong("botRate", botRate)
             .putLong("lastCollect", lastCollect)
@@ -118,6 +146,7 @@ class Game(private val prefs: SharedPreferences) {
         crackLvl = 0
         bypassLvl = 0
         stealthLvl = 0
+        scannerLvl = 0
         botRate = 0L
         lastCollect = System.currentTimeMillis()
         newMission()
@@ -153,8 +182,13 @@ class Game(private val prefs: SharedPreferences) {
             "collect" -> collect()
             "mission", "contract" -> showMission()
             "disconnect", "dc", "exit" -> disconnect(true)
-            "shop" -> shop()
+            "shop" -> showShop = true
             "buy" -> buy(arg)
+            "sound" -> {
+                soundOn = !soundOn
+                save()
+                out(if (soundOn) "Звук и вибрация: ВКЛ" else "Звук и вибрация: ВЫКЛ", Tone.INFO)
+            }
             "status", "stat" -> status()
             "devices" -> devices()
             "clear", "cls" -> lines.clear()
@@ -189,9 +223,10 @@ class Game(private val prefs: SharedPreferences) {
                 " loot            забрать добычу\n" +
                 " collect         забрать доход ботнета\n" +
                 " mission         текущий контракт\n" +
+                " sound           включить/выключить звук и вибрацию\n" +
                 " disconnect      отключиться\n" +
                 " shop            магазин софта\n" +
-                " buy <имя>       купить: crack, bypass, stealth\n" +
+                " buy <имя>       купить: crack, bypass, stealth, scanner\n" +
                 " status          твоя статистика\n" +
                 " devices         сколько устройств взломано\n" +
                 " clear           очистить экран\n" +
@@ -215,7 +250,8 @@ class Game(private val prefs: SharedPreferences) {
         out("Деньги: ${cash(money)}   REP: $rep   Уровень: $level", Tone.INFO)
         out("До следующего уровня: ${40 - rep % 40} REP", Tone.NORMAL)
         out("Взломано устройств: $hackedCount из $WORLD_SIZE", Tone.NORMAL)
-        out("Софт: брутфорс $crackLvl/10, обход FW $bypassLvl/10, стелс $stealthLvl/10", Tone.NORMAL)
+        out("Ранг: ${rankName()}", Tone.INFO)
+        out("Софт: брутфорс $crackLvl/10, обход FW $bypassLvl/10, стелс $stealthLvl/10, сканер $scannerLvl/10", Tone.NORMAL)
         out("Ботнет: ~${cash(botRate * 8L / 100L)}/час, накоплено ${cash(pendingBot())}", Tone.NORMAL)
     }
 
@@ -289,8 +325,9 @@ class Game(private val prefs: SharedPreferences) {
         }
 
         val found = ArrayList<Device>()
+        val want = 8 + scannerLvl
         var tries = 0
-        while (found.size < 8 && tries < 20000) {
+        while (found.size < want && tries < 20000) {
             tries++
             val d = World.device(kotlin.random.Random.nextInt(WORLD_SIZE))
             if (wanted != null && d.type != wanted) continue
@@ -379,6 +416,12 @@ class Game(private val prefs: SharedPreferences) {
         probed = true
         out("Дальше: bypass", Tone.INFO)
         addTrace(4 + d.security * 2)
+        // случайное событие: админ заметил активность
+        if (conn != null && d.security >= 3 && kotlin.random.Random.nextInt(100) < 15) {
+            out("[!] Администратор вошёл в систему! Трассировка ускорилась.", Tone.ERR)
+            playFx("err")
+            addTrace(12)
+        }
     }
 
     private fun bypass() {
@@ -437,7 +480,12 @@ class Game(private val prefs: SharedPreferences) {
             return
         }
         out("Запуск подбора пароля...", Tone.INFO)
-        mini = Mini.Code(d)
+        // три разные мини-игры: логика, двоичный замок, поиск пар
+        mini = when (kotlin.random.Random.nextInt(3)) {
+            0 -> Mini.Code(d)
+            1 -> Mini.Binary(d)
+            else -> Mini.Cards(d)
+        }
     }
 
     private fun loot() {
@@ -464,11 +512,17 @@ class Game(private val prefs: SharedPreferences) {
             lastCollect = System.currentTimeMillis()
             botRate += d.reward
 
+            // 15% шанс найти ценные файлы: добыча x1.5
+            val lucky = kotlin.random.Random.nextInt(100) < 15
+            val gain = if (lucky) d.reward * 3L / 2L else d.reward
+
             hacked.add(d.id)
             hackedCount = hacked.size
-            money += d.reward
+            money += gain
             rep += d.repGain
-            out("[+] Данные скачаны! +${cash(d.reward)}  +${d.repGain} REP", Tone.OK)
+            playFx("coin")
+            out("[+] Данные скачаны! +${cash(gain)}  +${d.repGain} REP", Tone.OK)
+            if (lucky) out("[*] Нашли ценные файлы: добыча x1.5!", Tone.OK)
             if (d.type.key == missionKey) {
                 missionDone += 1
                 if (missionDone >= missionNeed) {
@@ -481,7 +535,7 @@ class Game(private val prefs: SharedPreferences) {
                 }
             }
             if (level > before) {
-                out("*** НОВЫЙ УРОВЕНЬ: $level ***", Tone.OK)
+                out("*** НОВЫЙ УРОВЕНЬ: $level - ${rankName()} ***", Tone.OK)
                 out("Открываются новые типы устройств.", Tone.INFO)
             }
         }
@@ -505,6 +559,7 @@ class Game(private val prefs: SharedPreferences) {
     private fun caught() {
         val fine = minOf(money, maxOf(50L, money / 10))
         money -= fine
+        playFx("alarm")
         out("!!! ВАС ОТСЛЕДИЛИ !!!", Tone.ERR)
         out("Штраф: ${cash(fine)}. Соединение разорвано.", Tone.ERR)
         mini = null
@@ -520,9 +575,11 @@ class Game(private val prefs: SharedPreferences) {
         if (d == null) return
         if (ok) {
             fwDown = true
+            playFx("ok")
             out("[+] Фаервол обойдён. Дальше: ${afterFw(d)}", Tone.OK)
             addTrace(4 + d.security * 2)
         } else {
+            playFx("err")
             out("[-] Фаервол заблокировал атаку.", Tone.ERR)
             addTrace(15 + d.security * 2)
         }
@@ -534,9 +591,11 @@ class Game(private val prefs: SharedPreferences) {
         if (d == null) return
         if (ok) {
             exploited = true
+            playFx("ok")
             out("[+] Эксплойт сработал. Дальше: crack", Tone.OK)
             addTrace(4 + d.security * 2)
         } else {
+            playFx("err")
             out("[-] Эксплойт провалился.", Tone.ERR)
             addTrace(15 + d.security * 2)
         }
@@ -548,10 +607,13 @@ class Game(private val prefs: SharedPreferences) {
         if (d == null) return
         if (ok) {
             cracked = true
+            playFx("ok")
             out("[+] Пароль взломан! Дальше: loot", Tone.OK)
             addTrace(4 + d.security * 2)
         } else {
-            out("[-] Подбор не удался. Код был: $secret. Система сменила пароль.", Tone.ERR)
+            playFx("err")
+            val hint = if (secret.isEmpty()) "" else " Код был: $secret."
+            out("[-] Взлом не удался.$hint Система сменила пароль.", Tone.ERR)
             addTrace(15 + d.security * 2)
         }
     }
@@ -566,7 +628,7 @@ class Game(private val prefs: SharedPreferences) {
 
     // ---------- магазин ----------
 
-    private fun costOf(nextLevel: Int): Long = 100L * nextLevel * nextLevel
+    fun costOf(nextLevel: Int): Long = 100L * nextLevel * nextLevel
 
     private fun shopLine(key: String, name: String, lvl: Int, desc: String) {
         val priceText = if (lvl >= 10) "MAX" else cash(costOf(lvl + 1))
@@ -578,6 +640,7 @@ class Game(private val prefs: SharedPreferences) {
         shopLine("crack", "Брутфорсер", crackLvl, "+1 попытка при подборе пароля")
         shopLine("bypass", "Обход фаервола", bypassLvl, "шире зелёная зона в мини-игре")
         shopLine("stealth", "Прокси и VPN", stealthLvl, "трассировка растёт медленнее")
+        shopLine("scanner", "Сканер сети", scannerLvl, "+1 устройство в каждом скане")
     }
 
     private fun buy(name: String?) {
@@ -585,8 +648,9 @@ class Game(private val prefs: SharedPreferences) {
             "crack" -> crackLvl
             "bypass" -> bypassLvl
             "stealth" -> stealthLvl
+            "scanner" -> scannerLvl
             else -> {
-                out("Использование: buy <crack|bypass|stealth>", Tone.WARN)
+                out("Использование: buy <crack|bypass|stealth|scanner>", Tone.WARN)
                 return
             }
         }
@@ -603,8 +667,10 @@ class Game(private val prefs: SharedPreferences) {
         when (name) {
             "crack" -> crackLvl += 1
             "bypass" -> bypassLvl += 1
-            else -> stealthLvl += 1
+            "stealth" -> stealthLvl += 1
+            else -> scannerLvl += 1
         }
+        playFx("coin")
         save()
         out("[+] Куплено! Уровень: ${cur + 1}/10. Осталось ${cash(money)}.", Tone.OK)
     }
