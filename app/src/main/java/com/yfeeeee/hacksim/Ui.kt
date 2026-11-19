@@ -5,6 +5,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -45,6 +47,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -90,7 +94,14 @@ fun HackApp(game: Game) {
                     is Mini.Code -> CodeGame(m, game)
                     is Mini.Firewall -> FirewallGame(m, game)
                     is Mini.Sequence -> SequenceGame(m, game)
-                    null -> TerminalView(game)
+                    is Mini.Wires -> WiresGame(m, game)
+                    is Mini.Whack -> WhackGame(m, game)
+                    null -> Column(Modifier.fillMaxSize()) {
+                        ActionPanel(game)
+                        Box(Modifier.weight(1f).fillMaxWidth()) {
+                            TerminalView(game)
+                        }
+                    }
                 }
             }
             if (game.mini == null) {
@@ -182,18 +193,7 @@ fun InputBar(game: Game) {
         game.submit(t)
     }
 
-    val chips = ArrayList<String>()
-    if (game.conn == null) {
-        for (i in game.scanList.indices) {
-            chips.add("connect ${i + 1}")
-        }
-    }
-    chips.addAll(
-        listOf(
-            "scan", "probe", "bypass", "exploit", "crack", "loot",
-            "collect", "mission", "shop", "status", "help", "disconnect"
-        )
-    )
+    val chips = listOf("shop", "collect", "mission", "status", "help", "clear")
 
     Column(Modifier.fillMaxWidth().background(PANEL)) {
         Row(
@@ -555,6 +555,425 @@ fun SequenceGame(m: Mini.Sequence, game: Game) {
                             .background(if (lit == i) bright[i] else dim[i], RoundedCornerShape(12.dp))
                             .clickable { tap(i) }
                     )
+                }
+            }
+        }
+        Button(
+            onClick = { game.abortMini() },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp)
+        ) {
+            Text("Прервать")
+        }
+    }
+}
+
+// ======================= Визуальная панель управления =======================
+
+fun typeIcon(t: DeviceType): String = when (t) {
+    DeviceType.CAMERA -> "📷"
+    DeviceType.ROUTER -> "📡"
+    DeviceType.TV -> "📺"
+    DeviceType.PRINTER -> "🖨"
+    DeviceType.IOT -> "🏠"
+    DeviceType.NAS -> "💾"
+    DeviceType.WEB -> "🌐"
+    DeviceType.DB -> "🗄"
+    DeviceType.ATM -> "🏧"
+    DeviceType.CORP -> "🏢"
+    DeviceType.BANK -> "🏦"
+    DeviceType.GOV -> "🏛"
+}
+
+fun secColor(sec: Int): Color = when {
+    sec <= 3 -> GREEN
+    sec <= 6 -> AMBER
+    else -> RED
+}
+
+@Composable
+fun ActionPanel(game: Game) {
+    val d = game.conn
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF07110B))
+            .padding(horizontal = 8.dp, vertical = 8.dp)
+    ) {
+        if (d == null) {
+            Row(Modifier.horizontalScroll(rememberScrollState())) {
+                Text(
+                    "📡 SCAN",
+                    color = BG,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    modifier = Modifier
+                        .padding(end = 6.dp)
+                        .background(GREEN, RoundedCornerShape(8.dp))
+                        .clickable { game.submit("scan") }
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                )
+                for (t in DeviceType.values()) {
+                    val locked = t.minLevel > game.level
+                    Text(
+                        typeIcon(t),
+                        fontSize = 20.sp,
+                        modifier = Modifier
+                            .padding(end = 6.dp)
+                            .border(1.dp, if (locked) Color(0xFF333333) else GREEN_DIM, RoundedCornerShape(8.dp))
+                            .clickable { game.submit("scan " + t.key) }
+                            .padding(horizontal = 10.dp, vertical = 8.dp)
+                    )
+                }
+            }
+            if (game.scanList.isNotEmpty()) {
+                Row(
+                    Modifier
+                        .horizontalScroll(rememberScrollState())
+                        .padding(top = 8.dp)
+                ) {
+                    for (i in game.scanList.indices) {
+                        DeviceCard(i, game.scanList[i], game)
+                    }
+                }
+            }
+        } else {
+            Text(
+                typeIcon(d.type) + " " + d.type.title + "  " + d.hostname,
+                color = GREEN,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp
+            )
+            val expDone = if (d.needsExploit) game.exploited else game.fwDown
+            Row(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                StageButton("🔍", "probe", game.probed, !game.probed, Modifier.weight(1f)) {
+                    game.submit("probe")
+                }
+                StageButton("🧱", "bypass", game.fwDown, game.probed && !game.fwDown, Modifier.weight(1f)) {
+                    game.submit("bypass")
+                }
+                StageButton(
+                    "💥", "exploit", expDone,
+                    d.needsExploit && game.fwDown && !game.exploited,
+                    Modifier.weight(1f)
+                ) {
+                    game.submit("exploit")
+                }
+                StageButton(
+                    "🔑", "crack", game.cracked,
+                    game.fwDown && (!d.needsExploit || game.exploited) && !game.cracked,
+                    Modifier.weight(1f)
+                ) {
+                    game.submit("crack")
+                }
+                StageButton("💰", "loot", false, game.cracked, Modifier.weight(1f)) {
+                    game.submit("loot")
+                }
+                StageButton("⛔", "exit", false, false, Modifier.weight(1f)) {
+                    game.submit("disconnect")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun StageButton(
+    icon: String,
+    label: String,
+    done: Boolean,
+    enabled: Boolean,
+    modifier: Modifier,
+    onClick: () -> Unit
+) {
+    val borderColor = if (done) GREEN else if (enabled) AMBER else Color(0xFF333333)
+    val bg = if (done) Color(0xFF0F3D22) else Color(0xFF0C1A12)
+    Column(
+        modifier
+            .padding(horizontal = 2.dp)
+            .border(2.dp, borderColor, RoundedCornerShape(10.dp))
+            .background(bg, RoundedCornerShape(10.dp))
+            .clickable { onClick() }
+            .padding(vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(if (done) "✔" else icon, fontSize = 22.sp)
+        Text(label, color = borderColor, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+    }
+}
+
+@Composable
+fun DeviceCard(index: Int, d: Device, game: Game) {
+    val locked = d.type.minLevel > game.level
+    val owned = game.isOwned(d.id)
+    val frame = if (locked) Color(0xFF444444) else secColor(d.security)
+    Column(
+        Modifier
+            .padding(end = 8.dp)
+            .width(140.dp)
+            .border(2.dp, frame, RoundedCornerShape(10.dp))
+            .background(Color(0xFF0C1A12), RoundedCornerShape(10.dp))
+            .clickable { game.submit("connect " + (index + 1)) }
+            .padding(8.dp)
+    ) {
+        Text(typeIcon(d.type), fontSize = 28.sp)
+        Text(
+            d.hostname,
+            color = Color.White,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 12.sp,
+            maxLines = 1
+        )
+        Text(
+            d.type.title,
+            color = Color(0xFFC8E6C9),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+            maxLines = 1
+        )
+        Text(
+            "▮".repeat(d.security) + "▯".repeat(10 - d.security),
+            color = frame,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp
+        )
+        val footer = if (locked) "🔒 LVL " + d.type.minLevel else if (owned) "✔ взломан" else "~" + cash(d.reward)
+        Text(
+            footer,
+            color = if (locked) AMBER else if (owned) GREEN else GOLD,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp
+        )
+    }
+}
+
+// ======================= Мини-игра: соедини провода =======================
+
+@Composable
+fun WiresGame(m: Mini.Wires, game: Game) {
+    val d = m.device
+    val n = minOf(6, 3 + d.security / 3)
+    val colors = listOf(
+        Color(0xFFFF5252), Color(0xFF40C4FF), Color(0xFF00E676),
+        Color(0xFFFFD740), Color(0xFFE040FB), Color(0xFFFF9100)
+    )
+    val order = remember(m) { (0 until n).shuffled() }
+    val links = remember(m) {
+        val l = mutableStateListOf<Int>()
+        for (i in 0 until n) l.add(-1)
+        l
+    }
+    val totalTime = 22f + n * 4f + game.bypassLvl * 1.5f
+    var sel by remember(m) { mutableIntStateOf(-1) }
+    var time by remember(m) { mutableFloatStateOf(totalTime) }
+
+    LaunchedEffect(m) {
+        var last = withFrameNanos { it }
+        while (time > 0f) {
+            val now = withFrameNanos { it }
+            time -= (now - last) / 1_000_000_000f
+            last = now
+        }
+        game.onFirewallResult(false)
+    }
+
+    Column(Modifier.fillMaxSize().padding(12.dp)) {
+        Text(
+            "СОЕДИНИ ПРОВОДА: ${d.hostname}",
+            color = GREEN,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 16.sp
+        )
+        Text(
+            "Нажми провод слева, потом такой же цвет справа.\nОшибка отнимает 3 секунды.",
+            color = Color(0xFFC8E6C9),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+        Text(
+            "⏱ " + "%.1f".format(time.coerceAtLeast(0f)) + " c",
+            color = if (time < 8f) RED else AMBER,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 16.sp,
+            modifier = Modifier.padding(vertical = 6.dp)
+        )
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(6.dp)
+                .background(Color(0xFF1A2A1F))
+        ) {
+            Box(
+                Modifier
+                    .fillMaxWidth((time / totalTime).coerceIn(0f, 1f))
+                    .fillMaxHeight()
+                    .background(if (time < 8f) RED else GREEN)
+            )
+        }
+        Canvas(
+            Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .padding(vertical = 8.dp)
+                .background(Color(0xFF0A1A0F))
+                .pointerInput(m) {
+                    detectTapGestures { offset ->
+                        val h = size.height.toFloat()
+                        val w = size.width.toFloat()
+                        val slot = (offset.y / (h / n)).toInt().coerceIn(0, n - 1)
+                        if (offset.x < w * 0.5f) {
+                            if (links[slot] == -1) {
+                                sel = if (sel == slot) -1 else slot
+                            }
+                        } else {
+                            if (sel != -1) {
+                                if (order[slot] == sel) {
+                                    links[sel] = slot
+                                    sel = -1
+                                    var all = true
+                                    for (v in links) {
+                                        if (v == -1) all = false
+                                    }
+                                    if (all) game.onFirewallResult(true)
+                                } else {
+                                    time -= 3f
+                                    sel = -1
+                                }
+                            }
+                        }
+                    }
+                }
+        ) {
+            val h = size.height
+            val w = size.width
+            val lx = w * 0.14f
+            val rx = w * 0.86f
+            val rad = minOf(h / n * 0.3f, 60f)
+            for (i in 0 until n) {
+                if (links[i] != -1) {
+                    drawLine(
+                        colors[i],
+                        Offset(lx, (i + 0.5f) * h / n),
+                        Offset(rx, (links[i] + 0.5f) * h / n),
+                        strokeWidth = 12f
+                    )
+                }
+            }
+            for (i in 0 until n) {
+                val cy = (i + 0.5f) * h / n
+                drawCircle(colors[i], radius = rad, center = Offset(lx, cy))
+                if (sel == i) {
+                    drawCircle(Color.White, radius = rad + 8f, center = Offset(lx, cy), style = Stroke(width = 5f))
+                }
+                drawCircle(colors[order[i]], radius = rad, center = Offset(rx, cy))
+            }
+        }
+        Button(
+            onClick = { game.abortMini() },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp)
+        ) {
+            Text("Прервать")
+        }
+    }
+}
+
+// ======================= Мини-игра: антивирус (лови вирусы) =======================
+
+@Composable
+fun WhackGame(m: Mini.Whack, game: Game) {
+    val d = m.device
+    val need = 6 + d.security
+    val showMs = (950L - d.security * 50L).coerceAtLeast(450L)
+    var hits by remember(m) { mutableIntStateOf(0) }
+    var lives by remember(m) { mutableIntStateOf(3) }
+    var active by remember(m) { mutableIntStateOf(-1) }
+    var round by remember(m) { mutableIntStateOf(0) }
+
+    LaunchedEffect(m, round) {
+        active = -1
+        delay(250)
+        active = Random.nextInt(9)
+        delay(showMs)
+        active = -1
+        lives -= 1
+        if (lives <= 0) {
+            game.onSequenceResult(false)
+        } else {
+            round += 1
+        }
+    }
+
+    fun tap(i: Int) {
+        if (active == -1) return
+        if (i == active) {
+            hits += 1
+            active = -1
+            if (hits >= need) {
+                game.onSequenceResult(true)
+            } else {
+                round += 1
+            }
+        } else {
+            lives -= 1
+            active = -1
+            if (lives <= 0) {
+                game.onSequenceResult(false)
+            } else {
+                round += 1
+            }
+        }
+    }
+
+    Column(Modifier.fillMaxSize().padding(12.dp)) {
+        Text(
+            "АНТИВИРУС: ${d.hostname}",
+            color = GREEN,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 16.sp
+        )
+        Text(
+            "Лови вирусы, пока они не исчезли! Промах или мимо - минус жизнь.",
+            color = Color(0xFFC8E6C9),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+        Text(
+            "Поймано: $hits/$need     Жизни: " + "❤".repeat(lives.coerceAtLeast(0)),
+            color = AMBER,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 15.sp,
+            modifier = Modifier.padding(vertical = 10.dp)
+        )
+        for (r in 0..2) {
+            Row(Modifier.fillMaxWidth().weight(1f)) {
+                for (c in 0..2) {
+                    val i = r * 3 + c
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .padding(5.dp)
+                            .background(
+                                if (active == i) Color(0xFF00E676) else Color(0xFF0B3D20),
+                                RoundedCornerShape(12.dp)
+                            )
+                            .clickable { tap(i) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (active == i) {
+                            Text("👾", fontSize = 40.sp)
+                        }
+                    }
                 }
             }
         }

@@ -17,6 +17,8 @@ sealed interface Mini {
     class Code(val device: Device) : Mini
     class Firewall(val device: Device) : Mini
     class Sequence(val device: Device) : Mini
+    class Wires(val device: Device) : Mini
+    class Whack(val device: Device) : Mini
 }
 
 class Game(private val prefs: SharedPreferences) {
@@ -52,6 +54,8 @@ class Game(private val prefs: SharedPreferences) {
     private var missionBonus: Long = prefs.getLong("mBonus", 0L)
 
     val level: Int get() = 1 + rep / 40
+
+    fun isOwned(id: Int): Boolean = id in hacked
 
     init {
         val saved = prefs.getString("hacked", "") ?: ""
@@ -393,7 +397,8 @@ class Game(private val prefs: SharedPreferences) {
             return
         }
         out("Запуск обхода фаервола...", Tone.INFO)
-        mini = Mini.Firewall(d)
+        // для разнообразия: то тайминг, то соединение проводов
+        mini = if (kotlin.random.Random.nextBoolean()) Mini.Firewall(d) else Mini.Wires(d)
     }
 
     private fun afterFw(d: Device): String = if (d.needsExploit) "exploit" else "crack"
@@ -413,7 +418,8 @@ class Game(private val prefs: SharedPreferences) {
             return
         }
         out("Запуск эксплойта...", Tone.INFO)
-        mini = Mini.Sequence(d)
+        // то игра на память, то охота за вирусами
+        mini = if (kotlin.random.Random.nextBoolean()) Mini.Sequence(d) else Mini.Whack(d)
     }
 
     private fun crack() {
