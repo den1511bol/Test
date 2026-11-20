@@ -208,8 +208,12 @@ class IfiRelayMod(loader.Module):
         from telethon import utils as tl_utils
 
         found = {}
-        for user in await self._client.get_contacts():
-            found[user.id] = tl_utils.get_display_name(user)
+        from telethon.tl.functions.contacts import GetContactsRequest
+
+        result = await self._client(GetContactsRequest(hash=0))
+        for user in getattr(result, "users", []):
+            if not getattr(user, "bot", False):
+                found[user.id] = tl_utils.get_display_name(user)
         async for dialog in self._client.iter_dialogs(limit=300):
             entity = dialog.entity
             if dialog.is_user and not getattr(entity, "bot", False):

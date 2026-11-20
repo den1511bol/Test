@@ -31,7 +31,7 @@ class ApiClient(private val settings: Settings) {
         try {
             conn.requestMethod = "POST"
             conn.connectTimeout = 10_000
-            conn.readTimeout = 40_000
+            conn.readTimeout = 90_000
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             conn.setRequestProperty("Authorization", "Bearer ${settings.token}")

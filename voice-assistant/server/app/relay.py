@@ -65,7 +65,7 @@ class BotRelayGateway:
         owner_id: int,
         secret: str,
         http: Any = None,
-        timeout: float = 20.0,
+        timeout: float = 35.0,
     ) -> None:
         self._token = bot_token
         self._owner_id = owner_id
@@ -118,13 +118,18 @@ class BotRelayGateway:
         payload = {**payload, "id": request_id, "ts": int(time.time())}
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
+        started = time.monotonic()
+        log.info("relay -> %s id=%s", payload.get("op"), request_id)
         try:
             await self._api(
                 "sendMessage",
                 {"chat_id": self._owner_id, "text": pack(REQ_PREFIX, self._secret, payload)},
             )
-            return await asyncio.wait_for(future, self._timeout)
+            result = await asyncio.wait_for(future, self._timeout)
+            log.info("relay <- id=%s за %.1f c", request_id, time.monotonic() - started)
+            return result
         except asyncio.TimeoutError:
+            log.warning("relay: ответа на id=%s нет за %.0f c", request_id, self._timeout)
             raise RelayError("Юзербот не отвечает") from None
         finally:
             self._pending.pop(request_id, None)
@@ -151,15 +156,17 @@ class BotRelayGateway:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — не логируем текст: в нём может быть токен в URL
-                log.warning("relay poll error: %s", type(exc).__name__)
+                log.warning("relay poll error: %s: %s", type(exc).__name__, str(exc).replace(self._token, "***")[:200])
                 await asyncio.sleep(3)
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") or {}
         if (message.get("from") or {}).get("id") != self._owner_id:
+            log.info("relay: апдейт от другого отправителя, пропуск")
             return
         data = unpack(RES_PREFIX, self._secret, message.get("text") or "")
         if data is None:
+            log.info("relay: сообщение не IFI1R или неверная подпись, пропуск")
             return
         future = self._pending.get(str(data.get("id")))
         if future is not None and not future.done():
