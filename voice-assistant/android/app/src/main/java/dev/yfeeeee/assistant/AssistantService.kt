@@ -108,7 +108,7 @@ class AssistantService : Service() {
                     waitForWakeWord(it)
                     LogBuffer.add("Слово-активатор услышано")
                     beep()
-                    conversation()
+                    if (settings.geminiMode) handOffToAssistant() else conversation()
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -233,6 +233,20 @@ class AssistantService : Service() {
         return null
     }
 
+    /** Отдаёт разговор голосовому ассистенту телефона (Gemini / Google Ассистент / Bixby). */
+    private suspend fun handOffToAssistant() {
+        try {
+            startActivity(
+                Intent(Intent.ACTION_VOICE_ASSIST).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+            LogBuffer.add("Передал голосовому ассистенту телефона")
+        } catch (e: Exception) {
+            LogBuffer.add("Не удалось открыть ассистента: ${e.javaClass.simpleName}: ${e.message}")
+        }
+        // Микрофон нужен ассистенту: свой не включаем, пока он слушает и отвечает.
+        delay(ASSISTANT_PAUSE_MS)
+    }
+
     private suspend fun beep() {
         try {
             ToneGenerator(AudioManager.STREAM_MUSIC, 80).startTone(ToneGenerator.TONE_PROP_BEEP, 150)
@@ -271,6 +285,7 @@ class AssistantService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val SAMPLE_RATE = 16_000
         private const val MAX_TURNS = 3
+        private const val ASSISTANT_PAUSE_MS = 20_000L
         private val YES_WORDS = setOf(
             "да", "давай", "отправляй", "отправь", "ага", "угу", "подтверждаю", "конечно", "ок", "окей",
         )

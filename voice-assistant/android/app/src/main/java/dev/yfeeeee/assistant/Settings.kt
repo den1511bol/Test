@@ -18,4 +18,9 @@ class Settings(context: Context) {
     var threshold: Float
         get() = prefs.getFloat("threshold", 0.5f)
         set(value) = prefs.edit().putFloat("threshold", value).apply()
+
+    /** Режим «Ифи → Gemini»: после слова-активатора открывается голосовой ассистент телефона. */
+    var geminiMode: Boolean
+        get() = prefs.getBoolean("gemini", false)
+        set(value) = prefs.edit().putBoolean("gemini", value).apply()
 }

@@ -14,6 +14,7 @@ import android.provider.Settings as AndroidSettings
 import android.text.InputType
 import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -27,6 +28,7 @@ class MainActivity : Activity() {
     private lateinit var urlField: EditText
     private lateinit var tokenField: EditText
     private lateinit var thresholdField: EditText
+    private lateinit var geminiBox: CheckBox
     private lateinit var statusView: TextView
     private lateinit var logView: TextView
 
@@ -52,6 +54,11 @@ class MainActivity : Activity() {
         root.addView(urlField)
         root.addView(tokenField)
         root.addView(thresholdField)
+        geminiBox = CheckBox(this).apply {
+            text = "Режим Gemini: после слова-активатора открывать голосовой ассистент телефона (сервер не нужен)"
+            isChecked = settings.geminiMode
+        }
+        root.addView(geminiBox)
 
         root.addView(button("1. Выдать разрешения (микрофон, уведомления)") { requestRuntimePermissions() })
         root.addView(button("2. Разрешить «Поверх других окон»") { requestOverlay() })
@@ -94,14 +101,17 @@ class MainActivity : Activity() {
         settings.token = tokenField.text.toString()
         val threshold = thresholdField.text.toString().toFloatOrNull()
         if (threshold != null && threshold in 0.05f..0.99f) settings.threshold = threshold
+        settings.geminiMode = geminiBox.isChecked
 
-        if (!settings.serverUrl.startsWith("https://")) {
-            toast("Адрес сервера должен начинаться с https://")
-            return
-        }
-        if (settings.token.isEmpty()) {
-            toast("Введите токен")
-            return
+        if (!settings.geminiMode) {
+            if (!settings.serverUrl.startsWith("https://")) {
+                toast("Адрес сервера должен начинаться с https://")
+                return
+            }
+            if (settings.token.isEmpty()) {
+                toast("Введите токен")
+                return
+            }
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             toast("Сначала выдайте разрешение на микрофон (кнопка 1)")
