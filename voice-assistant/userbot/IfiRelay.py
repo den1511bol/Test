@@ -55,7 +55,7 @@ def _score_word(query, word):
             break
         common += 1
     shortest = min(len(query), len(word))
-    if shortest >= 3 and common >= 2 and abs(len(query) - len(word)) <= 3 and common >= shortest - 1 - (common >= 4):
+    if shortest >= 3 and abs(len(query) - len(word)) <= 3 and common >= max(2, shortest - 2):
         return 0.9
     ratio = SequenceMatcher(None, query, word).ratio()
     return ratio if ratio >= 0.8 else 0.0

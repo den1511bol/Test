@@ -334,5 +334,6 @@ def test_contact_matching_is_strict(relay_module):
     rank = lambda q: [n for _, n in relay_module._rank(contacts, q)]  # noqa: E731
     assert rank("Милая бука") == ["Милая Бука"]
     assert rank("Ане") == ["Аня"]
+    assert rank("милой буке") == ["Милая Бука"]
     assert rank("Дмитрий") == []
     assert "Максим" not in rank("Мила")
