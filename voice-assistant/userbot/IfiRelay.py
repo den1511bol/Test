@@ -17,7 +17,7 @@ MAX_AGE = 60  # секунд: старые запросы отклоняются
 OFFER_TTL = 600  # отправлять можно только контактам из поиска за последние 10 минут
 CACHE_TTL = 600
 MAX_TEXT = 4000
-VERSION = "3 (строгий поиск)"
+VERSION = "4 (строгий поиск)"
 
 
 def _sign(secret, body):
@@ -45,21 +45,39 @@ def _unpack(secret, text):
     return data if isinstance(data, dict) else None
 
 
+def _distance(a, b):
+    """Расстояние Левенштейна (правок, чтобы превратить a в b)."""
+    prev = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        cur = [i]
+        for j, y in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x != y)))
+        prev = cur
+    return prev[-1]
+
+
 def _score_word(query, word):
-    """Сходство двух слов 0..1. Нечёткость только против опечаток распознавания речи."""
+    """Сходство двух слов 0..1: точное, падежное окончание или одна ошибка распознавания."""
     if query == word:
         return 1.0
-    # Падежи: «ане» ~ «аня», «милой» ~ «милая» (общее начало от 3 букв, хвост до 3 букв).
+    shortest = min(len(query), len(word))
+    if shortest < 3:
+        return 0.0
     common = 0
     for x, y in zip(query, word):
         if x != y:
             break
         common += 1
-    shortest = min(len(query), len(word))
-    if shortest >= 3 and abs(len(query) - len(word)) <= 3 and common >= max(2, shortest - 2):
+    diff = abs(len(query) - len(word))
+    # Падежи: «ане» ~ «аня», «милой» ~ «милая», «буке» ~ «бука».
+    if shortest == 3 and common == 2 and diff <= 1:
         return 0.9
-    ratio = SequenceMatcher(None, query, word).ratio()
-    return ratio if ratio >= 0.8 else 0.0
+    if shortest >= 4 and common >= 3 and common >= shortest - 2 and diff <= 2:
+        return 0.9
+    # Одна ошибка распознавания речи: «бока» ~ «бука».
+    if shortest >= 4 and _distance(query, word) <= 1:
+        return 0.85
+    return 0.0
 
 
 def _score(query, name):
