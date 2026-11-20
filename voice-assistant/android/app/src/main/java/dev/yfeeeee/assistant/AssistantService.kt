@@ -125,7 +125,7 @@ class AssistantService : Service() {
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
         )
         val record = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.MIC,
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
@@ -140,6 +140,9 @@ class AssistantService : Service() {
         record.startRecording()
         try {
             var lastLogged = 0L
+            var lastStat = System.currentTimeMillis()
+            var peak = 0
+            var best = 0f
             while (true) {
                 ensureActive()
                 var read = 0
@@ -148,7 +151,14 @@ class AssistantService : Service() {
                     if (n < 0) throw IOException("AudioRecord.read вернул $n")
                     read += n
                 }
+                for (v in buffer) peak = maxOf(peak, kotlin.math.abs(v.toInt()))
                 val score = detector.process(buffer)
+                best = maxOf(best, score)
+                val t = System.currentTimeMillis()
+                if (t - lastStat > 5_000) {
+                    LogBuffer.add("Слушаю: громкость %d/32767, макс. оценка %.2f".format(peak, best))
+                    lastStat = t; peak = 0; best = 0f
+                }
                 if (score >= settings.threshold) {
                     LogBuffer.add("Оценка активации: %.2f".format(score))
                     return@withContext
