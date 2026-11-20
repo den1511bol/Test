@@ -5,9 +5,13 @@ import android.app.SearchManager
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.media.AudioManager
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.provider.AlarmClock
 import android.provider.MediaStore
+import android.view.KeyEvent
 import org.json.JSONObject
 
 /**
@@ -54,6 +58,18 @@ class ActionExecutor(private val context: Context) {
             }
             context.startActivity(search)
         }
+        // YouTube Music открывает найденное, но сам не стартует: досылаем кнопку «Играть».
+        // KEYCODE_MEDIA_PLAY (не PLAY_PAUSE) безопасно повторять, лишний раз он не поставит паузу.
+        val handler = Handler(Looper.getMainLooper())
+        for (delayMs in longArrayOf(3_000, 6_000, 9_000)) {
+            handler.postDelayed({ pressPlay() }, delayMs)
+        }
+    }
+
+    private fun pressPlay() {
+        val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY))
+        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY))
     }
 
     private fun setTimer(seconds: Int, label: String) {
