@@ -21,6 +21,8 @@ YouTube Music, ставит таймеры и будильники и пишет
 3. Добавьте переменные из `server/.env.example`:
    - `ASSISTANT_TOKEN` — придумайте длинную случайную строку (то же значение вводится в приложении);
    - `LLM_API_KEY` — бесплатный ключ Groq (console.groq.com → API Keys) и `LLM_MODEL` (по умолчанию `openai/gpt-oss-120b`).
+     Вместо Groq можно Google Gemini: ключ из aistudio.google.com, `LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/`,
+     `LLM_MODEL=gemini-3.5-flash-lite` (на бесплатном тарифе Google может использовать содержимое запросов для улучшения продуктов).
      Платная альтернатива: `ANTHROPIC_API_KEY` вместо этих двух;
    - `RELAY_BOT_TOKEN` — токен бота от @BotFather (бот нужен только как почтальон);
    - `RELAY_OWNER_ID` — ваш числовой Telegram ID (его покажет @userinfobot);

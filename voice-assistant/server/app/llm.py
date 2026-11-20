@@ -119,6 +119,13 @@ def to_openai_messages(system: str, messages: list[dict[str, Any]]) -> list[dict
             if text:
                 item["content"] = text
             if calls:
+                # Некоторые провайдеры (Gemini) кладут служебные данные рассуждений в extra_content
+                # и ждут их обратно вместе с историей вызовов.
+                for call, block in zip(
+                    calls, [b for b in content if b.get("type") == "tool_use"]
+                ):
+                    if block.get("extra_content"):
+                        call["extra_content"] = block["extra_content"]
                 item["tool_calls"] = calls
             out.append(item)
         else:
@@ -162,7 +169,7 @@ class OpenAICompatLLM:
             "tools": to_openai_tools(tools),
             "tool_choice": "auto",
             "temperature": 0.2,
-            "max_tokens": 1024,
+            "max_tokens": 2048,  # запас: у «думающих» моделей рассуждения тоже считаются
         }
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
@@ -197,7 +204,7 @@ class OpenAICompatLLM:
         if text:
             content.append({"type": "text", "text": text})
         calls: list[ToolCall] = []
-        for raw in message.get("tool_calls") or []:
+        for index, raw in enumerate(message.get("tool_calls") or []):
             function = raw.get("function") or {}
             try:
                 args = json.loads(function.get("arguments") or "{}")
@@ -205,7 +212,11 @@ class OpenAICompatLLM:
                 args = {}
             if not isinstance(args, dict):
                 args = {}
-            call = ToolCall(str(raw.get("id", "")), str(function.get("name", "")), args)
+            # Gemini иногда возвращает пустой id: подставляем свой, чтобы сопоставить результаты.
+            call = ToolCall(str(raw.get("id") or f"call_{index}"), str(function.get("name", "")), args)
             calls.append(call)
-            content.append({"type": "tool_use", "id": call.id, "name": call.name, "input": args})
+            block: dict[str, Any] = {"type": "tool_use", "id": call.id, "name": call.name, "input": args}
+            if raw.get("extra_content"):
+                block["extra_content"] = raw["extra_content"]
+            content.append(block)
         return LLMResponse("tool_use" if calls else "end_turn", text, calls, content)

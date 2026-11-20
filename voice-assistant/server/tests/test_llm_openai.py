@@ -167,3 +167,23 @@ def test_settings_pick_provider(monkeypatch):
     finally:
         os.environ.clear()
         os.environ.update(saved)
+
+
+def test_extra_content_and_empty_ids_roundtrip():
+    """Служебные данные провайдера (Gemini: extra_content) возвращаются в историю; пустой id заменяется."""
+    extra = {"google": {"thought_signature": "SIG"}}
+    call = {"id": "", "type": "function", "function": {"name": "play_music", "arguments": '{"query":"джаз"}'},
+            "extra_content": extra}
+    http = FakeHTTP([(200, completion(tool_calls=[call]))])
+    resp = run(OpenAICompatLLM("K", "m", http=http).complete("s", [{"role": "user", "content": "x"}], TOOLS))
+    assert resp.tool_calls[0].id == "call_0"
+    assert resp.content[0]["extra_content"] == extra
+
+    history = [
+        {"role": "user", "content": "x"},
+        {"role": "assistant", "content": resp.content},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_0", "content": "ok"}]},
+    ]
+    out = to_openai_messages("S", history)
+    assert out[2]["tool_calls"][0]["extra_content"] == extra and out[2]["tool_calls"][0]["id"] == "call_0"
+    assert out[3]["tool_call_id"] == "call_0"
