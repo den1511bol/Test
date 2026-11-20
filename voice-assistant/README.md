@@ -38,8 +38,7 @@ YouTube Music, ставит таймеры и будильники и пишет
 
 ## 3. Сборка APK
 
-Каждый push в `voice-assistant/` запускает GitHub Actions (`.github/workflows/voice-assistant.yml` в корне репозитория): тесты сервера и сборка debug-APK. Скачайте
-`voice-assistant-apk` из Artifacts запуска и установите на телефон (разрешите установку из неизвестных источников).
+Каждый push в `voice-assistant/` запускает GitHub Actions (`.github/workflows/voice-assistant.yml` в корне репозитория): тесты сервера и сборка debug-APK. APK публикуется в релизе `voice-assistant-latest` (раздел Releases репозитория, нужен вход в GitHub). Скачайте `voice-assistant.apk` и установите на телефон (разрешите установку из неизвестных источников).
 
 ## 4. Настройка телефона
 

@@ -25,6 +25,8 @@ jobs:
 
   android-apk:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +57,14 @@ jobs:
       - name: Сборка debug APK
         run: gradle -p voice-assistant/android assembleDebug --no-daemon
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: voice-assistant-apk
-          path: voice-assistant/android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Публикация APK в релизе (не расходует квоту артефактов)
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp voice-assistant/android/app/build/outputs/apk/debug/app-debug.apk voice-assistant.apk
+          gh release view voice-assistant-latest >/dev/null 2>&1 || \
+            gh release create voice-assistant-latest --prerelease \
+              --title "Voice assistant (latest build)" --notes "Debug APK"
+          gh release upload voice-assistant-latest voice-assistant.apk --clobber
+          gh release edit voice-assistant-latest --notes "Debug APK, коммит ${{ github.sha }}"
