@@ -17,6 +17,7 @@ MAX_AGE = 60  # секунд: старые запросы отклоняются
 OFFER_TTL = 600  # отправлять можно только контактам из поиска за последние 10 минут
 CACHE_TTL = 600
 MAX_TEXT = 4000
+VERSION = "3 (строгий поиск)"
 
 
 def _sign(secret, body):
@@ -118,7 +119,7 @@ class IfiRelayMod(loader.Module):
         ok_secret = bool(self.config["secret"])
         await utils.answer(
             message,
-            f"IfiRelay: бот = {'@' + bot if bot else 'не задан'}, "
+            f"IfiRelay v{VERSION}: бот = {'@' + bot if bot else 'не задан'}, "
             f"секрет = {'задан' if ok_secret else 'не задан'}",
         )
 
