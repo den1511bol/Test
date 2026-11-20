@@ -20,7 +20,8 @@ YouTube Music, ставит таймеры и будильники и пишет
    **Root Directory = `voice-assistant/server`** (конфиг запуска уже в `server/railway.json`).
 3. Добавьте переменные из `server/.env.example`:
    - `ASSISTANT_TOKEN` — придумайте длинную случайную строку (то же значение вводится в приложении);
-   - `ANTHROPIC_API_KEY`, при желании `CLAUDE_MODEL`;
+   - `LLM_API_KEY` — бесплатный ключ Groq (console.groq.com → API Keys) и `LLM_MODEL` (по умолчанию `openai/gpt-oss-120b`).
+     Платная альтернатива: `ANTHROPIC_API_KEY` вместо этих двух;
    - `RELAY_BOT_TOKEN` — токен бота от @BotFather (бот нужен только как почтальон);
    - `RELAY_OWNER_ID` — ваш числовой Telegram ID (его покажет @userinfobot);
    - `RELAY_SECRET` — ещё одна длинная случайная строка (общий секрет сервера и модуля).

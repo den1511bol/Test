@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hmac
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -13,6 +14,7 @@ from starlette.routing import Route
 from .agent import Agent
 
 MAX_TEXT = 1000
+log = logging.getLogger("assistant")
 
 
 def create_app(agent: Agent, token: str, gateways: tuple[Any, ...] = ()) -> Starlette:
@@ -42,7 +44,14 @@ def create_app(agent: Agent, token: str, gateways: tuple[Any, ...] = ()) -> Star
         text = data.get("text") if data else None
         if not isinstance(text, str) or not text.strip():
             return JSONResponse({"error": "text required"}, status_code=400)
-        return JSONResponse(await agent.handle(text.strip()[:MAX_TEXT]))
+        try:
+            return JSONResponse(await agent.handle(text.strip()[:MAX_TEXT]))
+        except Exception as exc:  # noqa: BLE001 — клиенту нужен голосовой ответ, а не HTML-страница 500
+            log.warning("command failed: %s", type(exc).__name__)
+            reply = getattr(exc, "user_message", "Не получилось обработать команду, попробуй ещё раз.")
+            return JSONResponse(
+                {"reply": reply, "actions": [], "confirm": None, "listen_again": False}
+            )
 
     async def confirm(request: Request) -> JSONResponse:
         if not authorized(request):
@@ -76,8 +85,13 @@ def create_app(agent: Agent, token: str, gateways: tuple[Any, ...] = ()) -> Star
 
 def build_from_env() -> Starlette:
     from .config import Settings
-    from .llm import AnthropicLLM
+    from .llm import AnthropicLLM, OpenAICompatLLM
+
     s = Settings.from_env()
+    if s.uses_openai_compat:
+        llm = OpenAICompatLLM(s.llm_api_key, s.model, s.llm_base_url)
+    else:
+        llm = AnthropicLLM(s.anthropic_key, s.model)
     if s.uses_relay:
         from .relay import BotRelayGateway
 
@@ -86,5 +100,5 @@ def build_from_env() -> Starlette:
         from .telegram_client import TelethonGateway
 
         telegram = TelethonGateway(s.tg_api_id, s.tg_api_hash, s.tg_session)
-    agent = Agent(AnthropicLLM(s.anthropic_key, s.model), telegram)
+    agent = Agent(llm, telegram)
     return create_app(agent, s.token, gateways=(telegram,))
