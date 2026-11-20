@@ -45,31 +45,35 @@ def _unpack(secret, text):
 
 
 def _score_word(query, word):
+    """Сходство двух слов 0..1. Нечёткость только против опечаток распознавания речи."""
     if query == word:
         return 1.0
-    stem = min(len(query), len(word)) - 1  # падежи: «ане» ~ «аня»
-    if stem >= 2 and query[:stem] == word[:stem]:
+    # Падежи: «ане» ~ «аня», «милой» ~ «милая» (общее начало от 3 букв, хвост до 3 букв).
+    common = 0
+    for x, y in zip(query, word):
+        if x != y:
+            break
+        common += 1
+    shortest = min(len(query), len(word))
+    if shortest >= 3 and common >= 2 and abs(len(query) - len(word)) <= 3 and common >= shortest - 1 - (common >= 4):
         return 0.9
-    if len(query) >= 3 and (query in word or word in query):
-        return 0.85
-    return SequenceMatcher(None, query, word).ratio()
+    ratio = SequenceMatcher(None, query, word).ratio()
+    return ratio if ratio >= 0.8 else 0.0
 
 
 def _score(query, name):
-    q, n = query.strip().lower(), name.strip().lower()
+    """Каждое слово запроса должно найтись среди слов имени; оценка — по худшему слову."""
+    q, n = query.strip().lower().replace("ё", "е"), name.strip().lower().replace("ё", "е")
     if not q or not n:
         return 0.0
     if q == n:
         return 1.0
-    best = _score_word(q, n)
-    for word in n.split():
-        best = max(best, _score_word(q, word))
-    if " " in q:
-        best = max(best, SequenceMatcher(None, q, n).ratio())
-    return best
+    name_words = n.split()
+    scores = [max(_score_word(w, nw) for nw in name_words) for w in q.split()]
+    return min(scores) if scores else 0.0
 
 
-def _rank(contacts, query, threshold=0.6, limit=3):
+def _rank(contacts, query, threshold=0.8, limit=3):
     scored = [(_score(query, name), cid, name) for cid, name in contacts]
     scored = [s for s in scored if s[0] >= threshold]
     scored.sort(key=lambda s: (-s[0], s[2]))

@@ -31,6 +31,7 @@ def relay_module(monkeypatch):
     tl_types = types.ModuleType("telethon.tl.types")
     tl_types.Message = Message
     tl = types.ModuleType("telethon.tl")
+    tl.__path__ = []
     tl.types = tl_types
     tl_utils = types.ModuleType("telethon.utils")
     tl_utils.get_display_name = lambda entity: entity.name
@@ -63,7 +64,11 @@ def relay_module(monkeypatch):
     hk_modules = types.ModuleType("hk.modules")
     hk_modules.__path__ = []
 
+    functions = types.ModuleType("telethon.tl.functions")
+    contacts_mod = types.ModuleType("telethon.tl.functions.contacts")
+    contacts_mod.GetContactsRequest = lambda hash=0: ("GetContacts", hash)
     stubs = {
+        "telethon.tl.functions": functions, "telethon.tl.functions.contacts": contacts_mod,
         "telethon": telethon, "telethon.tl": tl, "telethon.tl.types": tl_types,
         "telethon.utils": tl_utils, "hk": hk, "hk.loader": loader, "hk.utils": hk_utils,
         "hk.modules": hk_modules,
@@ -88,8 +93,9 @@ class FakeClient:
         self.contacts = [SimpleNamespace(id=i, name=n, bot=False) for i, n in contacts]
         self.contact_sends = []
 
-    async def get_contacts(self):
-        return self.contacts
+    async def __call__(self, request):
+        assert request[0] == "GetContacts"
+        return SimpleNamespace(users=self.contacts)
 
     async def iter_dialogs(self, limit=None):
         for _ in ():
@@ -321,3 +327,12 @@ def test_status_command(relay_module):
         assert "s3cret" not in msg.answered  # секрет не раскрывается
 
     run(relay_module, CONTACTS, scenario)
+
+
+def test_contact_matching_is_strict(relay_module):
+    contacts = [(1, "Милая Бука"), (2, "Милана"), (3, "Аня"), (4, "Максим"), (5, "Бука")]
+    rank = lambda q: [n for _, n in relay_module._rank(contacts, q)]  # noqa: E731
+    assert rank("Милая бука") == ["Милая Бука"]
+    assert rank("Ане") == ["Аня"]
+    assert rank("Дмитрий") == []
+    assert "Максим" not in rank("Мила")
