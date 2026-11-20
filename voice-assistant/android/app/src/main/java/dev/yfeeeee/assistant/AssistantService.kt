@@ -237,7 +237,7 @@ class AssistantService : Service() {
     private suspend fun handOffToAssistant() {
         try {
             startActivity(
-                Intent(Intent.ACTION_VOICE_ASSIST).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                Intent("android.intent.action.VOICE_ASSIST").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
             LogBuffer.add("Передал голосовому ассистенту телефона")
         } catch (e: Exception) {
