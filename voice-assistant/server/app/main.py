@@ -77,9 +77,14 @@ def create_app(agent: Agent, token: str, gateways: tuple[Any, ...] = ()) -> Star
 def build_from_env() -> Starlette:
     from .config import Settings
     from .llm import AnthropicLLM
-    from .telegram_client import TelethonGateway
-
     s = Settings.from_env()
-    telegram = TelethonGateway(s.tg_api_id, s.tg_api_hash, s.tg_session)
+    if s.uses_relay:
+        from .relay import BotRelayGateway
+
+        telegram = BotRelayGateway(s.relay_bot_token, s.relay_owner_id, s.relay_secret)
+    else:
+        from .telegram_client import TelethonGateway
+
+        telegram = TelethonGateway(s.tg_api_id, s.tg_api_hash, s.tg_session)
     agent = Agent(AnthropicLLM(s.anthropic_key, s.model), telegram)
     return create_app(agent, s.token, gateways=(telegram,))
